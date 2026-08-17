@@ -453,6 +453,54 @@ configure_bluetooth() {
     fi
 }
 
+# Bound the vendor Bluetooth attach, which can otherwise hang for most of an hour.
+#
+# On this board `hci0` is not a USB device: `aic-bluetooth.service` runs `hciattach` over
+# /dev/ttyS1 to bring the AIC8800's BT half up. The vendor unit has no timeout and no
+# restart, and `hciattach` retries internally, in silence, for as long as the chip refuses
+# to answer — measured on a robot: 9 seconds on a good boot, **42 minutes** on a bad one,
+# during which the robot simply has no Bluetooth and nothing in the journal says why. A
+# wedged chip (a mid-session UART death, `hci0: sending frame failed (-49)`, leaves one)
+# recovers on the *reset* at the start of the script, so bounded fresh attempts beat one
+# unbounded attach: kill a start that has taken over 90 s and try again, forever — a robot
+# that keeps retrying is strictly better than one that silently never gets Bluetooth.
+#
+# A drop-in rather than an edit, so a vendor package update to the unit does not undo it.
+configure_bluetooth_attach() {
+    local unit=aic-bluetooth.service
+    if ! systemctl list-unit-files "$unit" >/dev/null 2>&1 \
+        || ! systemctl list-unit-files "$unit" 2>/dev/null | grep -q "$unit"; then
+        say "no ${unit}; skipping the Bluetooth attach drop-in"
+        return 0
+    fi
+
+    local dropin_dir=/etc/systemd/system/${unit}.d
+    local dropin=${dropin_dir}/10-robot-retry.conf
+    local wanted
+    wanted=$(cat <<'EOF'
+# Installed by robot-setup-board. The vendor attach can hang for most of an hour on a wedged
+# AIC8800 (measured); the hciattach reset at the start of each run is what recovers it, so
+# bounded retries beat one unbounded attempt. StartLimit lifted: no Bluetooth forever is the
+# worse outcome.
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+TimeoutStartSec=90
+Restart=on-failure
+RestartSec=5
+EOF
+)
+    if [ -f "$dropin" ] && [ "$(cat "$dropin")" = "$wanted" ]; then
+        say "Bluetooth attach drop-in already in place"
+        return 0
+    fi
+    say "bounding ${unit}: 90s per attempt, retried until the chip answers"
+    mkdir -p "$dropin_dir"
+    printf '%s\n' "$wanted" > "$dropin"
+    systemctl daemon-reload
+}
+
 # What the board looks like now. Printed whether or not anything was changed, because "is
 # this board ready" is a question worth being able to ask on its own.
 report() {
@@ -659,6 +707,7 @@ main() {
     check_network
     free_motor_port
     configure_bluetooth
+    configure_bluetooth_attach
     install_onnxruntime
     report
 }

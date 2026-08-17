@@ -182,6 +182,13 @@ async fn main() -> ExitCode {
     let args = Args::parse();
     duck_ipc_proto::log_startup_identity!("configd");
 
+    // Say it at startup, not only when a pairing fails. A board carrying `Privacy = device`
+    // cannot bond a pad at all, and on a real robot that misconfiguration sat silent for
+    // days: pairing appeared to succeed (the pad even drove), the bond was never persisted,
+    // and every reboot forgot it — with the only breadcrumb buried in a `pad.pair` error
+    // nobody had triggered yet. One warn line per boot makes the journal name the cause.
+    warn_if_bluetooth_privacy_breaks_pairing(std::path::Path::new("/etc/bluetooth/main.conf"));
+
     // Neither backend is a reason to refuse to start. `configd` answers `net.*`, `pad.*` and
     // `system.*`, and `system.pin` is where `btd` gets the PIN a phone authenticates with — so a
     // `configd` that exits over one missing dependency turns "wifi is unavailable" into "the robot
@@ -581,5 +588,68 @@ async fn shutdown() {
     tokio::select! {
         _ = term.recv() => {}
         _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+/// Warn when `/etc/bluetooth/main.conf` carries a `Privacy` setting that stops gamepads
+/// bonding.
+///
+/// `Privacy = device` makes the adapter pair from a resolvable private address; the pad's
+/// DHKey check then fails, and even a pairing that appears to succeed leaves no bond on
+/// disk — so it silently evaporates on the next reboot. `scripts/setup-board.sh` sets
+/// `Privacy = off`, but a board provisioned by an older copy — or one where
+/// `microduck_runtime`'s installer ran afterwards, which writes `device` back — carries the
+/// broken value with no symptom until someone tries to pair. This is the one line in the
+/// journal that names the fix.
+///
+/// A warning rather than a refusal: everything else `configd` serves works fine, and wifi
+/// provisioning must not hinge on a Bluetooth setting.
+fn warn_if_bluetooth_privacy_breaks_pairing(conf: &std::path::Path) {
+    let Ok(text) = std::fs::read_to_string(conf) else {
+        return; // No file is BlueZ's default, which is `off` — nothing to say.
+    };
+    if let Some(value) = bluetooth_privacy(&text)
+        && !value.eq_ignore_ascii_case("off")
+    {
+        tracing::warn!(
+            privacy = value,
+            conf = %conf.display(),
+            "Bluetooth Privacy is not 'off': gamepads will fail to bond (DHKey check failed), \
+             and a pairing that seems to work will not survive a reboot. Fix: run \
+             scripts/setup-board.sh (sets Privacy = off) and reboot"
+        );
+    }
+}
+
+/// The active (uncommented) `Privacy` value, or `None` when unset.
+fn bluetooth_privacy(conf: &str) -> Option<String> {
+    conf.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            key.trim()
+                .eq_ignore_ascii_case("privacy")
+                .then(|| value.trim().to_owned())
+        })
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::bluetooth_privacy;
+
+    /// The exact file a runtime-provisioned board carries — the case this warning exists
+    /// for. A commented-out `Privacy` must not trigger it; BlueZ ships the file with every
+    /// key commented, and warning on that would cry wolf on every stock board.
+    #[test]
+    fn the_broken_value_is_found_and_the_stock_file_is_not() {
+        let runtime_board = "[General]\nPrivacy = device\n[BR]\n";
+        assert_eq!(bluetooth_privacy(runtime_board).as_deref(), Some("device"));
+
+        let stock = "[General]\n#Privacy = off\n";
+        assert_eq!(bluetooth_privacy(stock), None);
+
+        let fixed = "[General]\nPrivacy = off\n";
+        assert_eq!(bluetooth_privacy(fixed).as_deref(), Some("off"));
     }
 }
