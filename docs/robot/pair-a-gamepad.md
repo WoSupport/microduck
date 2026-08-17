@@ -98,9 +98,16 @@ The signature, in `sudo btmon`:
 ```
 
 The robot holds a bond and asks to encrypt with it; **the pad answers that it has no such
-key**. The robot's half is fine — the pad lost or refuses its half, which old Xbox firmware
-(5.0x era) genuinely does across its own power cycles. The freshly-paired session works
-(encryption is live from the pairing itself); every reconnection after that fails, forever.
+key**. The robot's half is fine — the pad lost its half, which old Xbox firmware (5.0x era)
+genuinely does **at every one of its own power-offs**. Proven end to end on a real pad
+(firmware 5.9) with a full `btmon` capture: a flawless SC pairing, `Encryption: Enabled
+with AES-CCM`, the robot storing exactly the negotiated LTK — and the pad, power-cycled
+five seconds later, answering `PIN or Key Missing` to that same key. Reproduced identically
+against a laptop, so no amount of robot-side work can fix it.
+
+Why nobody noticed for months: under the old `Privacy = device` misconfiguration the
+*robot* forgot every bond too, so the per-session Sync + pair everyone was doing anyway
+masked the pad's amnesia completely. Fixing the robot's memory is what exposed it.
 
 `pad.pair` heals this on its own: it verifies an existing bond against the pad
 (connect + wait for `ServicesResolved`, which cannot happen without encryption) and re-pairs
