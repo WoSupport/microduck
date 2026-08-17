@@ -88,6 +88,35 @@ sudo reboot
 
 `setup-board.sh` corrects the value, and it does not take effect until the reboot.
 
+## When it pairs, works, and then loops connect/disconnect ever after
+
+The signature, in `sudo btmon`:
+
+```
+< HCI Command: LE Start Encryption ... Long term key[16]: ...
+> HCI Event: Encryption Change: Status: PIN or Key Missing (0x06)
+```
+
+The robot holds a bond and asks to encrypt with it; **the pad answers that it has no such
+key**. The robot's half is fine — the pad lost or refuses its half, which old Xbox firmware
+(5.0x era) genuinely does across its own power cycles. The freshly-paired session works
+(encryption is live from the pairing itself); every reconnection after that fails, forever.
+
+`pad.pair` heals this on its own: it verifies an existing bond against the pad
+(connect + wait for `ServicesResolved`, which cannot happen without encryption) and re-pairs
+fresh when the pad no longer honours it. So the recovery is always the same two steps —
+press Sync, `sudo robotctl pad pair` — even when the robot believes it is already paired.
+
+The *fix* is a pad firmware update (Xbox Accessories app, on Windows or an Xbox): recent
+firmware keeps its bonds, and the robot's persisted half then means something. Until then a
+pad on old firmware needs the Sync + `pad pair` dance once per pad power-up — exactly the
+prototype-era workflow, which "worked" only because that robot never persisted bonds at all
+and re-paired implicitly every time.
+
+A pad that loops like this also drives fine over a **USB-C cable** into the robot (the
+kernel ships `xpad`); `padd` picks it up like any pad. Useful when the firmware update has
+to wait for a Windows machine.
+
 ## When it pairs and then drops every two seconds
 
 A bonded pad that connects and disconnects in a loop — `bluetoothctl` showing `Connected: yes` /
