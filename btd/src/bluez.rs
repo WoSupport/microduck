@@ -111,6 +111,13 @@ const NAME_TIMEOUT: Duration = Duration::from_secs(5);
 /// `configd` would be the tidier answer and is a protocol change nobody needs yet.
 const NAME_POLL: Duration = Duration::from_secs(5);
 
+/// How often [`manage_advertisement`] re-checks whether a peer is connected.
+///
+/// This has to beat the race between a gamepad's connection coming up and its pairing
+/// starting (~2 s on this pad), because advertising during that window is what corrupts it —
+/// see [`manage_advertisement`]. Well under a second, without hammering D-Bus.
+const CONNECTION_POLL: Duration = Duration::from_millis(750);
+
 /// Serve BLE for as long as this process lives, across an adapter that comes and goes.
 ///
 /// Waiting for an adapter to *appear* was never enough. Everything after that wait — powering the
@@ -443,15 +450,16 @@ async fn serve_on_an_adapter(
     // The name is reconciled *alongside* that wait rather than after it, so losing the adapter ends
     // both: whichever finishes first ends the bring-up, and the reconcile is dropped with the
     // advertisement handle it owns.
-    if name.pinned.is_some() {
+    let name_source = if name.pinned.is_some() {
         tracing::info!(name = %advertised, "--name pins the advertisement; not reconciling");
-        watch_adapter(&adapter).await;
+        None
     } else {
-        tokio::select! {
-            () = watch_adapter(&adapter) => {}
-            // Never completes on its own.
-            () = reconcile_name(&adapter, &for_reconcile, advertised, handle) => {}
-        }
+        Some(&for_reconcile)
+    };
+    tokio::select! {
+        () = watch_adapter(&adapter) => {}
+        // Never completes on its own.
+        () = manage_advertisement(&adapter, name_source, advertised, handle) => {}
     }
     Ok(())
 }
@@ -476,46 +484,95 @@ async fn advertise(
         .await
 }
 
-/// Keep the advertised name in step with `configd`'s. Never returns.
+/// Own the advertisement: keep its name in step with `configd`'s, and **keep it off the air
+/// while any peer is connected**. Never returns.
 ///
-/// Owns the advertisement handle, because changing the name means deregistering one advertisement
-/// and registering another — nothing else may be holding it while that happens.
-async fn reconcile_name(
+/// The pause is not etiquette, it is load-bearing on this board. The AIC8800 cannot run our
+/// advertisement and a connection at the same time without corrupting the connection:
+/// measured on a robot, a gamepad pairing that succeeds and holds with `btd` stopped fails
+/// with `AuthenticationFailed` — or bonds and then dies of radio silence two seconds later —
+/// the moment `btd` is advertising. That one interaction produced weeks of symptoms that
+/// looked like everything else: pads that "forgot" their bonds (they never got a clean
+/// pairing to commit), key-missing reconnect loops, and a robot whose pad worked only on
+/// boards that had never run the daemon.
+///
+/// So: advertise only while no peer is connected. That is also ordinary BLE peripheral
+/// behaviour, and it costs what it sounds like — the robot is not discoverable over BLE
+/// while a pad (or a phone) is connected — which on this radio is not a policy choice but
+/// what the hardware can actually do.
+///
+/// `sockets` is `None` when `--name` pins the advertisement; the connection pause applies
+/// either way, which is why the pinned path runs through here too.
+async fn manage_advertisement(
     adapter: &bluer::Adapter,
-    sockets: &Sockets,
+    sockets: Option<&Sockets>,
     mut advertised: String,
     mut handle: Option<bluer::adv::AdvertisementHandle>,
 ) {
+    let mut last_name_ask = tokio::time::Instant::now();
     loop {
-        tokio::time::sleep(NAME_POLL).await;
+        tokio::time::sleep(CONNECTION_POLL).await;
 
-        let current = ask_name(sockets, &advertised).await;
-        // `handle` is `None` only after a failed re-advertise, and then the robot is invisible —
-        // so retry regardless of whether the name moved.
-        if current == advertised && handle.is_some() {
+        // A connected peer silences us, promptly: the fatal window is the pairing that
+        // follows a pad's connection, and this poll has to win that race. It does with
+        // margin — the SMP exchange starts roughly two seconds after the link comes up.
+        if any_peer_connected(adapter).await {
+            if handle.is_some() {
+                tracing::info!("a peer is connected; advertisement off until it leaves");
+                drop(handle.take());
+            }
             continue;
         }
 
-        // Deregistered before the replacement is registered: BlueZ is being asked to change one
-        // advertisement, and holding two while swapping invites it to refuse the second. The gap is
-        // brief, and a central that is already connected does not notice — a connection is not an
-        // advertisement.
-        drop(handle.take());
-        match advertise(adapter, &current).await {
-            Ok(new) => {
-                if current == advertised {
-                    tracing::info!(name = %current, "advertising again after a failure");
-                } else {
-                    tracing::info!(from = %advertised, to = %current, "renamed; advertising");
-                }
-                handle = Some(new);
+        // Nobody connected: the robot should be visible, under the current name.
+        if let Some(sockets) = sockets
+            && last_name_ask.elapsed() >= NAME_POLL
+        {
+            last_name_ask = tokio::time::Instant::now();
+            let current = ask_name(sockets, &advertised).await;
+            if current != advertised {
+                // Deregistered before the replacement is registered: BlueZ is being asked to
+                // change one advertisement, and holding two while swapping invites it to
+                // refuse the second.
+                drop(handle.take());
+                tracing::info!(from = %advertised, to = %current, "renamed");
                 advertised = current;
             }
-            // Left for the next tick rather than fatal, and never propagated: this is inside a
-            // bring-up whose whole point is that radio faults do not end the process.
-            Err(e) => tracing::error!(error = %e, name = %current, "cannot advertise"),
+        }
+
+        if handle.is_none() {
+            match advertise(adapter, &advertised).await {
+                Ok(new) => {
+                    tracing::info!(name = %advertised, "advertising");
+                    handle = Some(new);
+                }
+                // Left for the next tick rather than fatal, and never propagated: this is
+                // inside a bring-up whose whole point is that radio faults do not end the
+                // process.
+                Err(e) => tracing::error!(error = %e, name = %advertised, "cannot advertise"),
+            }
         }
     }
+}
+
+/// Is any remote device connected to this adapter — a pad we drive, a phone driving us?
+///
+/// Polled rather than event-driven: BlueZ's per-device property streams need a subscription
+/// per device object including ones that do not exist yet, and a 750 ms poll over a handful
+/// of cached devices is two D-Bus round trips. Errors count as "not connected" — a device
+/// that cannot be asked is not one to stay silent for.
+async fn any_peer_connected(adapter: &bluer::Adapter) -> bool {
+    let Ok(addresses) = adapter.device_addresses().await else {
+        return false;
+    };
+    for address in addresses {
+        if let Ok(device) = adapter.device(address)
+            && device.is_connected().await.unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// What `configd` says the robot is called, or `fallback` if it will not say.
