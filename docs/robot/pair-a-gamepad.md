@@ -96,6 +96,14 @@ leaves` when a pad connects). Without it, `btd`'s BLE advertisement corrupts any
 connection on the AIC8800 combo radio, and a *pairing* is the longest, most fragile
 connection there is.
 
+Pausing *while connected* is necessary but was measured to be insufficient: re-advertising
+the moment a link died put the advertisement back on the air exactly when the pad's ~2 s
+reconnect arrived, poisoning the retry too — a self-sustaining connect-and-die loop with a
+~1.5 s period (`padd` logs the pad enumerating over and over; the pad's light never leaves
+pairing mode). The fix therefore also waits out a 10 s quiet grace before re-advertising,
+and stays silent while the adapter is scanning, so a `pad pair` never overlaps the
+advertisement at all.
+
 This one interaction produced a whole family of symptoms that each looked like something
 else, and cost days before it was isolated by A/B on a single board (same pairing: works
 with `btd` stopped, fails with it advertising):

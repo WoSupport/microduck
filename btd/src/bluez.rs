@@ -118,6 +118,17 @@ const NAME_POLL: Duration = Duration::from_secs(5);
 /// see [`manage_advertisement`]. Well under a second, without hammering D-Bus.
 const CONNECTION_POLL: Duration = Duration::from_millis(750);
 
+/// How long the air must stay quiet — no peer connected, no discovery — before the
+/// advertisement goes back up.
+///
+/// Dropping it promptly is only half the job. A pad that loses its link reconnects within a
+/// couple of seconds, and re-advertising on the next poll tick put the advertisement back on
+/// the air exactly when that reconnect arrived — poisoning it like the first, measured on a
+/// robot as a connect-and-die loop with a ~1.5 s period that `bluetoothctl` shows as
+/// `Connected: yes/no` forever. Ten seconds outlasts the pad's retry cadence with margin:
+/// the retry lands on quiet air, holds, and then *being connected* is what keeps us silent.
+const READVERTISE_GRACE: Duration = Duration::from_secs(10);
+
 /// Serve BLE for as long as this process lives, across an adapter that comes and goes.
 ///
 /// Waiting for an adapter to *appear* was never enough. Everything after that wait — powering the
@@ -496,10 +507,12 @@ async fn advertise(
 /// pairing to commit), key-missing reconnect loops, and a robot whose pad worked only on
 /// boards that had never run the daemon.
 ///
-/// So: advertise only while no peer is connected. That is also ordinary BLE peripheral
-/// behaviour, and it costs what it sounds like — the robot is not discoverable over BLE
-/// while a pad (or a phone) is connected — which on this radio is not a policy choice but
-/// what the hardware can actually do.
+/// So: advertise only while no peer is connected, no discovery is running, and the air has
+/// been quiet for [`READVERTISE_GRACE`] — the grace is what breaks the reconnect loop where
+/// re-advertising the instant a poisoned link died poisoned its retry too. That is also
+/// ordinary BLE peripheral behaviour, and it costs what it sounds like — the robot is not
+/// discoverable over BLE while a pad (or a phone) is connected — which on this radio is not
+/// a policy choice but what the hardware can actually do.
 ///
 /// `sockets` is `None` when `--name` pins the advertisement; the connection pause applies
 /// either way, which is why the pinned path runs through here too.
@@ -510,6 +523,7 @@ async fn manage_advertisement(
     mut handle: Option<bluer::adv::AdvertisementHandle>,
 ) {
     let mut last_name_ask = tokio::time::Instant::now();
+    let mut last_busy = tokio::time::Instant::now();
     loop {
         tokio::time::sleep(CONNECTION_POLL).await;
 
@@ -517,8 +531,21 @@ async fn manage_advertisement(
         // follows a pad's connection, and this poll has to win that race. It does with
         // margin — the SMP exchange starts roughly two seconds after the link comes up.
         if any_peer_connected(adapter).await {
+            last_busy = tokio::time::Instant::now();
             if handle.is_some() {
                 tracing::info!("a peer is connected; advertisement off until it leaves");
+                drop(handle.take());
+            }
+            continue;
+        }
+
+        // So does discovery: `configd` scans for seconds before it connects a pad, and
+        // going quiet here means the pairing that follows never overlaps the advertisement
+        // at all, instead of racing the connection poll to turn it off.
+        if adapter.is_discovering().await.unwrap_or(false) {
+            last_busy = tokio::time::Instant::now();
+            if handle.is_some() {
+                tracing::info!("the adapter is scanning; advertisement off until it stops");
                 drop(handle.take());
             }
             continue;
@@ -541,6 +568,11 @@ async fn manage_advertisement(
         }
 
         if handle.is_none() {
+            // See READVERTISE_GRACE: a departed peer is usually about to come back, and its
+            // reconnect has to land on quiet air.
+            if last_busy.elapsed() < READVERTISE_GRACE {
+                continue;
+            }
             match advertise(adapter, &advertised).await {
                 Ok(new) => {
                     tracing::info!(name = %advertised, "advertising");
