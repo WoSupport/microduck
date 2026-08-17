@@ -110,10 +110,11 @@ sudo robotctl pad forget 78:86:2E:BB:13:28
 
 Pairing is once per pad and has a page of its own —
 [`pair-a-gamepad.md`](pair-a-gamepad.md): which button puts a pad in pairing mode, adding a second
-pad without forgetting the first, and what to do when it will not bond (`Privacy = device` left in
-`/etc/bluetooth/main.conf` is the culprit more often than anything else — it fails the pad's DHKey
-check, and a pairing that seems to work leaves no bond on disk. `robot-setup-board` sets
-`Privacy = off`; it takes a reboot).
+pad without forgetting the first, and the two classic failures. Will not bond at all: `Privacy =
+device` left in `/etc/bluetooth/main.conf` (fails the pad's DHKey check, and a pairing that seems
+to work leaves no bond on disk). Bonds, then drops every two seconds: ERTM still enabled
+(`/sys/module/bluetooth/parameters/disable_ertm` must be `Y`; the modprobe.d line does nothing on
+this kernel). `robot-setup-board` fixes both.
 
 `padd.service` runs from boot and drives whatever pad connects, so pairing is the only step. On the
 pad: **Start** toggles the policy — nothing moves until it is on — **Y**/triangle switches the sticks

@@ -88,6 +88,24 @@ sudo reboot
 
 `setup-board.sh` corrects the value, and it does not take effect until the reboot.
 
+## When it pairs and then drops every two seconds
+
+A bonded pad that connects and disconnects in a loop — `bluetoothctl` showing `Connected: yes` /
+`Connected: no` over and over — is **ERTM**, which Xbox controllers cannot cope with. Check:
+
+```bash
+cat /sys/module/bluetooth/parameters/disable_ertm     # must be Y
+```
+
+`N` means the fix never applied. The classic `/etc/modprobe.d/bluetooth.conf` line does nothing on
+this board — the vendor kernel builds `bluetooth` in, and modprobe options do not reach built-in
+code — which is why a board can carry the file for months and still loop. `setup-board.sh` writes
+the sysfs parameter directly and persists it via tmpfiles.d; it takes effect for new connections
+without a reboot. Power-cycle the pad once after flipping it.
+
+(Historical note: `Privacy = device` was once credited with fixing this loop. It "fixed" it by
+breaking bonding outright, so the loop never got the chance to start.)
+
 Otherwise the usual cause is the pad having left pairing mode before the exchange began: press Sync
 again and re-run while the light is still flashing quickly. To see the exchange itself:
 

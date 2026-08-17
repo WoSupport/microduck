@@ -418,12 +418,14 @@ free_motor_port() {
 #   unaffected by retrying, by `JustWorksRepairing`, or by which side starts.
 #
 #   With `Privacy = off` the same pad pairs first time, is trusted, and reconnects by itself
-#   across a reboot. The drop-on-connect symptom the old value was meant to prevent has not
-#   returned.
+#   across a reboot.
 #
-# So this is a measurement replacing an inherited setting. If a pad ever does start dropping on
-# connect, the two are in genuine tension and the answer is to pair with privacy off and then
-# re-enable it — not to set `device` and lose the ability to pair at all.
+# The drop-on-connect symptom the old value was credited with preventing DID return once
+# privacy was off (a bonded pad connecting and dropping every two seconds) — and its real
+# cause is ERTM, fixed properly in `configure_bluetooth_ertm` below. The two settings were
+# never in tension: `device` "prevented" the loop only by breaking bonding outright, so the
+# loop never got the chance to start. Privacy off + ERTM off is the working combination,
+# measured on a robot.
 #
 # The change sets `needs_reboot` rather than restarting bluetooth. Restarting the daemon on
 # this board left the kernel holding hci0 while bluetoothd reported "No default controller
@@ -451,6 +453,46 @@ configure_bluetooth() {
         fi
         needs_reboot=1
     fi
+}
+
+# Disable Bluetooth ERTM, which Xbox controllers cannot cope with.
+#
+# With ERTM on, a bonded Xbox pad connects and drops two seconds later, forever — the
+# connect/disconnect loop `microduck_runtime`'s notes credit `Privacy = device` with fixing.
+# That credit was misplaced: privacy only masked it (by breaking bonding outright, so the
+# loop never got a chance to start). The real fix has been known for years — disable ERTM —
+# and the runtime's installer duly wrote `options bluetooth disable_ertm=1` to modprobe.d.
+#
+# On this board that file has never done anything: the vendor kernel builds `bluetooth` IN
+# (`modules.builtin` lists it), and modprobe options do not apply to built-in code. Measured
+# on a robot carrying the file: `/sys/module/bluetooth/parameters/disable_ertm` reads `N`.
+#
+# So the setting is applied where it actually works: the sysfs parameter, written now (it
+# takes effect for new connections, no reboot) and at every boot via tmpfiles.d. The
+# modprobe.d file is left alone — harmless, and correct on a kernel that modularises
+# bluetooth.
+configure_bluetooth_ertm() {
+    local param=/sys/module/bluetooth/parameters/disable_ertm
+    local tmpfiles=/etc/tmpfiles.d/robot-bluetooth.conf
+    local rule="w ${param} - - - - Y"
+
+    if [ ! -e "$param" ]; then
+        warn "no ${param}; skipping the ERTM disable (no bluetooth support in this kernel?)"
+        return 0
+    fi
+
+    if [ "$(cat "$param")" = "Y" ]; then
+        say "Bluetooth ERTM already disabled"
+    else
+        say "disabling Bluetooth ERTM (Xbox pads connect-loop with it on)"
+        printf 'Y\n' > "$param"
+    fi
+
+    if [ -f "$tmpfiles" ] && grep -qxF "$rule" "$tmpfiles"; then
+        return 0
+    fi
+    say "persisting the ERTM disable across boots (${tmpfiles})"
+    printf '# Installed by robot-setup-board. bluetooth is built into this kernel, so the\n# modprobe.d option cannot apply; the sysfs write is what works.\n%s\n' "$rule" > "$tmpfiles"
 }
 
 # Bound the vendor Bluetooth attach, which can otherwise hang for most of an hour.
@@ -707,6 +749,7 @@ main() {
     check_network
     free_motor_port
     configure_bluetooth
+    configure_bluetooth_ertm
     configure_bluetooth_attach
     install_onnxruntime
     report
