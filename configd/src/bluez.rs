@@ -160,6 +160,19 @@ const BOND_POLL: Duration = Duration::from_millis(200);
 /// someone is retrying — stays in the cache and never announces itself again.
 const DISCOVERY_POLL: Duration = Duration::from_millis(500);
 
+/// How long the verify-connect on an existing bond may take. Connecting to a pad in range is
+/// sub-second; this only has to be shorter than anyone's patience, not generous.
+const ALIVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How long after the verify-connect to wait for `ServicesResolved`. On the broken bond the
+/// link dies ~300 ms in and services never resolve, so this is the time an operator waits
+/// before the stale bond is dropped and re-paired — keep it short.
+const ALIVE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// The re-discovery window after a stale bond is dropped. The pad is already on the air —
+/// that is how it got here — so it reappears in the first sweep or two.
+const REPAIR_WINDOW: Duration = Duration::from_secs(15);
+
 #[zbus::proxy(interface = "org.bluez.Adapter1", default_service = "org.bluez")]
 trait Adapter {
     fn start_discovery(&self) -> zbus::Result<()>;
@@ -179,6 +192,12 @@ trait Device {
 
     #[zbus(property)]
     fn set_trusted(&self, on: bool) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn connected(&self) -> zbus::Result<bool>;
+    /// GATT discovery finished — which, on a pad that gates every read behind encryption,
+    /// doubles as proof the link actually encrypted. See [`BlueZ::bond_is_alive`].
+    #[zbus(property)]
+    fn services_resolved(&self) -> zbus::Result<bool>;
 }
 
 #[zbus::proxy(
@@ -328,6 +347,11 @@ struct Snapshot {
     paired: bool,
     trusted: bool,
     connected: bool,
+    /// Present only while the device is actually being heard during discovery. This is how a
+    /// pad that is on the air is told apart from one BlueZ merely remembers: bonded devices
+    /// stay in the object tree forever, powered or not, and acting on a memory as if it were
+    /// a radio contact is how a healthy bond gets dropped while its pad sits in a drawer.
+    rssi: Option<i16>,
 }
 
 impl Snapshot {
@@ -354,6 +378,7 @@ impl Snapshot {
             paired: flag("Paired"),
             trusted: flag("Trusted"),
             connected: flag("Connected"),
+            rssi: get("RSSI").and_then(|v| i16::try_from(v).ok()),
         })
     }
 
@@ -543,6 +568,52 @@ impl BlueZ {
     }
 
     /// Connect, pair, trust — in that order, for the reasons in this module's docs.
+    /// Does the bond the robot holds still work — will the pad encrypt with it?
+    ///
+    /// `Paired: yes` in BlueZ describes the *robot's* half of the bond and nothing else. An
+    /// Xbox pad can lose or refuse its half (old firmware genuinely forgets it), and the
+    /// result is pathological: the link connects, the robot's `LE Start Encryption` is
+    /// answered with `PIN or Key Missing`, and the pad drops ~300 ms later — forever, in a
+    /// loop. To BlueZ's properties that robot looks *bonded*; to the person holding the pad
+    /// it looks broken; and re-running `pad.pair` used to "succeed" without fixing anything,
+    /// because the already-paired path only re-asserted `Trusted`.
+    ///
+    /// The probe: connect, then wait for `ServicesResolved`. This pad gates every GATT read
+    /// behind encryption, so services resolving *is* proof the link encrypted — and in the
+    /// key-missing loop it never arrives, because the connection dies first.
+    async fn bond_is_alive(&self, device: &Snapshot) -> bool {
+        let proxy = match DeviceProxy::builder(&self.bus)
+            .path(device.path.as_ref())
+            .map(|b| b.build())
+        {
+            Ok(build) => match build.await {
+                Ok(proxy) => proxy,
+                Err(_) => return false,
+            },
+            Err(_) => return false,
+        };
+
+        // Soft: on the broken bond the connect can "succeed" and die moments later, and on a
+        // pad that is already connected it answers AlreadyConnected. Neither is the verdict —
+        // `ServicesResolved` below is.
+        match tokio::time::timeout(ALIVE_CONNECT_TIMEOUT, proxy.connect()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::info!(error = %e, "verify-connect failed"),
+            Err(_) => tracing::info!("verify-connect did not answer in time"),
+        }
+
+        let deadline = tokio::time::Instant::now() + ALIVE_RESOLVE_TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
+            let resolved = proxy.services_resolved().await.unwrap_or(false);
+            let connected = proxy.connected().await.unwrap_or(false);
+            if resolved && connected {
+                return true;
+            }
+            tokio::time::sleep(BOND_POLL).await;
+        }
+        false
+    }
+
     async fn bond(&self, device: &Snapshot) -> Result<(), (proto::PadPairFailure, String)> {
         let proxy = DeviceProxy::builder(&self.bus)
             .path(device.path.as_ref())
@@ -770,6 +841,60 @@ impl Pads for BlueZ {
                     }
                 }
             }
+        };
+
+        // A bond the robot holds says nothing about the pad still honouring it, so an
+        // already-paired pad that is ON THE AIR gets its bond verified before being trusted
+        // again — and a bond the pad no longer has the key for is dropped and re-made fresh,
+        // in this same call. That is what makes `pad pair` the one command that always works,
+        // which is the whole UX: press Sync, run it, drive.
+        //
+        // Gated on the pad actually being heard (an RSSI during this discovery, or a live
+        // connection), because bonded devices sit in BlueZ's object tree forever: without the
+        // gate, running `pad pair` while a healthy pad sat switched off in a drawer would
+        // "verify" its bond against silence and drop it.
+        let device = if device.paired && (device.rssi.is_some() || device.connected) {
+            if self.bond_is_alive(&device).await {
+                tracing::info!(mac = %device.mac, "existing bond verified");
+                device
+            } else {
+                tracing::warn!(
+                    mac = %device.mac,
+                    "the pad no longer honours this bond (its half of the key is gone); \
+                     dropping it and pairing fresh"
+                );
+                adapter
+                    .remove_device(&device.path.as_ref())
+                    .await
+                    .map_err(|e| format!("cannot drop the stale bond: {e}"))?;
+
+                // Re-discover the same pad, now unpaired. It was on the air seconds ago —
+                // that is how it got here — so it reappears within a sweep or two.
+                adapter
+                    .start_discovery()
+                    .await
+                    .map_err(|e| format!("cannot restart Bluetooth discovery: {e}"))?;
+                let refound = self.find(Some(&device.mac), REPAIR_WINDOW).await;
+                if let Err(e) = adapter.stop_discovery().await {
+                    tracing::warn!(error = %e, "could not stop discovery");
+                }
+                match refound?.matches.into_iter().next() {
+                    Some(fresh) => fresh,
+                    None => {
+                        return Ok(proto::PadPairResult::Failed {
+                            reason: proto::PadPairFailure::NotFound,
+                            detail: Some(format!(
+                                "the stale bond for {} was dropped, but the pad was not seen \
+                                 again. Press Sync (fast-flashing light) and re-run — the next \
+                                 pairing starts clean on both sides.",
+                                device.mac
+                            )),
+                        });
+                    }
+                }
+            }
+        } else {
+            device
         };
 
         // The agent, alive only for this bond and scoped to this device. Registered *after* the
