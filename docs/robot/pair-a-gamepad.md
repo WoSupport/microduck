@@ -88,41 +88,38 @@ sudo reboot
 
 `setup-board.sh` corrects the value, and it does not take effect until the reboot.
 
-## When it pairs, works, and then loops connect/disconnect ever after
+## When it pairs, works ~2 seconds, then loops — or fails with AuthenticationFailed
 
-The signature, in `sudo btmon`:
+**Check that the running `btd` has the advertise-pause fix** (`btd/src/bluez.rs`,
+`manage_advertisement` — its journal says `a peer is connected; advertisement off until it
+leaves` when a pad connects). Without it, `btd`'s BLE advertisement corrupts any concurrent
+connection on the AIC8800 combo radio, and a *pairing* is the longest, most fragile
+connection there is.
 
-```
-< HCI Command: LE Start Encryption ... Long term key[16]: ...
-> HCI Event: Encryption Change: Status: PIN or Key Missing (0x06)
-```
+This one interaction produced a whole family of symptoms that each looked like something
+else, and cost days before it was isolated by A/B on a single board (same pairing: works
+with `btd` stopped, fails with it advertising):
 
-The robot holds a bond and asks to encrypt with it; **the pad answers that it has no such
-key**. The robot's half is fine — the pad lost its half, which old Xbox firmware (5.0x era)
-genuinely does **at every one of its own power-offs**. Proven end to end on a real pad
-(firmware 5.9) with a full `btmon` capture: a flawless SC pairing, `Encryption: Enabled
-with AES-CCM`, the robot storing exactly the negotiated LTK — and the pad, power-cycled
-five seconds later, answering `PIN or Key Missing` to that same key. Reproduced identically
-against a laptop, so no amount of robot-side work can fix it.
+- a fresh pairing dying of radio silence ~2 s after encryption (`Disconnect: Connection
+  Timeout`, supervision timeout — the link just goes deaf);
+- pairing refused outright with `org.bluez.Error.AuthenticationFailed`;
+- the **key-missing reconnect loop**: `LE Start Encryption` answered by `PIN or Key
+  Missing (0x06)`, forever. The pad never got far enough into its poisoned pairing to
+  commit its half of the bond, so the robot's stored key means nothing to it. The pad's
+  firmware was blamed for "forgetting bonds" — falsely: given one clean pairing it commits
+  and reconnects across power cycles indefinitely.
 
-Why nobody noticed for months: under the old `Privacy = device` misconfiguration the
-*robot* forgot every bond too, so the per-session Sync + pair everyone was doing anyway
-masked the pad's amnesia completely. Fixing the robot's memory is what exposed it.
+None of this is the pad, the batteries, `Privacy`, ERTM, connection intervals,
+NetworkManager or the GATT cache — all were suspected and all exonerated by radio traces.
+If the symptoms return on a fixed `btd`, capture `sudo btmon` and look at what else was on
+the air when the link died.
 
-`pad.pair` heals this on its own: it verifies an existing bond against the pad
-(connect + wait for `ServicesResolved`, which cannot happen without encryption) and re-pairs
-fresh when the pad no longer honours it. So the recovery is always the same two steps —
-press Sync, `sudo robotctl pad pair` — even when the robot believes it is already paired.
+After fixing `btd` (or stopping it), clear the poisoned state once: press Sync so the pad
+re-enters pairing mode, `bluetoothctl remove <mac>` on the robot, and `sudo robotctl pad
+pair`. From then on the bond is real on both sides and the pad reconnects by itself.
 
-The *fix* is a pad firmware update (Xbox Accessories app, on Windows or an Xbox): recent
-firmware keeps its bonds, and the robot's persisted half then means something. Until then a
-pad on old firmware needs the Sync + `pad pair` dance once per pad power-up — exactly the
-prototype-era workflow, which "worked" only because that robot never persisted bonds at all
-and re-paired implicitly every time.
-
-A pad that loops like this also drives fine over a **USB-C cable** into the robot (the
-kernel ships `xpad`); `padd` picks it up like any pad. Useful when the firmware update has
-to wait for a Windows machine.
+A pad also drives fine over a **USB-C cable** into the robot (the kernel ships `xpad`);
+`padd` picks it up like any pad. Useful while diagnosing anything radio-shaped.
 
 ## When it pairs and then drops every two seconds
 
