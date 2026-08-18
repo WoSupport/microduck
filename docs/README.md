@@ -34,7 +34,7 @@ own the mechanism is the bug.
 | [`restart-order.md`](design/restart-order.md) | Which unit restarts, at which step, on every path that moves `current` — and at boot. |
 | [`app-path-design.md`](design/app-path-design.md) | `btd` and `configd` — how a phone configures a robot over BLE. |
 | [`boot-recovery-net.md`](design/boot-recovery-net.md) | Falling back to golden when the release that booted cannot start its daemons. |
-| [`pad-bond-failure.md`](design/pad-bond-failure.md) | Why a gamepad will not stay bonded to some boards, and everything that was ruled out. |
+| [`pad-bond-failure.md`](design/pad-bond-failure.md) | Two faults behind one gamepad symptom: the pairing agent bug, and a stored key the pad rejects. |
 
 ## `project/` — you are running the project
 
