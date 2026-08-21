@@ -128,7 +128,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///
 /// Gaze as a point instead of joint angles: `robot.head`'s doc always promised both forms,
 /// and this is the second one — the daemon runs the IK and answers with the joints it chose.
-pub const API_VERSION: u32 = 12;
+///
+/// # v13 — `robot.map`
+///
+/// The live occupancy map, when `[maploc]` is enabled in robotd.toml. A subscription like
+/// `robot.state`: the answer says whether mapping runs, then `map.frame` notifications
+/// carry the rendered grid and the map-frame pose at a slow cadence.
+pub const API_VERSION: u32 = 13;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -423,6 +429,14 @@ pub mod method {
 
     /// One 8×8 depth frame, pushed after [`TOF_STREAM`].
     pub const TOF_FRAME: &str = "tof.frame";
+
+    /// Subscribe to the live occupancy map (`[maploc]` must be enabled in
+    /// robotd.toml). The answer says whether mapping runs; frames then
+    /// arrive as [`MAP_FRAME`] notifications at a slow cadence.
+    pub const ROBOT_MAP: &str = "robot.map";
+
+    /// One rendered map, pushed after [`ROBOT_MAP`].
+    pub const MAP_FRAME: &str = "map.frame";
 }
 
 /// JSON-RPC error codes.
@@ -568,6 +582,8 @@ pub enum Call {
     PadInput,
     /// Subscribe to the ToF depth stream. Answered by `tofd`.
     TofStream,
+    /// Subscribe to the live occupancy map. Answered by `robotd`.
+    RobotMap,
 }
 
 impl Call {
@@ -619,6 +635,7 @@ impl Call {
             Call::PadForget(_) => method::PAD_FORGET,
             Call::PadInput => method::PAD_INPUT,
             Call::TofStream => method::TOF_STREAM,
+            Call::RobotMap => method::ROBOT_MAP,
         }
     }
 
@@ -717,7 +734,8 @@ impl Call {
             | Call::SystemPairingPin
             | Call::PadStatus
             | Call::PadInput
-            | Call::TofStream => Value::Object(serde_json::Map::new()),
+            | Call::TofStream
+            | Call::RobotMap => Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -786,6 +804,7 @@ impl Call {
             method::PAD_FORGET => Call::PadForget(decode(params)?),
             method::PAD_INPUT => Call::PadInput,
             method::TOF_STREAM => Call::TofStream,
+            method::ROBOT_MAP => Call::RobotMap,
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -889,6 +908,24 @@ impl Request {
     /// Read a depth-frame notification back.
     pub fn as_tof_frame(&self) -> Option<TofFrame> {
         if self.method != method::TOF_FRAME {
+            return None;
+        }
+        serde_json::from_value(self.params.clone()?).ok()
+    }
+
+    /// A map notification: no `id`, so no response is expected.
+    pub fn notify_map_frame(frame: &MapFrame) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: method::MAP_FRAME.to_owned(),
+            params: Some(serde_json::to_value(frame).unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Read a map notification back.
+    pub fn as_map_frame(&self) -> Option<MapFrame> {
+        if self.method != method::MAP_FRAME {
             return None;
         }
         serde_json::from_value(self.params.clone()?).ok()
@@ -2546,6 +2583,125 @@ pub struct TofFrame {
     pub status: Vec<u8>,
 }
 
+/// Answer to [`Call::RobotMap`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapStreamResult {
+    /// The subscription is held either way — frames flow if mapping is later
+    /// enabled — mirroring [`TofStreamResult::accepted`]'s reasoning.
+    pub accepted: bool,
+    /// Whether `[maploc]` is enabled on this robot.
+    pub enabled: bool,
+    /// `stop_and_scan` or `continuous`, when enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+/// One rendered occupancy map, pushed at a slow cadence after [`Call::RobotMap`].
+///
+/// The grid is trinary — a viewer needs walls, floor and fog, not sixteen bits
+/// of log-odds — and rides as base64 (see [`b64`]) because 30 k cells as a
+/// JSON number array would triple the frame for nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MapFrame {
+    /// Renders since mapping started, so a viewer can see a gap it did not cause.
+    pub seq: u64,
+    /// The robot's pose in the MAP frame (which equals the odometry frame
+    /// until a relocalization or loop closure says otherwise).
+    pub x: f64,
+    pub y: f64,
+    pub yaw: f64,
+    /// False while the pose is not to be trusted (searching, or no map yet).
+    pub tracking: bool,
+    /// World coordinates of cell (0, 0)'s corner, and the cell pitch.
+    pub x_min: f32,
+    pub y_min: f32,
+    pub cell_m: f32,
+    /// Grid dimensions: `cells` decodes to `rows × cols` bytes, row-major,
+    /// row 0 at `y_min`.
+    pub rows: u32,
+    pub cols: u32,
+    /// Base64 of one byte per cell: 0 unknown, 1 free, 2 wall.
+    pub cells: String,
+    pub n_submaps: u32,
+    pub n_loops: u32,
+}
+
+/// Standard base64 (RFC 4648, with padding), owned here so both ends of
+/// [`MapFrame::cells`] spell it identically and no client needs a dependency
+/// to read a map.
+pub mod b64 {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    pub fn encode(data: &[u8]) -> String {
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+            out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHABET[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    pub fn decode(text: &str) -> Option<Vec<u8>> {
+        let bytes = text.trim_end_matches('=').as_bytes();
+        let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+        let value =
+            |c: u8| -> Option<u32> { ALPHABET.iter().position(|&a| a == c).map(|v| v as u32) };
+        for chunk in bytes.chunks(4) {
+            if chunk.len() < 2 {
+                return None;
+            }
+            let mut n = 0u32;
+            for (i, &c) in chunk.iter().enumerate() {
+                n |= value(c)? << (18 - 6 * i);
+            }
+            out.push((n >> 16) as u8);
+            if chunk.len() > 2 {
+                out.push((n >> 8) as u8);
+            }
+            if chunk.len() > 3 {
+                out.push(n as u8);
+            }
+        }
+        Some(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Round-trips at every length mod 3, and matches the RFC vectors.
+        #[test]
+        fn round_trips_and_matches_the_rfc() {
+            assert_eq!(encode(b""), "");
+            assert_eq!(encode(b"f"), "Zg==");
+            assert_eq!(encode(b"fo"), "Zm8=");
+            assert_eq!(encode(b"foo"), "Zm9v");
+            assert_eq!(encode(b"foobar"), "Zm9vYmFy");
+            for n in 0..32 {
+                let data: Vec<u8> = (0..n).map(|i| (i * 37 + 11) as u8).collect();
+                assert_eq!(decode(&encode(&data)).as_deref(), Some(data.as_slice()));
+            }
+            assert!(decode("!!!!").is_none(), "junk must not decode");
+        }
+    }
+}
+
 /// `skip_serializing_if` for a `bool` that is false by default.
 fn not(b: &bool) -> bool {
     !*b
@@ -2938,6 +3094,7 @@ mod tests {
                 mac: "78:86:2E:BB:13:28".into(),
             }),
             Call::TofStream,
+            Call::RobotMap,
         ]
     }
 
@@ -2949,7 +3106,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            44,
+            45,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

@@ -11,6 +11,7 @@
 //! standing over the robot's starting pose. The origin is marked `+`, the
 //! robot `●` with a short ray for its heading.
 
+use duck_ipc_proto as proto;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -142,6 +143,73 @@ impl PathMap {
     }
 }
 
+/// Draw a rendered occupancy map ([`proto::MapFrame`]) into `area`: walls as
+/// braille, confirmed floor as a sparse dim stipple, the robot's map-frame
+/// pose as the same yellow marker the odometry path uses. The panel never
+/// grows; the world scales to fit — the map's whole point is seeing all of it.
+pub fn draw_map(frame: &proto::MapFrame, area: Rect, buf: &mut Buffer) {
+    let (w, h) = (area.width as usize * 2, area.height as usize * 4);
+    if w < 8 || h < 8 {
+        return;
+    }
+    let Some(cells) = proto::b64::decode(&frame.cells) else {
+        return;
+    };
+    let (rows, cols) = (frame.rows as usize, frame.cols as usize);
+    if cells.len() != rows * cols || rows == 0 || cols == 0 {
+        return;
+    }
+
+    let cell = frame.cell_m;
+    let span_x = cols as f32 * cell; // world x = columns
+    let span_y = rows as f32 * cell;
+    // +x up the screen, +y screen-left, like the odometry path map.
+    let scale = ((h - 1) as f32 / span_x).min((w - 1) as f32 / span_y);
+    let centre = (frame.x_min + span_x / 2.0, frame.y_min + span_y / 2.0);
+    let dot = |x: f32, y: f32| -> (isize, isize) {
+        (
+            (w as f32 / 2.0 - (y - centre.1) * scale).round() as isize,
+            (h as f32 / 2.0 - (x - centre.0) * scale).round() as isize,
+        )
+    };
+
+    let mut grid = Grid::new(area.width as usize, area.height as usize);
+    for i in 0..rows {
+        for j in 0..cols {
+            let v = cells[i * cols + j];
+            if v == 0 {
+                continue;
+            }
+            let x = frame.x_min + (j as f32 + 0.5) * cell;
+            let y = frame.y_min + (i as f32 + 0.5) * cell;
+            if v == 2 {
+                grid.set(dot(x, y), None);
+            } else if (i + 2 * j) % 5 == 0 {
+                // Free space as a sparse stipple: enough to read the room's
+                // shape, not enough to compete with its walls.
+                grid.set(dot(x, y), Some(Color::DarkGray));
+            }
+        }
+    }
+
+    grid.mark(dot(0.0, 0.0), '+', Color::DarkGray);
+    let (rx, ry, ryaw) = (frame.x as f32, frame.y as f32, frame.yaw as f32);
+    let reach = 5.0 / scale;
+    grid.line(
+        dot(rx, ry),
+        dot(rx + reach * ryaw.cos(), ry + reach * ryaw.sin()),
+        Some(Color::Yellow),
+    );
+    // Searching robots draw differently: a pose not to be trusted must not
+    // look like one that is.
+    if frame.tracking {
+        grid.mark(dot(rx, ry), '●', Color::Yellow);
+    } else {
+        grid.mark(dot(rx, ry), '?', Color::Magenta);
+    }
+    grid.paint(area, buf);
+}
+
 /// A braille dot grid with per-cell colour and a few character overrides.
 struct Grid {
     w: usize,
@@ -249,6 +317,58 @@ mod tests {
         (0..h)
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_owned()).collect())
             .collect()
+    }
+
+    /// A wall in the frame must ink the panel; the robot must be its yellow
+    /// marker; a searching robot must not look locked.
+    #[test]
+    fn a_map_frame_draws_walls_and_the_robot() {
+        let mut cells = vec![1u8; 8 * 8]; // all free
+        for j in 0..8 {
+            cells[7 * 8 + j] = 2; // a wall along the top row (max y? row 7)
+        }
+        let frame = proto::MapFrame {
+            seq: 1,
+            x: 0.1,
+            y: 0.1,
+            yaw: 0.0,
+            tracking: true,
+            x_min: 0.0,
+            y_min: 0.0,
+            cell_m: 0.05,
+            rows: 8,
+            cols: 8,
+            cells: proto::b64::encode(&cells),
+            n_submaps: 1,
+            n_loops: 0,
+        };
+        let area = Rect::new(0, 0, 30, 10);
+        let mut buf = Buffer::empty(area);
+        draw_map(&frame, area, &mut buf);
+        let rendered: String = (0..10)
+            .flat_map(|y| (0..30).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_owned())
+            .collect();
+        assert!(rendered.contains('●'), "robot marker missing: {rendered:?}");
+        assert!(
+            rendered
+                .chars()
+                .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+            "no braille ink at all"
+        );
+
+        let searching = proto::MapFrame {
+            tracking: false,
+            ..frame
+        };
+        let mut buf = Buffer::empty(area);
+        draw_map(&searching, area, &mut buf);
+        let rendered: String = (0..10)
+            .flat_map(|y| (0..30).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_owned())
+            .collect();
+        assert!(rendered.contains('?'), "a searching pose must say so");
+        assert!(!rendered.contains('●'));
     }
 
     /// Not a test — a stopwatch for a full-capacity track. Run with:

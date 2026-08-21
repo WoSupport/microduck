@@ -27,6 +27,48 @@ pub struct Params {
     pub policy: PolicyParams,
     pub safety: SafetyParams,
     pub audio: AudioParams,
+    pub maploc: MaplocParams,
+}
+
+/// `[maploc]` — mapping & localization, off by default: it is the most
+/// CPU-hungry thing the robot can do, and a duck that is not being asked to
+/// map should not pay for it. When enabled, robotd hosts the SLAM pipeline
+/// on a worker thread fed by the control loop's own odometry and tofd's
+/// depth stream; nothing here touches the control loop's timing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MaplocParams {
+    pub enabled: bool,
+    /// When to paint scans into the map. `stop_and_scan` (the default)
+    /// integrates only while the robot stands still — frames from a stop are
+    /// voted against each other before any of them ink the map, which is
+    /// what keeps walking passers-by and sensor noise out of the walls.
+    /// `continuous` also integrates while walking: more coverage, blurrier
+    /// walls (gait wobble), and the pose under each scan is one tick stale.
+    pub mode: MaplocMode,
+    /// Where the session (submaps + pose graph + last pose) persists.
+    /// Autosaved periodically and on shutdown; restored on boot.
+    pub map_path: PathBuf,
+    /// Start from a clean slate instead of restoring the saved session.
+    pub wipe_on_boot: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaplocMode {
+    StopAndScan,
+    Continuous,
+}
+
+impl Default for MaplocParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: MaplocMode::StopAndScan,
+            map_path: PathBuf::from("/var/lib/robot/maploc.session"),
+            wipe_on_boot: false,
+        }
+    }
 }
 
 /// `[audio]` — the voice and the microphone. All optional equipment: a robot without a

@@ -2938,6 +2938,7 @@ dependencies = [
  "duck-ipc-proto",
  "kinematics",
  "libc",
+ "maploc",
  "minisign",
  "odometry",
  "pet-detect",

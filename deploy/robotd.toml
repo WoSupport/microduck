@@ -218,3 +218,24 @@ mode = "walk"
 # pet_model = ".../current/models/pet_detect.onnx"
 # pet_enter_threshold = 0.95
 # pet_exit_threshold = 0.85
+
+[maploc]
+# Mapping & localization. Off by default: it is the most CPU-hungry thing the robot can
+# do, and a duck that is not being asked to map should not pay for it. When on, robotd
+# builds an occupancy map from the head ToF (needs tofd running) and contact odometry,
+# persists it across restarts, and serves it live to `robotctl monitor` — the path panel
+# becomes the map (`m` makes it fullscreen).
+# enabled = false
+
+# When scans are painted into the map. "stop_and_scan" (default) integrates only while
+# the robot stands still — a stop's frames are voted against each other before any of
+# them ink the map, which keeps walking passers-by and sensor noise out of the walls.
+# "continuous" also paints while walking: more coverage, blurrier walls.
+# mode = "stop_and_scan"
+
+# Where the session (submaps + pose graph + last pose) persists. Autosaved once a minute
+# while mapping and on shutdown; restored on boot.
+# map_path = "/var/lib/robot/maploc.session"
+
+# Start from a clean slate instead of restoring the saved session.
+# wipe_on_boot = false

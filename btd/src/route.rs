@@ -158,6 +158,10 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         // radio ahead of a client that can use it buys nothing and widens the surface.
         RobotSound(_) => None,
 
+        // A 40 KB map frame is not a 20-byte BLE notification's business; the
+        // app path reads maps over WebRTC when it exists (§5.2).
+        RobotMap => None,
+
         // Powering the machine off from a phone in the room is `system.reboot` without the
         // coming back. The sit-then-power-off flow wants whoever asked to be watching the
         // robot, and that is `robotctl` or the pad's long-press, deliberately.

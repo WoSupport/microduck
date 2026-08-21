@@ -21,6 +21,7 @@
 
 mod control;
 mod intents;
+mod maploc;
 mod params;
 mod soc;
 mod sound;
@@ -259,6 +260,13 @@ struct RobotState {
     shutdown: AtomicBool,
     /// Fan-out for `robot.state`. Bounded and lossy by design — see [`STATE_BUFFER`].
     state_tx: tokio::sync::broadcast::Sender<proto::RobotState>,
+    /// Fan-out for `robot.map` — populated by the maploc worker when
+    /// `[maploc]` is enabled, quiet otherwise. Small buffer: frames arrive
+    /// at ~1 Hz and only the newest matters.
+    map_tx: tokio::sync::broadcast::Sender<proto::MapFrame>,
+    /// What `robot.map`'s answer says about this robot's mapping.
+    maploc_enabled: bool,
+    maploc_mode: &'static str,
     /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
     /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
     policy_error: ArcSwapOption<String>,
@@ -331,6 +339,12 @@ impl RobotState {
             imu_ready: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
+            map_tx: tokio::sync::broadcast::Sender::new(4),
+            maploc_enabled: params.maploc.enabled,
+            maploc_mode: match params.maploc.mode {
+                crate::params::MaplocMode::StopAndScan => "stop_and_scan",
+                crate::params::MaplocMode::Continuous => "continuous",
+            },
             policy_error: ArcSwapOption::empty(),
             policy_walk: {
                 let policy = params.policy.resolved();
@@ -1092,6 +1106,16 @@ async fn control_loop<T: RobotIo>(
     // bus pressure the spasms investigation taught this loop not to add.
     let mut odometry = odometry::Odometry::alpha();
 
+    // Mapping, when asked for: a niced worker thread fed by this loop's own
+    // samples, plus a task pumping tofd's depth stream to it. The loop's
+    // entire cost is one `try_send` per tick.
+    let maploc_host = params.maploc.enabled.then(|| {
+        tracing::info!(mode = state.maploc_mode, "maploc enabled");
+        let host = maploc::spawn(params.maploc.clone(), state.map_tx.clone());
+        tokio::spawn(maploc::feed_tof(host.clone()));
+        host
+    });
+
     // The sit-then-power-off sequence, and fall recovery.
     let mut shutdown_sit: Option<Instant> = None;
     let mut powered_off = false;
@@ -1175,6 +1199,27 @@ async fn control_loop<T: RobotIo>(
             // into the estimator would tell it the robot froze, which it did not.
             if safety.imu_ready() {
                 odometry.update(&fresh.positions, fresh.imu.quat);
+                if let Some(host) = &maploc_host {
+                    let position = odometry.position();
+                    host.observe(maploc::OdomSample {
+                        odom: (
+                            position[0] as f32,
+                            position[1] as f32,
+                            odometry.yaw() as f32,
+                        ),
+                        gravity: fresh.imu.gravity,
+                        trunk_z: position[2],
+                        head: [
+                            fresh.positions[5],
+                            fresh.positions[6],
+                            fresh.positions[7],
+                            fresh.positions[8],
+                        ],
+                        // Last tick's verdict — 20 ms stale, and the stillness
+                        // window on the worker side absorbs far more than that.
+                        moving: state.moving.load(Ordering::Relaxed),
+                    });
+                }
             }
         }
         state.fallen.store(safety.fallen(), Ordering::Relaxed);
@@ -1958,38 +2003,57 @@ async fn handle(
     let mut states: Option<tokio::sync::broadcast::Receiver<proto::RobotState>> = None;
     let mut decimate = Duration::ZERO;
     let mut last_sent: Option<Instant> = None;
+    let mut maps: Option<tokio::sync::broadcast::Receiver<proto::MapFrame>> = None;
 
     loop {
-        let line = match states.as_mut() {
-            None => lines.next_line().await?,
-            Some(rx) => {
-                tokio::select! {
-                    line = lines.next_line() => line?,
-                    received = rx.recv() => {
-                        match received {
-                            Ok(state) => {
-                                // Decimate per subscriber: a dashboard asking for 10 Hz
-                                // should not cost what a digital twin asking for 50 does.
-                                let due = last_sent
-                                    .map(|at| at.elapsed() >= decimate)
-                                    .unwrap_or(true);
-                                if due {
-                                    last_sent = Some(Instant::now());
-                                    write_line(&mut write_half, &proto::Request::notify_state(&state))
-                                        .await?;
-                                }
-                            }
-                            // Lagged: the client fell behind and lost frames. That is the
-                            // designed behaviour — state is advisory and must never apply
-                            // backpressure to the control loop — so carry on from the newest.
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::debug!(dropped = n, "state subscriber fell behind");
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+        // Absent subscriptions pend forever, so one select covers every
+        // combination of the two streams without a match ladder per case.
+        async fn next_from<T: Clone>(
+            rx: &mut Option<tokio::sync::broadcast::Receiver<T>>,
+        ) -> Result<T, tokio::sync::broadcast::error::RecvError> {
+            match rx {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            }
+        }
+        let line = tokio::select! {
+            line = lines.next_line() => line?,
+            received = next_from(&mut states) => {
+                match received {
+                    Ok(state) => {
+                        // Decimate per subscriber: a dashboard asking for 10 Hz
+                        // should not cost what a digital twin asking for 50 does.
+                        let due = last_sent
+                            .map(|at| at.elapsed() >= decimate)
+                            .unwrap_or(true);
+                        if due {
+                            last_sent = Some(Instant::now());
+                            write_line(&mut write_half, &proto::Request::notify_state(&state))
+                                .await?;
                         }
-                        continue;
                     }
+                    // Lagged: the client fell behind and lost frames. That is the
+                    // designed behaviour — state is advisory and must never apply
+                    // backpressure to the control loop — so carry on from the newest.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!(dropped = n, "state subscriber fell behind");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                 }
+                continue;
+            }
+            received = next_from(&mut maps) => {
+                match received {
+                    Ok(frame) => {
+                        write_line(&mut write_half, &proto::Request::notify_map_frame(&frame))
+                            .await?;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!(dropped = n, "map subscriber fell behind");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+                continue;
             }
         };
         let Some(line) = line else { return Ok(()) };
@@ -2030,6 +2094,10 @@ async fn handle(
             continue;
         };
 
+        if let Ok(proto::Call::RobotMap) = &call {
+            // Subscribing again just re-arms the stream.
+            maps = Some(state.map_tx.subscribe());
+        }
         if let Ok(proto::Call::RobotSubscribe(params)) = &call {
             decimate = params
                 .hz
@@ -2218,6 +2286,17 @@ fn dispatch(
                     },
                     |e| Some(format!("policy would not load: {e}")),
                 ),
+            },
+        ),
+
+        // The subscription itself was armed by the connection handler; this
+        // is the answer that says whether frames will mean anything.
+        proto::Call::RobotMap => proto::Response::ok(
+            Some(id),
+            &proto::MapStreamResult {
+                accepted: true,
+                enabled: state.maploc_enabled,
+                mode: state.maploc_enabled.then(|| state.maploc_mode.to_owned()),
             },
         ),
 

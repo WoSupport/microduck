@@ -9,6 +9,7 @@ description = "Robot control daemon — skeleton"
 duck-ipc-proto = { path = "../duck-ipc-proto" }
 duck-control = { path = "../duck-control" }
 kinematics = { path = "../kinematics" }
+maploc = { path = "../maploc" }
 odometry = { path = "../odometry" }
 pet-detect = { path = "../pet-detect" }
 clap = { workspace = true, features = ["derive"] }
