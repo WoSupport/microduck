@@ -15,6 +15,23 @@
 use crate::grid::GridConfig;
 use crate::submap::{Pose2, Submap};
 
+/// What one manager tick did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickOutcome {
+    /// Nothing changed.
+    Idle,
+    /// A new submap opened (the previous one froze, unless this is the
+    /// bootstrap open).
+    Opened,
+    /// The current submap was EMPTY when it hit a switch condition, so it
+    /// was re-anchored at the current pose instead of frozen: an empty
+    /// submap in the frozen list is a dead node the pose graph drags
+    /// around, and its stale anchor would misplace whatever ink eventually
+    /// arrives. A long stand (or a scanless walk) re-anchors; it does not
+    /// pile up husks.
+    Reanchored,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SubmapManagerConfig {
     /// Submap dimensions (centred on the anchor; defines the local grid).
@@ -111,14 +128,12 @@ impl SubmapManager {
 
     /// Update the manager. Call on every tick; `tracked_pose` is the
     /// robot's current world pose (from odom-driven tracking), and
-    /// `now_s` is the session-relative wall-time. Returns `true` iff a
-    /// new submap was started this tick (useful for downstream loop
-    /// closure / pose-graph hooks at submap-close).
-    pub fn tick(&mut self, now_s: f32, tracked_pose: Pose2) -> bool {
+    /// `now_s` is the session-relative wall-time.
+    pub fn tick(&mut self, now_s: f32, tracked_pose: Pose2) -> TickOutcome {
         // Bootstrap the first submap on the very first tick.
         if self.current.is_none() {
             self.start_new(tracked_pose, now_s);
-            return true;
+            return TickOutcome::Opened;
         }
         // Session restore leaves `current_started_s = None`; arm the age
         // clock now. Without this, `should_switch` computes age = 0
@@ -128,13 +143,18 @@ impl SubmapManager {
             self.current_started_s = Some(now_s);
         }
         if self.should_switch(now_s, tracked_pose) {
+            if !self.current.as_ref().is_some_and(Submap::has_content) {
+                // Empty: nothing worth freezing — see [`TickOutcome::Reanchored`].
+                self.start_new(tracked_pose, now_s);
+                return TickOutcome::Reanchored;
+            }
             // Move current → frozen, start fresh at the new anchor.
             let old = self.current.take().unwrap();
             self.frozen.push(old);
             self.start_new(tracked_pose, now_s);
-            return true;
+            return TickOutcome::Opened;
         }
-        false
+        TickOutcome::Idle
     }
 
     fn should_switch(&self, now_s: f32, tracked_pose: Pose2) -> bool {
@@ -163,6 +183,33 @@ impl SubmapManager {
 mod tests {
     use super::*;
 
+    fn sc() -> crate::submap::Scan {
+        crate::submap::Scan::from_polar(&[0.0], &[1.0], (0.0, 0.0), 0.0)
+    }
+
+    /// A submap with nothing in it never freezes: hitting a switch
+    /// condition re-anchors it at the current pose instead, so long stands
+    /// and scanless walks cannot pile husk submaps into the pose graph.
+    #[test]
+    fn empty_submaps_reanchor_instead_of_freezing() {
+        let cfg = SubmapManagerConfig {
+            max_age_s: 5.0,
+            max_travel_m: 1000.0,
+            ..SubmapManagerConfig::default()
+        };
+        let mut mgr = SubmapManager::new(cfg);
+        assert_eq!(mgr.tick(0.0, (0.0, 0.0, 0.0)), TickOutcome::Opened);
+        assert_eq!(mgr.tick(6.0, (1.0, 0.0, 0.0)), TickOutcome::Reanchored);
+        assert_eq!(mgr.n_frozen(), 0, "an empty submap must not freeze");
+        assert_eq!(mgr.current().unwrap().anchor_pose().0, 1.0);
+        // With content, the same condition freezes.
+        mgr.current_mut()
+            .unwrap()
+            .integrate_scan((1.0, 0.0, 0.0), &sc());
+        assert_eq!(mgr.tick(12.0, (1.0, 0.0, 0.0)), TickOutcome::Opened);
+        assert_eq!(mgr.n_frozen(), 1);
+    }
+
     /// M2 regression: after `from_parts` (session restore) the age
     /// clock must re-arm on the first tick — the old code left it
     /// `None` forever, so a restored submap could never age out.
@@ -175,14 +222,19 @@ mod tests {
         };
         let current = Some(Submap::new_at((0.0, 0.0, 0.0), cfg.grid));
         let mut mgr = SubmapManager::from_parts(cfg, Vec::new(), current);
+        // Content, so aging freezes rather than re-anchors.
+        mgr.current_mut()
+            .unwrap()
+            .integrate_scan((0.0, 0.0, 0.0), &sc());
         // First tick (resume at t=100): arms the clock, no switch.
-        assert!(!mgr.tick(100.0, (0.0, 0.0, 0.0)));
+        assert_eq!(mgr.tick(100.0, (0.0, 0.0, 0.0)), TickOutcome::Idle);
         assert_eq!(mgr.n_frozen(), 0);
         // Just under the age limit: still no switch.
-        assert!(!mgr.tick(109.0, (0.0, 0.0, 0.0)));
+        assert_eq!(mgr.tick(109.0, (0.0, 0.0, 0.0)), TickOutcome::Idle);
         // Past the age limit: the restored submap must freeze.
-        assert!(
+        assert_eq!(
             mgr.tick(110.5, (0.0, 0.0, 0.0)),
+            TickOutcome::Opened,
             "restored submap never aged out"
         );
         assert_eq!(mgr.n_frozen(), 1);
@@ -193,7 +245,7 @@ mod tests {
         let mut mgr = SubmapManager::new(SubmapManagerConfig::default());
         assert_eq!(mgr.n_total(), 0);
         let opened = mgr.tick(0.0, (0.0, 0.0, 0.0));
-        assert!(opened);
+        assert_eq!(opened, TickOutcome::Opened);
         assert_eq!(mgr.n_total(), 1);
         assert_eq!(mgr.n_frozen(), 0);
     }
@@ -207,6 +259,9 @@ mod tests {
         };
         let mut mgr = SubmapManager::new(cfg);
         mgr.tick(0.0, (0.0, 0.0, 0.0));
+        mgr.current_mut()
+            .unwrap()
+            .integrate_scan((0.0, 0.0, 0.0), &sc());
         assert_eq!(mgr.n_frozen(), 0);
         mgr.tick(1.0, (0.5, 0.0, 0.0));
         assert_eq!(mgr.n_frozen(), 0, "0.5 m < threshold should not trigger");
@@ -224,6 +279,9 @@ mod tests {
         };
         let mut mgr = SubmapManager::new(cfg);
         mgr.tick(0.0, (0.0, 0.0, 0.0));
+        mgr.current_mut()
+            .unwrap()
+            .integrate_scan((0.0, 0.0, 0.0), &sc());
         mgr.tick(3.0, (0.0, 0.0, 0.0));
         assert_eq!(mgr.n_frozen(), 0);
         mgr.tick(6.0, (0.0, 0.0, 0.0));
@@ -239,6 +297,9 @@ mod tests {
         };
         let mut mgr = SubmapManager::new(cfg);
         mgr.tick(0.0, (0.0, 0.0, 0.0));
+        mgr.current_mut()
+            .unwrap()
+            .integrate_scan((0.0, 0.0, 0.0), &sc());
         let switch_pose = (1.0, 0.5, 0.7);
         mgr.tick(1.0, switch_pose);
         let cur = mgr.current().unwrap();

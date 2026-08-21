@@ -58,6 +58,9 @@ impl PoseGraph {
     pub fn edges(&self) -> &[PoseEdge] {
         &self.edges
     }
+    pub fn edges_mut(&mut self) -> &mut [PoseEdge] {
+        &mut self.edges
+    }
     pub fn nodes_mut(&mut self) -> &mut [PoseNode] {
         &mut self.nodes
     }

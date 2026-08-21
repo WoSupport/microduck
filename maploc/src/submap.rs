@@ -149,6 +149,12 @@ impl Submap {
         &self.raw_scans
     }
 
+    /// Whether anything was ever integrated. (Retention caps at
+    /// [`MAX_RAW_SCANS`], so this is "has content", not a count.)
+    pub fn has_content(&self) -> bool {
+        !self.raw_scans.is_empty()
+    }
+
     /// Update the anchor pose. Used by the pose-graph optimizer after
     /// loop closure: the submap's local content (grid + raw scans)
     /// stays untouched, only its anchor changes.

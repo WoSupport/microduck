@@ -21,7 +21,7 @@ use crate::optimizer::{OptimizerConfig, optimize};
 use crate::pose_graph::{PoseEdge, PoseGraph, between, compose, information_from_sigmas, wrap_pi};
 use crate::session::{SessionState, save_session};
 use crate::submap::{Pose2, Scan};
-use crate::submap_manager::{SubmapManager, SubmapManagerConfig};
+use crate::submap_manager::{SubmapManager, SubmapManagerConfig, TickOutcome};
 
 #[derive(Debug, Clone)]
 pub struct SlamConfig {
@@ -70,6 +70,9 @@ pub struct Slam {
     n_loops: usize,
     tracked: Pose2,
     last_odom: Option<Pose2>,
+    /// Index of the odometry edge feeding the CURRENT submap's node, so a
+    /// re-anchor can update its measurement in place.
+    edge_into_current: Option<usize>,
     /// Set by anything that changes what a render would show.
     dirty: bool,
 }
@@ -83,6 +86,7 @@ impl Slam {
             n_loops: 0,
             tracked: (0.0, 0.0, 0.0),
             last_odom: None,
+            edge_into_current: None,
             dirty: false,
             cfg,
         }
@@ -105,6 +109,7 @@ impl Slam {
             n_loops,
             tracked: s.tracked,
             last_odom: None,
+            edge_into_current: None,
             dirty: true,
             cfg,
         }
@@ -165,8 +170,24 @@ impl Slam {
     /// submap and the tracked pose. Returns true when a submap froze.
     pub fn tick(&mut self, now_s: f32) -> bool {
         let prev_frozen = self.mgr.n_frozen();
-        if !self.mgr.tick(now_s, self.tracked) {
-            return false;
+        match self.mgr.tick(now_s, self.tracked) {
+            TickOutcome::Idle => return false,
+            TickOutcome::Reanchored => {
+                // The empty current submap moved under its node: keep the
+                // node (and the edge into it) telling the same story, or the
+                // graph would preserve an anchor the map no longer has.
+                let anchor = self.mgr.current().expect("re-anchored").anchor_pose();
+                if let Some(&node) = self.node_for_submap.last() {
+                    self.graph.nodes_mut()[node].pose = anchor;
+                    if let Some(edge_idx) = self.edge_into_current {
+                        let from = self.graph.edges()[edge_idx].from;
+                        let from_pose = self.graph.nodes()[from].pose;
+                        self.graph.edges_mut()[edge_idx].measurement = between(from_pose, anchor);
+                    }
+                }
+                return false;
+            }
+            TickOutcome::Opened => {}
         }
         let anchor = self.mgr.current().expect("just opened").anchor_pose();
         let node = self.graph.add_node(anchor, self.mgr.n_total() - 1);
@@ -176,6 +197,7 @@ impl Slam {
         // rides the current node: leave it floating and the closure moves
         // every frozen anchor while tracking sails on uncorrected (the
         // prototype's wiring had exactly this hole).
+        self.edge_into_current = None;
         if let Some(&prev_node) = self.node_for_submap.last() {
             let prev_pose = self.graph.nodes()[prev_node].pose;
             self.graph.add_edge(PoseEdge {
@@ -187,6 +209,7 @@ impl Slam {
                     self.cfg.odom_sigma_yaw,
                 ),
             });
+            self.edge_into_current = Some(self.graph.edges().len() - 1);
         }
         self.node_for_submap.push(node);
 

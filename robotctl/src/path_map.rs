@@ -73,6 +73,12 @@ impl PathMap {
         }
     }
 
+    /// The recorded track, world (x, y), oldest first — for overlaying the
+    /// path on views that own their own projection (the live map).
+    pub fn points(&self) -> &[(f64, f64)] {
+        &self.points
+    }
+
     /// How wide the tracked world currently is, metres — the number the panel
     /// caption shows so the zoom level is legible.
     pub fn extent_m(&self) -> f64 {
@@ -120,7 +126,11 @@ impl PathMap {
 
         let mut grid = Grid::new(area.width as usize, area.height as usize);
         for pair in self.points.windows(2) {
-            grid.line(dot(pair[0].0, pair[0].1), dot(pair[1].0, pair[1].1), None);
+            grid.line(
+                dot(pair[0].0, pair[0].1),
+                dot(pair[1].0, pair[1].1),
+                Some(Color::Red),
+            );
         }
 
         // Origin first, robot second: on the tick the robot is still at the
@@ -129,7 +139,7 @@ impl PathMap {
 
         if let Some((x, y, yaw)) = self.here {
             if let Some(&(px, py)) = self.points.last() {
-                grid.line(dot(px, py), dot(x, y), None);
+                grid.line(dot(px, py), dot(x, y), Some(Color::Red));
             }
             // The heading ray: from the robot, one panel-relative step forward,
             // so it reads at every zoom level rather than shrinking with the map.
@@ -147,7 +157,7 @@ impl PathMap {
 /// braille, confirmed floor as a sparse dim stipple, the robot's map-frame
 /// pose as the same yellow marker the odometry path uses. The panel never
 /// grows; the world scales to fit — the map's whole point is seeing all of it.
-pub fn draw_map(frame: &proto::MapFrame, area: Rect, buf: &mut Buffer) {
+pub fn draw_map(frame: &proto::MapFrame, path: &PathMap, area: Rect, buf: &mut Buffer) {
     let (w, h) = (area.width as usize * 2, area.height as usize * 4);
     if w < 8 || h < 8 {
         return;
@@ -190,6 +200,18 @@ pub fn draw_map(frame: &proto::MapFrame, area: Rect, buf: &mut Buffer) {
                 grid.set(dot(x, y), Some(Color::DarkGray));
             }
         }
+    }
+
+    // The walked path, red, on top of the rooms it was walked through. The
+    // path lives in the odometry frame, the map in the map frame — identical
+    // until loop closures diverge them, and worth seeing together even then.
+    let pts = path.points();
+    for pair in pts.windows(2) {
+        grid.line(
+            dot(pair[0].0 as f32, pair[0].1 as f32),
+            dot(pair[1].0 as f32, pair[1].1 as f32),
+            Some(Color::Red),
+        );
     }
 
     grid.mark(dot(0.0, 0.0), '+', Color::DarkGray);
@@ -341,10 +363,12 @@ mod tests {
             cells: proto::b64::encode(&cells),
             n_submaps: 1,
             n_loops: 0,
+            windows: 1,
+            still: false,
         };
         let area = Rect::new(0, 0, 30, 10);
         let mut buf = Buffer::empty(area);
-        draw_map(&frame, area, &mut buf);
+        draw_map(&frame, &PathMap::new(), area, &mut buf);
         let rendered: String = (0..10)
             .flat_map(|y| (0..30).map(move |x| (x, y)))
             .map(|(x, y)| buf[(x, y)].symbol().to_owned())
@@ -362,7 +386,7 @@ mod tests {
             ..frame
         };
         let mut buf = Buffer::empty(area);
-        draw_map(&searching, area, &mut buf);
+        draw_map(&searching, &PathMap::new(), area, &mut buf);
         let rendered: String = (0..10)
             .flat_map(|y| (0..30).map(move |x| (x, y)))
             .map(|(x, y)| buf[(x, y)].symbol().to_owned())

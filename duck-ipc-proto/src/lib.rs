@@ -2624,6 +2624,16 @@ pub struct MapFrame {
     pub cells: String,
     pub n_submaps: u32,
     pub n_loops: u32,
+    /// Still-windows integrated so far — the number that says whether the
+    /// robot's stops are actually reaching the map. A map that "shows
+    /// nothing" with `windows: 0` is a robot that never stood still long
+    /// enough; with `windows: 30` it is a rendering question.
+    #[serde(default)]
+    pub windows: u32,
+    /// Whether the mapper currently believes the robot is standing still
+    /// (i.e. a scan window is accumulating right now).
+    #[serde(default)]
+    pub still: bool,
 }
 
 /// Standard base64 (RFC 4648, with padding), owned here so both ends of

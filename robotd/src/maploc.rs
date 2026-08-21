@@ -50,6 +50,12 @@ const AUTOSAVE_EVERY: Duration = Duration::from_secs(60);
 /// Map publish cadence when someone is subscribed.
 const PUBLISH_EVERY: Duration = Duration::from_secs(1);
 
+/// A still window is flushed into the map after this long even if the robot
+/// keeps standing — the first field test stood the robot in place, watched
+/// the map, and saw nothing: the window only integrated on the next MOTION,
+/// which never came. The map must build while you look at it.
+const WINDOW_FLUSH_AFTER: Duration = Duration::from_secs(3);
+
 /// One tick's worth of the robot's own state, as the control loop sees it.
 #[derive(Debug, Clone, Copy)]
 pub struct OdomSample {
@@ -145,6 +151,8 @@ fn worker(
     let mut last_save = Instant::now();
     let mut seq = 0u64;
     let mut unsaved = false;
+    let mut windows = 0u32;
+    let mut window_opened: Option<Instant> = None;
 
     // Blocking recv; a closed channel is the shutdown signal.
     while let Ok(event) = rx.recv() {
@@ -164,18 +172,27 @@ fn worker(
                         (dx * dx + dy * dy).sqrt() < 0.01 && dyaw.abs() < 0.05
                     });
 
-                // A still window just ended: vote, filter, ink.
-                if was_still
-                    && !still
+                // A window flushes when the stand ends — or after
+                // WINDOW_FLUSH_AFTER while it continues, so the map builds
+                // while you watch instead of waiting for the next step.
+                let stand_ended = was_still && !still;
+                let ripe = window_opened.is_some_and(|at| at.elapsed() >= WINDOW_FLUSH_AFTER);
+                if (stand_ended || ripe)
                     && !acc.is_empty()
                     && let Some((pose, composite)) = acc.finish()
                 {
-                    tracing::debug!(
+                    tracing::info!(
                         beams = composite.n_valid(),
+                        windows = windows + 1,
                         "maploc: still window integrated"
                     );
                     slam.integrate(pose, &composite);
+                    windows += 1;
                     unsaved = true;
+                    window_opened = None;
+                }
+                if stand_ended {
+                    window_opened = None;
                 }
                 was_still = still;
                 latest = Some(sample);
@@ -201,6 +218,9 @@ fn worker(
                 match params.mode {
                     MaplocMode::StopAndScan => {
                         if was_still {
+                            if acc.is_empty() {
+                                window_opened = Some(Instant::now());
+                            }
                             acc.push(slam.tracked(), scan);
                         }
                     }
@@ -214,7 +234,7 @@ fn worker(
 
         if map_tx.receiver_count() > 0 && last_publish.elapsed() >= PUBLISH_EVERY {
             last_publish = Instant::now();
-            if let Some(frame) = render_frame(&slam, &mut seq) {
+            if let Some(frame) = render_frame(&slam, &mut seq, windows, was_still) {
                 let _ = map_tx.send(frame);
             }
         }
@@ -261,7 +281,7 @@ fn decode_ranges(
 }
 
 /// The composite map as a wire frame: trinary cells, base64.
-fn render_frame(slam: &Slam, seq: &mut u64) -> Option<proto::MapFrame> {
+fn render_frame(slam: &Slam, seq: &mut u64, windows: u32, still: bool) -> Option<proto::MapFrame> {
     let grid = slam.render()?;
     let mut cells = Vec::with_capacity(grid.width() * grid.height());
     for i in 0..grid.height() {
@@ -292,6 +312,8 @@ fn render_frame(slam: &Slam, seq: &mut u64) -> Option<proto::MapFrame> {
         cells: proto::b64::encode(&cells),
         n_submaps: slam.n_submaps() as u32,
         n_loops: slam.n_loops() as u32,
+        windows,
+        still,
     })
 }
 

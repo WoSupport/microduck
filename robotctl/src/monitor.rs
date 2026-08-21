@@ -1396,6 +1396,7 @@ impl View {
         // odometry track is what it shows the rest of the time.
         if let Some(map) = self.live_map() {
             let searching = if map.tracking { "" } else { " · searching" };
+            let standing = if map.still { " · scanning" } else { "" };
             let hint = if self.fullscreen_map {
                 " m back "
             } else {
@@ -1406,14 +1407,14 @@ impl View {
                 .title_bottom(Line::from(hint).dim().right_aligned())
                 .title_bottom(
                     Line::from(format!(
-                        " {} submaps · {} loops{searching} ",
-                        map.n_submaps, map.n_loops
+                        " {} windows · {} submaps · {} loops{standing}{searching} ",
+                        map.windows, map.n_submaps, map.n_loops
                     ))
                     .dim(),
                 );
             let inner = block.inner(area);
             frame.render_widget(block, area);
-            path_map::draw_map(&map, inner, frame.buffer_mut());
+            path_map::draw_map(&map, &self.path, inner, frame.buffer_mut());
             return;
         }
         let hint = if self.fullscreen_map {
