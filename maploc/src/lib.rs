@@ -31,6 +31,12 @@
 //!   replay         — read back the prototype's .mdlg logs for offline work
 //!   rng            — the pinned RNG determinism rides on
 
+// The optimizer, grid and matcher kernels iterate matrices and grids by
+// index on purpose: the loops mirror the maths they implement (H[r][c],
+// row-major sweeps), and iterator rewrites of numeric kernels hide the
+// indices the comments and papers speak in.
+#![allow(clippy::needless_range_loop)]
+
 pub mod accumulator;
 pub mod follower;
 pub mod global_render;

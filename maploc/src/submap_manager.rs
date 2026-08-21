@@ -168,9 +168,11 @@ mod tests {
     /// `None` forever, so a restored submap could never age out.
     #[test]
     fn restored_submap_ages_out() {
-        let mut cfg = SubmapManagerConfig::default();
-        cfg.max_age_s = 10.0;
-        cfg.max_travel_m = 1000.0; // age rule only
+        let cfg = SubmapManagerConfig {
+            max_age_s: 10.0,
+            max_travel_m: 1000.0, // age rule only
+            ..SubmapManagerConfig::default()
+        };
         let current = Some(Submap::new_at((0.0, 0.0, 0.0), cfg.grid));
         let mut mgr = SubmapManager::from_parts(cfg, Vec::new(), current);
         // First tick (resume at t=100): arms the clock, no switch.
@@ -198,9 +200,11 @@ mod tests {
 
     #[test]
     fn travel_triggers_switch() {
-        let mut cfg = SubmapManagerConfig::default();
-        cfg.max_travel_m = 1.0;
-        cfg.max_age_s = 1000.0;
+        let cfg = SubmapManagerConfig {
+            max_travel_m: 1.0,
+            max_age_s: 1000.0,
+            ..SubmapManagerConfig::default()
+        };
         let mut mgr = SubmapManager::new(cfg);
         mgr.tick(0.0, (0.0, 0.0, 0.0));
         assert_eq!(mgr.n_frozen(), 0);
@@ -213,9 +217,11 @@ mod tests {
 
     #[test]
     fn age_triggers_switch() {
-        let mut cfg = SubmapManagerConfig::default();
-        cfg.max_age_s = 5.0;
-        cfg.max_travel_m = 1000.0;
+        let cfg = SubmapManagerConfig {
+            max_age_s: 5.0,
+            max_travel_m: 1000.0,
+            ..SubmapManagerConfig::default()
+        };
         let mut mgr = SubmapManager::new(cfg);
         mgr.tick(0.0, (0.0, 0.0, 0.0));
         mgr.tick(3.0, (0.0, 0.0, 0.0));
@@ -226,9 +232,11 @@ mod tests {
 
     #[test]
     fn new_submap_anchor_equals_tracked_pose_at_switch() {
-        let mut cfg = SubmapManagerConfig::default();
-        cfg.max_travel_m = 0.5;
-        cfg.max_age_s = 1000.0;
+        let cfg = SubmapManagerConfig {
+            max_travel_m: 0.5,
+            max_age_s: 1000.0,
+            ..SubmapManagerConfig::default()
+        };
         let mut mgr = SubmapManager::new(cfg);
         mgr.tick(0.0, (0.0, 0.0, 0.0));
         let switch_pose = (1.0, 0.5, 0.7);

@@ -83,13 +83,15 @@ pub struct LoopCloserConfig {
 
 impl Default for LoopCloserConfig {
     fn default() -> Self {
-        let mut sm = ScanMatchConfig::default();
         // The prior is re-anchored at the coarse-search winner (a
         // geometry-derived pose), so it stabilizes weakly-constrained
         // DoF without dragging the match back toward odometry drift.
         // Wide sigmas keep that stabilizing role gentle.
-        sm.prior_sigma_xy = 0.50;
-        sm.prior_sigma_yaw = 0.35;
+        let sm = ScanMatchConfig {
+            prior_sigma_xy: 0.50,
+            prior_sigma_yaw: 0.35,
+            ..ScanMatchConfig::default()
+        };
         Self {
             radius_m: 1.5,
             min_index_gap: 2,
@@ -480,7 +482,13 @@ mod tests {
         let far2 = Submap::new_at((60.0, 0.0, 0.0), grid_cfg);
 
         let mut submaps = vec![a, far1, far2, b];
-        let loops = detect_loops(&mut submaps, 3, &LoopCloserConfig::default());
+        // The test scans are single 64-beam raycasts; the witness gate is
+        // tuned for the accumulator's composites, so admit them here.
+        let cfg = LoopCloserConfig {
+            min_witness_beams: 32,
+            ..LoopCloserConfig::default()
+        };
+        let loops = detect_loops(&mut submaps, 3, &cfg);
         assert_eq!(
             loops.len(),
             1,
@@ -563,7 +571,13 @@ mod tests {
         let far1 = Submap::new_at((50.0, 0.0, 0.0), grid_cfg);
         let far2 = Submap::new_at((60.0, 0.0, 0.0), grid_cfg);
         let mut submaps = vec![a, far1, far2, b];
-        let loops = detect_loops(&mut submaps, 3, &LoopCloserConfig::default());
+        // The test scans are single 64-beam raycasts; the witness gate is
+        // tuned for the accumulator's composites, so admit them here.
+        let cfg = LoopCloserConfig {
+            min_witness_beams: 32,
+            ..LoopCloserConfig::default()
+        };
+        let loops = detect_loops(&mut submaps, 3, &cfg);
         assert!(
             loops.is_empty(),
             "agreeing closure must be skipped by the correction floor, \

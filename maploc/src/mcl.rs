@@ -961,10 +961,10 @@ mod tests {
         // the closest occupied cell).
         let mut inside_free = 0usize;
         for p in &mcl.particles {
-            if let Some((i, j)) = grid.world_to_idx(p.0, p.1) {
-                if grid.is_known_free(i, j) {
-                    inside_free += 1;
-                }
+            if let Some((i, j)) = grid.world_to_idx(p.0, p.1)
+                && grid.is_known_free(i, j)
+            {
+                inside_free += 1;
             }
         }
         assert!(

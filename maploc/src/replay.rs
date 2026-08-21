@@ -327,7 +327,7 @@ mod tests {
         f.write_all(&123_456_789u64.to_le_bytes()).unwrap();
         // ToF record at ts_us = 1000.
         let mut tof_payload = Vec::new();
-        tof_payload.extend(&3.1415_f64.to_le_bytes());
+        tof_payload.extend(&1.2345_f64.to_le_bytes());
         tof_payload.push(8); // rows
         tof_payload.push(8); // cols
         tof_payload.extend(&[0u8, 0u8]); // reserved
@@ -379,7 +379,7 @@ mod tests {
         let rec1 = r.next().unwrap().unwrap();
         if let Record::Tof(t) = rec1 {
             assert_eq!(t.ts_us, 1000);
-            assert!((t.sender_ts_s - 3.1415).abs() < 1e-9);
+            assert!((t.sender_ts_s - 1.2345).abs() < 1e-9);
             assert_eq!(t.status[0][0], 0);
             assert_eq!(t.status[7][7], 63);
             assert!((t.ranges_m[0][0] - 0.0).abs() < 1e-6);

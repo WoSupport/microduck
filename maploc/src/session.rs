@@ -64,10 +64,10 @@ pub fn save_session<P: AsRef<Path>>(
     tracked: Pose2,
 ) -> io::Result<()> {
     let path = path.as_ref();
-    if let Some(p) = path.parent() {
-        if !p.as_os_str().is_empty() {
-            std::fs::create_dir_all(p)?;
-        }
+    if let Some(p) = path.parent()
+        && !p.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(p)?;
     }
     let view = SessionStateRef {
         frozen,
@@ -91,12 +91,11 @@ pub fn save_session<P: AsRef<Path>>(
     std::fs::rename(&tmp, path)?;
     // Best-effort fsync of the parent directory so the rename itself
     // survives a power cut (POSIX doesn't guarantee it otherwise).
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Ok(d) = File::open(parent) {
-                let _ = d.sync_all();
-            }
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(d) = File::open(parent)
+    {
+        let _ = d.sync_all();
     }
     Ok(())
 }

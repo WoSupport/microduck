@@ -63,12 +63,14 @@ fn main() {
     let mut graph = PoseGraph::new();
     let mut node_for_submap: Vec<usize> = Vec::new();
     let odom_info = information_from_sigmas(0.10, 0.05);
-    let mut loop_cfg = LoopCloserConfig::default();
-    loop_cfg.verbose = std::env::var("MAPLOC_VERBOSE").is_ok();
     // Residual intra-submap drift is real; demanding 6 cm consensus from
     // witnesses captured a stop apart rejects true closures.
-    loop_cfg.verify_max_spread_m = 0.12;
-    loop_cfg.verify_max_spread_rad = 0.09;
+    let loop_cfg = LoopCloserConfig {
+        verbose: std::env::var("MAPLOC_VERBOSE").is_ok(),
+        verify_max_spread_m: 0.12,
+        verify_max_spread_rad: 0.09,
+        ..LoopCloserConfig::default()
+    };
     let opt_cfg = OptimizerConfig::default();
 
     // Tracking state, mirroring the runtime: odom deltas composed in body
@@ -193,16 +195,16 @@ fn main() {
                 }
                 if !continuous && !still {
                     // A still window just ended: vote, filter, integrate.
-                    if let Some((pose, composite)) = acc.finish() {
-                        if let Some(cur) = mgr.current_mut() {
-                            cur.integrate_scan(pose, &composite);
-                            n_used += 1;
-                            kept.push((
-                                mgr.n_total() - 1,
-                                between(mgr.current().expect("current").anchor_pose(), pose),
-                                composite,
-                            ));
-                        }
+                    if let Some((pose, composite)) = acc.finish()
+                        && let Some(cur) = mgr.current_mut()
+                    {
+                        cur.integrate_scan(pose, &composite);
+                        n_used += 1;
+                        kept.push((
+                            mgr.n_total() - 1,
+                            between(mgr.current().expect("current").anchor_pose(), pose),
+                            composite,
+                        ));
                     }
                     continue;
                 }
@@ -260,16 +262,16 @@ fn main() {
         }
     }
 
-    if let Some((pose, composite)) = acc.finish() {
-        if let Some(cur) = mgr.current_mut() {
-            cur.integrate_scan(pose, &composite);
-            n_used += 1;
-            kept.push((
-                mgr.n_total() - 1,
-                between(mgr.current().expect("current").anchor_pose(), pose),
-                composite,
-            ));
-        }
+    if let Some((pose, composite)) = acc.finish()
+        && let Some(cur) = mgr.current_mut()
+    {
+        cur.integrate_scan(pose, &composite);
+        n_used += 1;
+        kept.push((
+            mgr.n_total() - 1,
+            between(mgr.current().expect("current").anchor_pose(), pose),
+            composite,
+        ));
     }
     // Truth poses through the FINAL anchors.
     let anchor_of = |idx: usize| -> Pose2 {

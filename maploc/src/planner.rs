@@ -61,10 +61,7 @@ pub fn plan(
     let h = grid.height();
 
     let s = grid.world_to_idx(start.0, start.1)?;
-    let g = match grid.world_to_idx(goal.0, goal.1) {
-        Some(g) => g,
-        None => return None,
-    };
+    let g = grid.world_to_idx(goal.0, goal.1)?;
 
     // If the start is blocked (probably duck radius vs wall), fall
     // back to nearest free cell — otherwise A* never explores.
@@ -225,10 +222,11 @@ fn astar(
                 continue;
             }
             // Forbid diagonal moves that "squeeze through" two blocked corners.
-            if di != 0 && dj != 0 {
-                if blocked[ci * w + (nj as usize)] || blocked[(ni as usize) * w + cj] {
-                    continue;
-                }
+            if di != 0
+                && dj != 0
+                && (blocked[ci * w + (nj as usize)] || blocked[(ni as usize) * w + cj])
+            {
+                continue;
             }
             let tentative = cur_g.saturating_add(step_cost);
             if tentative < g_score[nidx] {
@@ -392,7 +390,7 @@ mod tests {
         let w = 4usize;
         let h = 4usize;
         let mut blocked = vec![false; w * h];
-        blocked[1 * w + 2] = true;
+        blocked[w + 2] = true;
         blocked[2 * w + 1] = true;
         assert!(
             !line_of_sight(&blocked, w, h, (0, 0), (3, 3)),

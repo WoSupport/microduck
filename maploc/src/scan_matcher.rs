@@ -109,7 +109,7 @@ pub fn match_scan(
     // Snapshot grid metadata before we (mutably) touch the field.
     let cell = grid.cell();
     let cell_inv = 1.0 / cell;
-    let cfg_g = grid.cfg().clone();
+    let cfg_g = *grid.cfg();
     let h = grid.height();
     let w = grid.width();
     let field = grid.distance_field(cfg.occ_threshold_fp);

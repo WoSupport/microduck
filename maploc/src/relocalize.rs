@@ -99,6 +99,7 @@ pub struct RelocalizeResult {
 /// ray's midpoint breaks the degeneracy for a fraction of a ray-cast's
 /// cost.
 #[inline]
+#[allow(clippy::too_many_arguments)] // a hot kernel fed unpacked grid metadata on purpose
 fn score_offsets(
     cx: f32,
     cy: f32,
@@ -347,7 +348,7 @@ pub fn relocalize_against_grid(
                         continue;
                     }
                     let mean = sum / (offsets.len() as f32);
-                    if best.as_ref().map_or(true, |b| mean < b.mean_residual_m) {
+                    if best.as_ref().is_none_or(|b| mean < b.mean_residual_m) {
                         best = Some(RelocalizeResult {
                             pose: (cx, cy, wrap_pi(yaw)),
                             mean_residual_m: mean,

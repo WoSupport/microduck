@@ -746,7 +746,7 @@ mod tests {
         let g = OccupancyGrid::new(GridConfig::default());
         let mut bytes = g.to_bytes();
         // Stomp the width field (offset 28: magic 4 + version 4 + 5×f32).
-        bytes[28..32].copy_from_slice(&0xFFFF_FFu32.to_le_bytes());
+        bytes[28..32].copy_from_slice(&0x00FF_FFFF_u32.to_le_bytes());
         let r = OccupancyGrid::read_from(&mut bytes.as_slice());
         assert!(r.is_err(), "corrupt header must be rejected");
     }
