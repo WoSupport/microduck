@@ -1219,6 +1219,7 @@ async fn control_loop<T: RobotIo>(
                         // window on the worker side absorbs far more than that.
                         moving: state.moving.load(Ordering::Relaxed),
                         sitting: controller.as_ref().is_some_and(|c| c.is_sitting()),
+                        fallen: safety.fallen(),
                     });
                 }
             }

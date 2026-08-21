@@ -18,7 +18,7 @@
 //! f32 gravity_x, gravity_y, gravity_z   (projected gravity, body frame)
 //! f32 trunk_z                            (metres above the floor)
 //! f32 head[4]                            (neck_pitch, head_pitch, head_yaw, head_roll)
-//! u8  flags                              bit 0 = moving, bit 1 = sitting
+//! u8  flags                              bit 0 = moving, bit 1 = sitting, bit 2 = fallen
 //! ```
 
 use std::fs::File;
@@ -34,6 +34,7 @@ pub const STREAM_ODOM: u8 = 2;
 
 pub const FLAG_MOVING: u8 = 1;
 pub const FLAG_SITTING: u8 = 2;
+pub const FLAG_FALLEN: u8 = 4;
 
 /// Appends records to one `.mdlg` file. Buffered; call [`Self::flush`] on
 /// whatever cadence losing the tail to a crash stops being acceptable.
@@ -104,6 +105,7 @@ impl SessionRecorder {
         head: [f32; 4],
         moving: bool,
         sitting: bool,
+        fallen: bool,
     ) -> io::Result<()> {
         self.header(STREAM_ODOM, 11 * 4 + 1)?;
         for v in [
@@ -118,6 +120,9 @@ impl SessionRecorder {
         }
         if sitting {
             flags |= FLAG_SITTING;
+        }
+        if fallen {
+            flags |= FLAG_FALLEN;
         }
         self.w.write_all(&[flags])
     }
@@ -144,6 +149,7 @@ mod tests {
                 [0.1, 0.2, 0.3, 0.4],
                 false,
                 true,
+                false,
             )
             .expect("odom");
             let mm: Vec<i16> = (0..64).collect();
@@ -160,6 +166,7 @@ mod tests {
                 assert_eq!(o.head, [0.1, 0.2, 0.3, 0.4]);
                 assert!(!o.moving);
                 assert!(o.sitting);
+                assert!(!o.fallen);
             }
             other => panic!("expected Odom, got {other:?}"),
         }

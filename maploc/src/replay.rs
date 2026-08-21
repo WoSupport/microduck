@@ -123,6 +123,8 @@ pub struct OdomRecord {
     /// Seated — the ground-truth protocol's kidnap marker: a carried robot
     /// is sat first, and odometry cannot see a carry but cannot miss a sit.
     pub sitting: bool,
+    /// Fallen over — a fall can displace and rotate the robot.
+    pub fallen: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +334,7 @@ fn decode_odom(ts_us: u64, payload: &[u8]) -> io::Result<OdomRecord> {
         head: [f(7), f(8), f(9), f(10)],
         moving: flags & crate::record::FLAG_MOVING != 0,
         sitting: flags & crate::record::FLAG_SITTING != 0,
+        fallen: flags & crate::record::FLAG_FALLEN != 0,
     })
 }
 

@@ -205,6 +205,7 @@ fn main() {
                         odom,
                         moving: o.moving,
                         sitting: o.sitting,
+                        fallen: o.fallen,
                     },
                     &mut notes,
                 );
@@ -338,6 +339,17 @@ fn main() {
                     if lost_at.is_none() {
                         lost_at = Some(t);
                     }
+                }
+                Note::SuspectAfterFall => {
+                    println!("[{t:7.1}s] FELL — pose suspect");
+                }
+                Note::ResumedUnverified { pose } => {
+                    println!(
+                        "[{t:7.1}s] resumed UNVERIFIED at ({:.2}, {:.2}, {:.1}°) — nothing could judge the pose",
+                        pose.0,
+                        pose.1,
+                        pose.2.to_degrees()
+                    );
                 }
                 Note::WindowQuarantined {
                     mean_residual_m,

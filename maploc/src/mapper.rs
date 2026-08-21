@@ -139,6 +139,13 @@ pub struct MapperConfig {
     /// while 0.3 m off the truth. A window that sees the scene it claims
     /// to stand in gets judged on half its beams, not an eighth.
     pub relocalize_confirm_min_fraction: f32,
+    /// When suspicion came from a sit, a fall or a session resume (soft —
+    /// nothing has CONTRADICTED the pose) and this many windows could not
+    /// be judged either way (unmapped view), give up and resume at the
+    /// odometry-carried pose. Without an escape, a robot that sits facing
+    /// an unmapped corner stays "searching" forever; with evidence of
+    /// displacement the escape never applies.
+    pub suspect_give_up_windows: u32,
 }
 
 impl Default for MapperConfig {
@@ -166,6 +173,7 @@ impl Default for MapperConfig {
             relocalize_max_beams: 256,
             relocalize_confirm_max_residual_m: 0.10,
             relocalize_confirm_min_fraction: 0.3,
+            suspect_give_up_windows: 10,
         }
     }
 }
@@ -182,6 +190,9 @@ pub struct MapperSample {
     /// floor clutter, and the ground-truth protocol uses the sit as its
     /// kidnap marker.
     pub sitting: bool,
+    /// Fallen over: a fall can displace and rotate the robot, and the
+    /// scans from the floor are garbage anyway.
+    pub fallen: bool,
 }
 
 /// What one call did — the host turns these into log lines; the bench
@@ -217,6 +228,14 @@ pub enum Note {
     /// window confirms it — the current pose is pre-seeded as the
     /// relocalize candidate, so an unmoved robot confirms in one window.
     SuspectAfterSit,
+    /// The robot fell: same treatment as a sit — a fall can drag and spin.
+    SuspectAfterFall,
+    /// Soft suspicion (sit/fall/resume) expired: nothing could judge the
+    /// pose either way for `suspect_give_up_windows` windows, so tracking
+    /// resumed at the odometry-carried pose, unverified.
+    ResumedUnverified {
+        pose: Pose2,
+    },
     /// The map could judge this window and flatly contradicts it.
     LostTracking {
         mean_residual_m: f32,
@@ -254,6 +273,14 @@ pub struct Mapper {
     /// tracked pose when it was proposed — odometry deltas since then move
     /// the candidate along with the robot).
     pending_reloc: Option<(Pose2, Pose2)>,
+    /// The "I was not moved" hypothesis, when suspicion is soft (sit,
+    /// fall, session resume — no scan has contradicted the pose). Same
+    /// (pose, tracked-then) carrying as `pending_reloc`. Cleared when a
+    /// judgeable window REFUTES it: that is evidence of displacement, and
+    /// the give-up escape must never fire after evidence.
+    soft_seed: Option<(Pose2, Pose2)>,
+    /// Windows since suspicion that could not be judged either way.
+    unjudged: u32,
     /// The map as it stood when the current stand began — what the
     /// watchdog judges the stand's windows against. Judging against the
     /// LIVE map lets a kidnapped stand vouch for itself: its first window
@@ -270,7 +297,7 @@ pub struct Mapper {
 
 impl Mapper {
     pub fn new(cfg: MapperConfig, slam: Slam) -> Self {
-        Self {
+        let mut mapper = Self {
             acc: WindowAccumulator::new(cfg.accumulator),
             cfg,
             slam,
@@ -281,9 +308,32 @@ impl Mapper {
             lost: false,
             suspect: 0,
             pending_reloc: None,
+            soft_seed: None,
+            unjudged: 0,
             stand_grid: None,
             last_window: None,
+        };
+        // A resumed session cannot vouch for its pose: the robot may have
+        // been moved, or even booted in another room, while the daemon was
+        // down. Suspect until a window confirms — an unmoved robot
+        // confirms in one. (A fresh mapper has nothing to confirm against
+        // and starts trusting, as it must.)
+        if mapper.slam.n_submaps() > 0 {
+            mapper.arm_suspicion();
         }
+        mapper
+    }
+
+    /// Soft suspicion: keep tracking odometry, ink nothing, and let the
+    /// windows either confirm the carried pose, refute it (→ search), or
+    /// exhaust the give-up budget.
+    fn arm_suspicion(&mut self) {
+        self.lost = true;
+        self.suspect = 0;
+        self.unjudged = 0;
+        let here = self.slam.tracked();
+        self.soft_seed = Some((here, here));
+        self.pending_reloc = None;
     }
 
     pub fn slam(&self) -> &Slam {
@@ -321,18 +371,22 @@ impl Mapper {
         let horizon = self.cfg.still.window_s;
         self.odom_window.retain(|&(at, ..)| t_s - at <= horizon);
 
-        // A sit invalidates the pose: the robot cannot feel a carry. Arm
-        // the lost machinery with "I was not moved" as the candidate —
-        // cheap to confirm when true, refused when false.
-        if sample.sitting && !self.lost {
-            self.lost = true;
-            self.suspect = 0;
-            self.pending_reloc = Some((self.slam.tracked(), self.slam.tracked()));
-            notes.push(Note::SuspectAfterSit);
+        // A sit or a fall invalidates the pose: the robot cannot feel a
+        // carry, and a fall can drag and spin it. Arm the lost machinery
+        // with "I was not moved" as the seed — cheap to confirm when
+        // true, refused when false.
+        if (sample.sitting || sample.fallen) && !self.lost {
+            self.arm_suspicion();
+            notes.push(if sample.fallen {
+                Note::SuspectAfterFall
+            } else {
+                Note::SuspectAfterSit
+            });
         }
 
         let still = !sample.moving
             && !sample.sitting
+            && !sample.fallen
             && self.odom_window.first().is_some_and(|&(_, fx, fy, fyaw)| {
                 let dx = sample.odom.0 - fx;
                 let dy = sample.odom.1 - fy;
@@ -421,41 +475,93 @@ impl Mapper {
             let Some(mut grid) = self.slam.render() else {
                 return;
             };
+            // Candidates are confirmed by THIS window, carried to the
+            // candidate-implied pose by the odometry accumulated since
+            // they were proposed. Three verdicts per attempt: confirmed
+            // (tracking resumes there), refuted (a judgeable window
+            // disagreed — real evidence), or unjudgeable (unmapped view).
+            enum Verdict {
+                Confirmed(Pose2, f32),
+                Refuted,
+                Unjudgeable,
+            }
             let wd = self.cfg.watchdog;
-            // A pending candidate from the previous window is confirmed by
-            // THIS window, carried to the candidate-implied pose by the
-            // odometry accumulated in between.
-            if let Some((cand, tracked_then)) = self.pending_reloc.take() {
-                let implied = compose(cand, between(tracked_then, self.slam.tracked()));
+            let check = |cand: Pose2,
+                             tracked_then: Pose2,
+                             grid: &mut OccupancyGrid,
+                             tracked_now: Pose2|
+             -> (Pose2, Verdict) {
+                let implied = compose(cand, between(tracked_then, tracked_now));
                 let a = score_pose(
-                    &mut grid,
+                    grid,
                     composite,
                     implied,
                     wd.clamp_m,
                     wd.wall_threshold_fp,
                     wd.observed_fp,
                 );
-                if a.n_observed >= wd.min_observed_beams
+                let judgeable = a.n_observed >= wd.min_observed_beams
                     && a.n_observed as f32
-                        >= self.cfg.relocalize_confirm_min_fraction * a.n_beams as f32
+                        >= self.cfg.relocalize_confirm_min_fraction * a.n_beams as f32;
+                let verdict = if judgeable
                     && a.mean_residual_m <= self.cfg.relocalize_confirm_max_residual_m
                 {
-                    self.slam.set_tracked(implied);
-                    self.ink(implied, composite);
-                    self.lost = false;
-                    self.suspect = 0;
-                    notes.push(Note::Relocalized {
-                        pose: implied,
-                        mean_residual_m: a.mean_residual_m,
-                    });
-                    return;
+                    Verdict::Confirmed(implied, a.mean_residual_m)
+                } else if judgeable {
+                    Verdict::Refuted
+                } else {
+                    Verdict::Unjudgeable
+                };
+                (implied, verdict)
+            };
+            let now = self.slam.tracked();
+
+            // The soft seed first: "I was not moved" outranks any search
+            // candidate while it stands unrefuted.
+            if let Some((cand, then)) = self.soft_seed.take() {
+                match check(cand, then, &mut grid, now) {
+                    (implied, Verdict::Confirmed(pose, resid)) => {
+                        let _ = implied;
+                        self.resume_at(pose, composite);
+                        notes.push(Note::Relocalized {
+                            pose,
+                            mean_residual_m: resid,
+                        });
+                        return;
+                    }
+                    (_, Verdict::Refuted) => {
+                        // Evidence of displacement: suspicion hardens, the
+                        // give-up escape is off the table.
+                    }
+                    (implied, Verdict::Unjudgeable) => {
+                        self.unjudged += 1;
+                        if self.unjudged >= self.cfg.suspect_give_up_windows {
+                            self.resume_at(implied, composite);
+                            notes.push(Note::ResumedUnverified { pose: implied });
+                            return;
+                        }
+                        self.soft_seed = Some((implied, now));
+                    }
                 }
-                // Fell through: the candidate was a coincidence — search anew.
             }
+
+            // Then the search's last candidate, if one is pending.
+            if let Some((cand, then)) = self.pending_reloc.take()
+                && let (_, Verdict::Confirmed(pose, resid)) = check(cand, then, &mut grid, now)
+            {
+                self.resume_at(pose, composite);
+                notes.push(Note::Relocalized {
+                    pose,
+                    mean_residual_m: resid,
+                });
+                return;
+            }
+
+            // No confirmation: search this window for a fresh candidate.
             let probe = decimate(composite, self.cfg.relocalize_max_beams);
             match relocalize_against_grid(&mut grid, &probe, &self.cfg.relocalize) {
                 Some(r) if r.accepted => {
-                    self.pending_reloc = Some((r.pose, self.slam.tracked()));
+                    self.pending_reloc = Some((r.pose, now));
                     notes.push(Note::RelocalizeCandidate {
                         pose: r.pose,
                         mean_residual_m: r.mean_residual_m,
@@ -519,6 +625,17 @@ impl Mapper {
             n_observed: agreement.1,
             n_beams: agreement.2,
         });
+    }
+
+    /// Tracking resumes at `pose`; the window that earned it inks there.
+    fn resume_at(&mut self, pose: Pose2, composite: &Scan) {
+        self.slam.set_tracked(pose);
+        self.ink(pose, composite);
+        self.lost = false;
+        self.suspect = 0;
+        self.unjudged = 0;
+        self.soft_seed = None;
+        self.pending_reloc = None;
     }
 
     fn ink(&mut self, pose: Pose2, composite: &Scan) {
@@ -621,6 +738,7 @@ mod tests {
                     odom: pose,
                     moving: false,
                     sitting: false,
+                    fallen: false,
                 },
                 notes,
             );
@@ -661,6 +779,7 @@ mod tests {
                     odom: (0.0, 0.0, 0.0),
                     moving: false,
                     sitting: true,
+                    fallen: false,
                 },
                 &mut notes,
             );
@@ -682,6 +801,7 @@ mod tests {
                     odom: (0.0, 0.0, 0.0),
                     moving: false,
                     sitting: false,
+                    fallen: false,
                 },
                 &mut notes,
             );
@@ -721,6 +841,7 @@ mod tests {
                     odom: (0.0, 0.0, 0.0),
                     moving: false,
                     sitting: true,
+                    fallen: false,
                 },
                 &mut notes,
             );
@@ -739,6 +860,132 @@ mod tests {
         });
         let pose = confirmed.expect("confirmation shows up as a relocalization");
         assert!((pose.0 - before.0).hypot(pose.1 - before.1) < 0.05);
+    }
+
+    /// A fall arms the same suspicion as a sit, and an unmoved robot
+    /// confirms its pose and resumes.
+    #[test]
+    fn a_fall_makes_the_pose_suspect_and_recovers() {
+        let mut mapper = Mapper::new(MapperConfig::default(), Slam::new(SlamConfig::default()));
+        let mut notes = Vec::new();
+        let mut t = drive(&mut mapper, 0.0, (0.0, 0.0, 0.0), 8.0, &mut notes);
+        for _ in 0..50 {
+            mapper.observe(
+                t,
+                MapperSample {
+                    odom: (0.0, 0.0, 0.0),
+                    moving: false,
+                    sitting: false,
+                    fallen: true,
+                },
+                &mut notes,
+            );
+            t += 0.02;
+        }
+        assert!(!mapper.tracking(), "a fall must make the pose suspect");
+        drive(&mut mapper, t, (0.0, 0.0, 0.0), 8.0, &mut notes);
+        assert!(
+            mapper.tracking(),
+            "an unmoved robot must confirm and resume"
+        );
+    }
+
+    /// A resumed session boots with a suspect pose (the robot may have
+    /// been moved while the daemon was off) and confirms it from the
+    /// first window when it was not.
+    #[test]
+    fn a_resumed_session_confirms_before_inking() {
+        let mut mapper = Mapper::new(MapperConfig::default(), Slam::new(SlamConfig::default()));
+        let mut notes = Vec::new();
+        drive(&mut mapper, 0.0, (0.0, 0.0, 0.0), 8.0, &mut notes);
+        let path = std::env::temp_dir().join(format!(
+            "maploc_mapper_resume_{}.session",
+            std::process::id()
+        ));
+        mapper.slam().save(&path).expect("save");
+        let restored = crate::session::SessionState::load(&path)
+            .expect("load")
+            .expect("present");
+        std::fs::remove_file(&path).ok();
+
+        let mut resumed = Mapper::new(
+            MapperConfig::default(),
+            Slam::from_session(SlamConfig::default(), restored),
+        );
+        assert!(
+            !resumed.tracking(),
+            "a resumed map must not vouch for its pose"
+        );
+        drive(&mut resumed, 100.0, (0.0, 0.0, 0.0), 8.0, &mut notes);
+        assert!(
+            resumed.tracking(),
+            "booting where it saved must confirm from the first window"
+        );
+    }
+
+    /// Soft suspicion facing territory the map cannot judge gives up
+    /// after its budget and resumes at the odometry-carried pose —
+    /// without the escape, a robot that sits facing an unmapped corner
+    /// would say "searching" forever.
+    #[test]
+    fn soft_suspicion_gives_up_when_nothing_can_judge() {
+        let mut mapper = Mapper::new(MapperConfig::default(), Slam::new(SlamConfig::default()));
+        let mut notes = Vec::new();
+        let mut t = drive(&mut mapper, 0.0, (0.0, 0.0, 0.0), 8.0, &mut notes);
+        // Sit (suspicion), then wake up somewhere the map has never seen:
+        // odometry says (5, 5) — far outside the mapped room — and the
+        // scans are a fixed ring nothing can compare against.
+        for _ in 0..50 {
+            mapper.observe(
+                t,
+                MapperSample {
+                    odom: (0.0, 0.0, 0.0),
+                    moving: false,
+                    sitting: true,
+                    fallen: false,
+                },
+                &mut notes,
+            );
+            t += 0.02;
+        }
+        assert!(!mapper.tracking());
+        let ring: Vec<f32> = (0..240)
+            .map(|k| -std::f32::consts::PI + k as f32 * (2.0 * std::f32::consts::PI / 240.0))
+            .collect();
+        let ranges = vec![1.0f32; 240];
+        let scan = || Scan::from_polar(&ring, &ranges, (0.0, 0.0), 1e-3);
+        let mut next_frame = t;
+        let mut resumed = None;
+        let end = t + 60.0;
+        while t < end {
+            mapper.observe(
+                t,
+                MapperSample {
+                    odom: (5.0, 5.0, 0.0),
+                    moving: false,
+                    sitting: false,
+                    fallen: false,
+                },
+                &mut notes,
+            );
+            if t >= next_frame {
+                mapper.frame(t, scan());
+                next_frame += 1.0 / 15.0;
+            }
+            for n in notes.drain(..) {
+                if let Note::ResumedUnverified { pose } = n {
+                    resumed = Some(pose);
+                }
+            }
+            if resumed.is_some() {
+                break;
+            }
+            t += 0.02;
+        }
+        let pose = resumed.expect("soft suspicion must eventually give up");
+        assert!(mapper.tracking());
+        // The odometry carried the pose to (5, 5) relative to the seed.
+        assert!((pose.0 - 5.0).abs() < 0.1 && (pose.1 - 5.0).abs() < 0.1);
     }
 
     /// Beams into unexplored territory must never read as "lost".

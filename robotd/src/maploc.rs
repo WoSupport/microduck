@@ -68,6 +68,8 @@ pub struct OdomSample {
     /// Seated. The mapper never maps from sitting height, and the
     /// ground-truth protocol uses the sit as its kidnap marker.
     pub sitting: bool,
+    /// Fallen over (the safety layer's verdict).
+    pub fallen: bool,
 }
 
 enum Event {
@@ -169,6 +171,10 @@ fn worker(
         slam,
     );
 
+    if !mapper.tracking() {
+        tracing::info!("maploc: resumed map with a suspect pose — confirming before anything inks");
+    }
+
     let mut recorder = params.record_dir.as_ref().and_then(|dir| {
         if let Err(e) = std::fs::create_dir_all(dir) {
             tracing::warn!(error = %e, dir = %dir.display(), "maploc: cannot create record_dir");
@@ -218,6 +224,7 @@ fn worker(
                             sample.head.map(|h| h as f32),
                             sample.moving,
                             sample.sitting,
+                            sample.fallen,
                         )
                         .is_err()
                 {
@@ -230,6 +237,7 @@ fn worker(
                         odom: sample.odom,
                         moving: sample.moving,
                         sitting: sample.sitting,
+                        fallen: sample.fallen,
                     },
                     &mut notes,
                 );
@@ -302,6 +310,16 @@ fn worker(
                 }
                 Note::SuspectAfterSit => {
                     tracing::info!("maploc: robot sat — pose suspect until a window confirms it");
+                }
+                Note::SuspectAfterFall => {
+                    tracing::info!("maploc: robot fell — pose suspect until a window confirms it");
+                }
+                Note::ResumedUnverified { pose } => {
+                    tracing::warn!(
+                        x = format!("{:.2}", pose.0),
+                        y = format!("{:.2}", pose.1),
+                        "maploc: nothing could judge the pose; resumed unverified"
+                    );
                 }
                 Note::RelocalizeCandidate {
                     pose,
