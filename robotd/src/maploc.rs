@@ -153,6 +153,11 @@ fn worker(
     let mut unsaved = false;
     let mut windows = 0u32;
     let mut window_opened: Option<Instant> = None;
+    // Field diagnostics: one line every 5 s says what mapping is actually
+    // doing, because "the map shows nothing" has half a dozen distinct
+    // causes and a journal that names the live one beats guessing.
+    let mut last_status = Instant::now();
+    let (mut n_odom, mut n_frames, mut n_frames_kept) = (0u64, 0u64, 0u64);
 
     // Blocking recv; a closed channel is the shutdown signal.
     while let Ok(event) = rx.recv() {
@@ -196,12 +201,14 @@ fn worker(
                 }
                 was_still = still;
                 latest = Some(sample);
+                n_odom += 1;
 
                 if slam.tick(started.elapsed().as_secs_f32()) {
                     unsaved = true;
                 }
             }
             Event::Frame(frame) => {
+                n_frames += 1;
                 let Some(sample) = latest else { continue };
                 let Some(ranges) = decode_ranges(&frame) else {
                     continue;
@@ -222,6 +229,7 @@ fn worker(
                                 window_opened = Some(Instant::now());
                             }
                             acc.push(slam.tracked(), scan);
+                            n_frames_kept += 1;
                         }
                     }
                     MaplocMode::Continuous => {
@@ -230,6 +238,35 @@ fn worker(
                     }
                 }
             }
+        }
+
+        if last_status.elapsed() >= Duration::from_secs(5) {
+            last_status = Instant::now();
+            let (dxy, dyaw) = odom_window
+                .first()
+                .zip(latest.as_ref())
+                .map(|(first, s)| {
+                    let dx = s.odom.0 - first.1;
+                    let dy = s.odom.1 - first.2;
+                    (
+                        (dx * dx + dy * dy).sqrt(),
+                        wrap_pi(s.odom.2 - first.3).abs(),
+                    )
+                })
+                .unwrap_or((f32::NAN, f32::NAN));
+            tracing::info!(
+                odom = n_odom,
+                frames = n_frames,
+                kept = n_frames_kept,
+                windows,
+                still = was_still,
+                moving = latest.as_ref().is_some_and(|s| s.moving),
+                window_frames = acc.len(),
+                dxy_500ms = format!("{dxy:.4}"),
+                dyaw_500ms = format!("{dyaw:.4}"),
+                submaps = slam.n_submaps(),
+                "maploc: status"
+            );
         }
 
         if map_tx.receiver_count() > 0 && last_publish.elapsed() >= PUBLISH_EVERY {
@@ -327,6 +364,7 @@ pub async fn feed_tof(host: Host) {
     loop {
         match tokio::net::UnixStream::connect(proto::socket::TOF).await {
             Ok(stream) => {
+                tracing::info!("maploc: connected to tofd's depth stream");
                 backoff = Duration::from_millis(500);
                 let (read, mut write) = stream.into_split();
                 let hello = serde_json::to_string(&proto::Request::call(
@@ -359,8 +397,11 @@ pub async fn feed_tof(host: Host) {
                 }
                 tracing::debug!("maploc: tofd stream ended; reconnecting");
             }
-            Err(_) => {
-                // Absent socket is the no-sensor board; stay quiet about it.
+            Err(e) => {
+                // Common on a no-sensor board; say it once per backoff step
+                // at debug, because a silent failure here already cost a
+                // field-test afternoon.
+                tracing::debug!(error = %e, "maploc: cannot reach tofd");
             }
         }
         tokio::time::sleep(backoff).await;
