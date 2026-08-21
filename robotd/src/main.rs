@@ -1665,8 +1665,14 @@ async fn control_loop<T: RobotIo>(
                     Ok(step) => (
                         step.targets,
                         step.gain,
-                        // A scripted move is motion whatever the twist says; so is walking.
-                        step.busy || command.twist_magnitude() > 0.0,
+                        // A scripted move is motion whatever the twist says; so is
+                        // walking. But "walking" is the policy's own standing
+                        // decision (the label), not `twist > 0.0`: a gamepad twist
+                        // idles at a not-quite-zero value below the standing
+                        // threshold, which once latched `moving` true through an
+                        // entire stop-and-scan lap — the robot stood, odometry
+                        // read zero, and mapping still refused every stop.
+                        step.busy || step.label == "walk",
                         step.label,
                     ),
                     Err(e) => {
