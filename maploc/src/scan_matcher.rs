@@ -79,10 +79,14 @@ pub struct ScanMatchResult {
     /// `sigma_m` of a wall; NaN/zero ranges skipped).
     pub n_beams_used: u32,
     /// Number of geometrically valid beams in the scan (finite, > 0),
-    /// regardless of whether they landed near a mapped wall. Callers can
-    /// gate on `n_beams_used / n_beams_valid` to reject matches where an
-    /// aliased subset scores well while most beams disagree.
+    /// regardless of whether they landed near a mapped wall.
     pub n_beams_valid: u32,
+    /// Of the valid beams, how many landed in a cell the target grid has
+    /// actually OBSERVED (known free or wall) at the final pose. THIS is
+    /// the denominator for a coverage gate: a 360° scan matched against a
+    /// small submap parks most of its beams outside what that submap ever
+    /// saw, and counting those as "disagreeing" rejects every honest match.
+    pub n_beams_observed: u32,
 }
 
 /// Scan-to-map ICP. Iteratively shifts `initial_pose` (a BODY pose) so
@@ -112,7 +116,9 @@ pub fn match_scan(
     let cfg_g = *grid.cfg();
     let h = grid.height();
     let w = grid.width();
-    let field = grid.distance_field(cfg.occ_threshold_fp);
+    // The Arc clone releases the grid borrow, so the observedness check in
+    // the final scoring can read log-odds while the field stays alive.
+    let field = grid.distance_field_shared(cfg.occ_threshold_fp);
 
     // Bilinear-interpolated distance + gradient at world point.
     // Returns (d, ∂d/∂x, ∂d/∂y). Out-of-bounds: saturate to sigma, no gradient.
@@ -241,10 +247,28 @@ pub fn match_scan(
     // computed before the last delta was applied.
     let mut residual_sum_sq = 0.0_f32;
     let mut n_used = 0u32;
+    let mut n_observed = 0u32;
     let (sin_t, cos_t) = yaw.sin_cos();
     for &(bx, by) in &endpoints {
-        let (d, _, _) = sample(x + cos_t * bx - sin_t * by, y + sin_t * bx + cos_t * by);
-        if !d.is_finite() || d > cfg.sigma_m {
+        let ex = x + cos_t * bx - sin_t * by;
+        let ey = y + sin_t * bx + cos_t * by;
+        let (d, _, _) = sample(ex, ey);
+        // `sample` answers +∞ exactly when the endpoint left the grid.
+        if !d.is_finite() {
+            continue;
+        }
+        // Observed = the submap has an opinion about this cell at all.
+        // |log| ≥ 50 is half a single hit/miss — anything it ever saw.
+        if let Some((i, j)) = grid.world_to_idx(ex, ey) {
+            if grid.log_at(i, j).unsigned_abs() >= 50 {
+                n_observed += 1;
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        if d > cfg.sigma_m {
             continue;
         }
         residual_sum_sq += d * d;
@@ -263,6 +287,7 @@ pub fn match_scan(
         converged,
         n_beams_used: n_used,
         n_beams_valid,
+        n_beams_observed: n_observed,
     }
 }
 

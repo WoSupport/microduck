@@ -25,15 +25,13 @@ use std::path::PathBuf;
 
 use kinematics::tof::{Posture, Reprojector};
 use maploc::accumulator::{AccumulatorConfig, WindowAccumulator};
-use maploc::global_render::{GlobalRenderConfig, render_global};
-use maploc::loop_closer::{LoopCloserConfig, detect_loops};
+use maploc::loop_closer::LoopCloserConfig;
 use maploc::mcl::{Localizer, MclConfig};
-use maploc::optimizer::{OptimizerConfig, optimize};
-use maploc::pose_graph::{PoseEdge, PoseGraph, between, compose, information_from_sigmas};
+use maploc::pipeline::{Slam, SlamConfig};
+use maploc::pose_graph::{between, compose};
 use maploc::relocalize::{RelocalizeConfig, relocalize_against_grid};
 use maploc::replay::{Record, SessionReplayer, TwinRecord};
 use maploc::submap::{Pose2, Scan};
-use maploc::submap_manager::{SubmapManager, SubmapManagerConfig};
 
 const N_ZONES: usize = kinematics::tof::ROWS * kinematics::tof::COLS;
 
@@ -51,32 +49,13 @@ fn main() {
     });
 
     let rp = Reprojector::alpha();
-    let mut mgr = SubmapManager::new(SubmapManagerConfig {
-        // Small submaps: with stop-and-scan the atomic unit is the still
-        // window, and odometry drifts between stops — a submap spanning
-        // several stops is not rigid, and its loop-closure witnesses
-        // contradict each other by exactly that internal drift.
-        max_age_s: 8.0,
-        max_travel_m: 0.8,
-        ..SubmapManagerConfig::default()
+    let mut slam = Slam::new(SlamConfig {
+        loops: LoopCloserConfig {
+            verbose: std::env::var("MAPLOC_VERBOSE").is_ok(),
+            ..SlamConfig::default().loops
+        },
+        ..SlamConfig::default()
     });
-    let mut graph = PoseGraph::new();
-    let mut node_for_submap: Vec<usize> = Vec::new();
-    let odom_info = information_from_sigmas(0.10, 0.05);
-    // Residual intra-submap drift is real; demanding 6 cm consensus from
-    // witnesses captured a stop apart rejects true closures.
-    let loop_cfg = LoopCloserConfig {
-        verbose: std::env::var("MAPLOC_VERBOSE").is_ok(),
-        verify_max_spread_m: 0.12,
-        verify_max_spread_rad: 0.09,
-        ..LoopCloserConfig::default()
-    };
-    let opt_cfg = OptimizerConfig::default();
-
-    // Tracking state, mirroring the runtime: odom deltas composed in body
-    // frame onto `tracked`.
-    let mut tracked: Pose2 = (0.0, 0.0, 0.0);
-    let mut last_odom: Option<Pose2> = None;
     let mut latest_twin: Option<TwinRecord> = None;
     // Stillness from odometry: displacement across the last ~0.5 s window.
     let mut odom_window: VecDeque<(u64, f32, f32, f32)> = VecDeque::new();
@@ -92,7 +71,7 @@ fn main() {
     let mut kept: Vec<(usize, Pose2, Scan)> = Vec::new();
     let mut raw_kept: Vec<(Pose2, Scan)> = Vec::new(); // every still frame, unfiltered
     let mut kept_head_yaw: Vec<f32> = Vec::new(); // parallel to raw_kept
-    let (mut n_frames, mut n_used, mut n_beams_total, mut n_loops) = (0u32, 0u32, 0u64, 0u32);
+    let (mut n_frames, mut n_used, mut n_beams_total) = (0u32, 0u32, 0u64);
     let mut n_still_frames = 0u32;
 
     for record in SessionReplayer::open(&session).expect("open session") {
@@ -101,17 +80,7 @@ fn main() {
             Record::Twin(t) => {
                 let odom = (t.odom_x, t.odom_y, t.odom_yaw);
                 if odom.0.is_finite() && odom.1.is_finite() && odom.2.is_finite() {
-                    if let Some((px, py, pyaw)) = last_odom {
-                        let (dxw, dyw) = (odom.0 - px, odom.1 - py);
-                        let (cp, sp) = (pyaw.cos(), pyaw.sin());
-                        let (dxb, dyb) = (cp * dxw + sp * dyw, -sp * dxw + cp * dyw);
-                        let dyaw = wrap_pi(odom.2 - pyaw);
-                        let (cy, sy) = (tracked.2.cos(), tracked.2.sin());
-                        tracked.0 += cy * dxb - sy * dyb;
-                        tracked.1 += sy * dxb + cy * dyb;
-                        tracked.2 = wrap_pi(tracked.2 + dyaw);
-                    }
-                    last_odom = Some(odom);
+                    slam.observe_odom(odom);
                     odom_window.push_back((t.ts_us, odom.0, odom.1, odom.2));
                     while odom_window
                         .front()
@@ -121,59 +90,10 @@ fn main() {
                     }
                 }
                 latest_twin = Some(t);
-                let now_s = t.ts_us as f32 / 1e6;
-                let prev_frozen = mgr.n_frozen();
-                if mgr.tick(now_s, tracked) {
-                    let node = graph.add_node(
-                        mgr.current().expect("just opened").anchor_pose(),
-                        mgr.n_total() - 1,
-                    );
-                    node_for_submap.push(node);
-                    if mgr.n_frozen() > prev_frozen && mgr.n_frozen() >= 2 {
-                        let idx = mgr.n_frozen() - 1;
-                        let prev = mgr.frozen()[idx - 1].anchor_pose();
-                        let cur = mgr.frozen()[idx].anchor_pose();
-                        graph.add_edge(PoseEdge {
-                            from: node_for_submap[idx - 1],
-                            to: node_for_submap[idx],
-                            measurement: between(prev, cur),
-                            information: odom_info,
-                        });
-                        let loops = detect_loops(mgr.frozen_mut(), idx, &loop_cfg);
-                        for lc in &loops {
-                            n_loops += 1;
-                            println!(
-                                "loop {} → {}  resid={:.3} beams={}",
-                                lc.from_idx, lc.to_idx, lc.residual_m, lc.n_beams_used
-                            );
-                            let sigma = loop_cfg.edge_sigma_xy.max(lc.residual_m);
-                            let factor = sigma / loop_cfg.edge_sigma_xy;
-                            graph.add_edge(PoseEdge {
-                                from: node_for_submap[lc.from_idx],
-                                to: node_for_submap[lc.to_idx],
-                                measurement: lc.measurement,
-                                information: information_from_sigmas(
-                                    sigma,
-                                    loop_cfg.edge_sigma_yaw * factor,
-                                ),
-                            });
-                        }
-                        if !loops.is_empty() {
-                            let cur_node = *node_for_submap.last().expect("nodes exist");
-                            let old_anchor = graph.nodes()[cur_node].pose;
-                            let _ = optimize(&mut graph, &opt_cfg);
-                            for (sm, &node) in node_for_submap.iter().enumerate() {
-                                let pose = graph.nodes()[node].pose;
-                                if sm < mgr.n_frozen() {
-                                    mgr.frozen_mut()[sm].set_anchor_pose(pose);
-                                } else if let Some(cur) = mgr.current_mut() {
-                                    cur.set_anchor_pose(pose);
-                                }
-                            }
-                            let new_anchor = graph.nodes()[cur_node].pose;
-                            tracked = compose(new_anchor, between(old_anchor, tracked));
-                        }
-                    }
+                let before = slam.n_loops();
+                slam.tick(t.ts_us as f32 / 1e6);
+                if slam.n_loops() > before {
+                    println!("loops: {} (total)", slam.n_loops());
                 }
             }
             Record::Tof(frame) => {
@@ -195,16 +115,12 @@ fn main() {
                 }
                 if !continuous && !still {
                     // A still window just ended: vote, filter, integrate.
-                    if let Some((pose, composite)) = acc.finish()
-                        && let Some(cur) = mgr.current_mut()
-                    {
-                        cur.integrate_scan(pose, &composite);
+                    if let Some((pose, composite)) = acc.finish() {
+                        let idx = slam.n_submaps().saturating_sub(1);
+                        let local = between(slam.anchor(idx).unwrap_or((0.0, 0.0, 0.0)), pose);
+                        slam.integrate(pose, &composite);
                         n_used += 1;
-                        kept.push((
-                            mgr.n_total() - 1,
-                            between(mgr.current().expect("current").anchor_pose(), pose),
-                            composite,
-                        ));
+                        kept.push((idx, local, composite));
                     }
                     continue;
                 }
@@ -243,54 +159,49 @@ fn main() {
                 }
                 n_beams_total += flat.angles_body.len() as u64;
                 let scan = Scan::from_polar(&flat.angles_body, &flat.ranges, flat.sensor_xy, 1e-3);
-                raw_kept.push((tracked, scan.clone()));
+                raw_kept.push((slam.tracked(), scan.clone()));
                 kept_head_yaw.push(twin.joints[7]);
                 if continuous || raw_filter {
-                    if let Some(cur) = mgr.current_mut() {
-                        cur.integrate_scan(tracked, &scan);
-                        n_used += 1;
-                        kept.push((
-                            mgr.n_total() - 1,
-                            between(mgr.current().expect("current").anchor_pose(), tracked),
-                            scan,
-                        ));
-                    }
+                    let tracked = slam.tracked();
+                    let idx = slam.n_submaps().saturating_sub(1);
+                    let local = maploc::pose_graph::between(
+                        slam.anchor(idx).unwrap_or((0.0, 0.0, 0.0)),
+                        tracked,
+                    );
+                    slam.integrate(tracked, &scan);
+                    n_used += 1;
+                    kept.push((idx, local, scan));
                 } else {
-                    acc.push(tracked, scan);
+                    acc.push(slam.tracked(), scan);
                 }
             }
         }
     }
 
-    if let Some((pose, composite)) = acc.finish()
-        && let Some(cur) = mgr.current_mut()
-    {
-        cur.integrate_scan(pose, &composite);
+    if let Some((pose, composite)) = acc.finish() {
+        let idx = slam.n_submaps().saturating_sub(1);
+        let local = between(slam.anchor(idx).unwrap_or((0.0, 0.0, 0.0)), pose);
+        slam.integrate(pose, &composite);
         n_used += 1;
-        kept.push((
-            mgr.n_total() - 1,
-            between(mgr.current().expect("current").anchor_pose(), pose),
-            composite,
-        ));
+        kept.push((idx, local, composite));
     }
     // Truth poses through the FINAL anchors.
-    let anchor_of = |idx: usize| -> Pose2 {
-        if idx < mgr.n_frozen() {
-            mgr.frozen()[idx].anchor_pose()
-        } else {
-            mgr.current().map_or((0.0, 0.0, 0.0), |c| c.anchor_pose())
-        }
-    };
     let kept: Vec<(Pose2, Scan)> = kept
         .into_iter()
-        .map(|(idx, local, scan)| (compose(anchor_of(idx), local), scan))
+        .map(|(idx, local, scan)| {
+            (
+                compose(slam.anchor(idx).unwrap_or((0.0, 0.0, 0.0)), local),
+                scan,
+            )
+        })
         .collect();
     println!(
         "\n{}: {n_frames} depth frames, {n_still_frames} still, {n_used} integrated \
-         (mean {:.1} beams/scan), {} submaps, {n_loops} loops",
+         (mean {:.1} beams/scan), {} submaps, {} loops",
         session.display(),
         n_beams_total as f64 / f64::from(n_used.max(1)),
-        mgr.n_total(),
+        slam.n_submaps(),
+        slam.n_loops(),
     );
 
     // Composite scans: consecutive frames captured at (nearly) the same
@@ -407,7 +318,7 @@ fn main() {
         }
     }
 
-    let Some(mut global) = render_global(mgr.all(), &GlobalRenderConfig::default()) else {
+    let Some(mut global) = slam.render() else {
         println!("no submaps — nothing to render");
         return;
     };

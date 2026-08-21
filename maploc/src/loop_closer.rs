@@ -76,6 +76,18 @@ pub struct LoopCloserConfig {
     /// estimate is below this (translation AND yaw) — nothing to fix.
     pub min_correction_m: f32,
     pub min_correction_rad: f32,
+    /// And drop closures whose correction is IMPLAUSIBLY LARGE for the
+    /// number of submaps between the two: odometry drifts a few percent of
+    /// distance travelled, so a "correction" far beyond what could have
+    /// accumulated is an aliased match — accepting one folds distinct rooms
+    /// onto each other (observed on recorded sessions). Allowed correction
+    /// = `base + per_submap × index gap`, capped at `cap`.
+    pub max_correction_base_m: f32,
+    pub max_correction_per_submap_m: f32,
+    pub max_correction_cap_m: f32,
+    pub max_correction_base_rad: f32,
+    pub max_correction_per_submap_rad: f32,
+    pub max_correction_cap_rad: f32,
     /// If true, print one line per rejection (residual / beams) so we
     /// can debug "why did no loop close".
     pub verbose: bool,
@@ -111,6 +123,12 @@ impl Default for LoopCloserConfig {
             min_coverage: 0.40,
             min_correction_m: 0.04,
             min_correction_rad: 0.03,
+            max_correction_base_m: 0.06,
+            max_correction_per_submap_m: 0.08,
+            max_correction_cap_m: 0.60,
+            max_correction_base_rad: 0.05,
+            max_correction_per_submap_rad: 0.03,
+            max_correction_cap_rad: 0.45,
             verbose: false,
         }
     }
@@ -179,12 +197,12 @@ pub fn detect_loops(
             .filter(|s| s.scan.n_valid() >= cfg.min_witness_beams)
             .take(cfg.verify_scans.max(1))
             .collect();
-        if picked.is_empty() {
-            // Nothing strong enough to testify. No closure beats a closure
-            // sworn by a 30-beam scrap: one wrong edge warps every anchor.
+        if picked.len() < 2 {
+            // A closure warps every anchor in the graph; one witness —
+            // however large — is not enough to swear that in. Measured on
+            // recorded sessions: lone-witness closures were the wrong ones.
             continue;
         }
-        let lone_witness = picked.len() == 1;
 
         // Match each picked scan: coarse-to-fine — grid-search a window
         // around the drifted seed to land inside the GN basin, then
@@ -194,11 +212,7 @@ pub fn detect_loops(
         let mut worst_residual = 0.0_f32;
         let mut min_beams = u32::MAX;
         let mut all_pass = true;
-        let max_residual = if lone_witness {
-            cfg.max_residual_m * 0.7
-        } else {
-            cfg.max_residual_m
-        };
+        let max_residual = cfg.max_residual_m;
         for scan in &picked {
             let pose_world = compose(new_anchor, scan.pose_in_submap);
             let pose_in_older = between(older_anchor, pose_world);
@@ -289,6 +303,23 @@ pub fn detect_loops(
                 eprintln!(
                     "[loop-try] {} → {}  skipped: correction \
                            ({corr_xy:.3} m, {:.1}°) below floor",
+                    older_idx,
+                    new_idx,
+                    corr_yaw.to_degrees()
+                );
+            }
+            continue;
+        }
+        let gap = (new_idx - older_idx) as f32;
+        let allow_xy = (cfg.max_correction_base_m + cfg.max_correction_per_submap_m * gap)
+            .min(cfg.max_correction_cap_m);
+        let allow_yaw = (cfg.max_correction_base_rad + cfg.max_correction_per_submap_rad * gap)
+            .min(cfg.max_correction_cap_rad);
+        if corr_xy > allow_xy || corr_yaw > allow_yaw {
+            if cfg.verbose {
+                eprintln!(
+                    "[loop-try] {} → {}  REJECTED: correction ({corr_xy:.3} m, {:.1}°) \
+                     implausible for a {gap:.0}-submap gap",
                     older_idx,
                     new_idx,
                     corr_yaw.to_degrees()
@@ -483,9 +514,12 @@ mod tests {
 
         let mut submaps = vec![a, far1, far2, b];
         // The test scans are single 64-beam raycasts; the witness gate is
-        // tuned for the accumulator's composites, so admit them here.
+        // tuned for the accumulator's composites, so admit them here. And
+        // this scenario's whole point is a 0.4 m drift over a 3-submap gap —
+        // beyond the default plausibility budget on purpose.
         let cfg = LoopCloserConfig {
             min_witness_beams: 32,
+            max_correction_per_submap_m: 0.15,
             ..LoopCloserConfig::default()
         };
         let loops = detect_loops(&mut submaps, 3, &cfg);

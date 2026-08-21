@@ -21,6 +21,7 @@
 //!   scan_matcher   — Hector-style GN scan-to-map matching
 //!   pose_graph     — SE(2) nodes + relative-pose edges
 //!   optimizer      — dense Gauss-Newton over the full graph
+//!   pipeline       — the assembled SLAM loop a host drives (robotd, bench)
 //!   loop_closer    — coarse-to-fine submap-to-submap loop matching
 //!   global_render  — composite all submaps into one grid
 //!   mcl            — particle-filter relocalize against a saved map
@@ -44,6 +45,7 @@ pub mod grid;
 pub mod loop_closer;
 pub mod mcl;
 pub mod optimizer;
+pub mod pipeline;
 pub mod planner;
 pub mod pose_graph;
 pub mod relocalize;
