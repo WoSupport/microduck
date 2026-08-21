@@ -20,7 +20,8 @@
 //! `record_dir` is set) a ground-truth `.mdlg` recording of everything the
 //! mapper consumed, replayable through the offline bench byte-for-byte.
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use duck_ipc_proto as proto;
@@ -82,6 +83,7 @@ enum Event {
 #[derive(Clone)]
 pub struct Host {
     tx: mpsc::SyncSender<Event>,
+    searching: Arc<AtomicBool>,
 }
 
 impl Host {
@@ -95,6 +97,15 @@ impl Host {
     pub fn frame(&self, frame: proto::TofFrame) {
         let _ = self.tx.try_send(Event::Frame(Box::new(frame)));
     }
+
+    /// Is the mapper's pose suspect or lost right now? The control loop
+    /// polls this to sweep the head while standing: a single 45° wedge
+    /// aliases onto any wall at the same range, and the accumulator merges
+    /// a pan into one wide composite — the difference between the bench's
+    /// 0-for-13 relocalizes on wedges and 6-for-10 on sweeps.
+    pub fn searching(&self) -> bool {
+        self.searching.load(Ordering::Relaxed)
+    }
 }
 
 /// Start the worker and its tofd feed. `map_tx` is where rendered maps go;
@@ -104,6 +115,8 @@ pub fn spawn(
     map_tx: tokio::sync::broadcast::Sender<proto::MapFrame>,
 ) -> Host {
     let (tx, rx) = mpsc::sync_channel(EVENT_BUFFER);
+    let searching = Arc::new(AtomicBool::new(false));
+    let searching_worker = searching.clone();
     std::thread::Builder::new()
         .name("maploc".into())
         .spawn(move || {
@@ -112,7 +125,7 @@ pub fn spawn(
             unsafe {
                 libc::setpriority(libc::PRIO_PROCESS, 0, 10);
             }
-            worker(params, rx, map_tx);
+            worker(params, rx, map_tx, &searching_worker);
         })
         .expect("spawning the maploc thread cannot fail");
 
@@ -121,7 +134,10 @@ pub fn spawn(
     // one is built time-only, and a socket task spawned there dies on its
     // first connect — silently, inside the JoinHandle nobody reads. That is
     // not hypothetical; it is how field test three produced `frames=0`.
-    let feed = Host { tx: tx.clone() };
+    let feed = Host {
+        tx: tx.clone(),
+        searching: searching.clone(),
+    };
     std::thread::Builder::new()
         .name("maploc-tof".into())
         .spawn(move || {
@@ -139,13 +155,14 @@ pub fn spawn(
         })
         .expect("spawning the maploc feed thread cannot fail");
 
-    Host { tx }
+    Host { tx, searching }
 }
 
 fn worker(
     params: MaplocParams,
     rx: mpsc::Receiver<Event>,
     map_tx: tokio::sync::broadcast::Sender<proto::MapFrame>,
+    searching: &AtomicBool,
 ) {
     let slam = if params.wipe_on_boot {
         tracing::info!("maploc: starting fresh (wipe_on_boot)");
@@ -210,6 +227,8 @@ fn worker(
     // causes and a journal that names the live one beats guessing.
     let mut last_status = Instant::now();
     let (mut n_odom, mut n_frames, mut n_frames_kept) = (0u64, 0u64, 0u64);
+
+    searching.store(!mapper.tracking(), Ordering::Relaxed);
 
     // Blocking recv; a closed channel is the shutdown signal.
     while let Ok(event) = rx.recv() {
@@ -385,6 +404,7 @@ fn worker(
         if mapper.slam_mut().take_dirty() {
             unsaved = true;
         }
+        searching.store(!mapper.tracking(), Ordering::Relaxed);
 
         if last_status.elapsed() >= Duration::from_secs(5) {
             last_status = Instant::now();

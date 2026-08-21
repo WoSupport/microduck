@@ -240,6 +240,12 @@ mode = "walk"
 # Start from a clean slate instead of restoring the saved session.
 # wipe_on_boot = false
 
+# While the mapper is unsure of its pose (after a sit, a fall, a reboot, or scans that
+# contradict the map) and the robot stands still, sweep the head slowly so relocalization
+# sees a wide arc instead of a narrow wedge. The commanded head pose comes back as soon as
+# the pose is confirmed.
+# search_sweep = true
+
 # Record everything the mapper consumes (odometry ticks + raw depth frames) to a
 # timestamped .mdlg file in this directory — replayable offline through the maploc
 # crate's `evaluate` bench, byte-for-byte the way the robot saw it. ~6 KB/s while

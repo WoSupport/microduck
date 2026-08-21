@@ -1089,6 +1089,9 @@ async fn control_loop<T: RobotIo>(
     let head_alpha = params.control.head_alpha.clamp(0.0, 1.0);
     let mut twist_ema = [0.0f64; 3];
     let mut head_ema = [0.0f64; 4];
+    // The relocalize head sweep's clock; runs only while the mapper is
+    // searching and the robot stands.
+    let mut sweep_t = 0.0f64;
     let mut body_ema = [0.0f64; 3];
 
     // Coasting over a dropped bus read, and where the robot actually is.
@@ -1505,7 +1508,34 @@ async fn control_loop<T: RobotIo>(
         for (ema, target) in twist_ema.iter_mut().zip(twist_target) {
             *ema += cmd_alpha * (target - *ema);
         }
-        for (ema, target) in head_ema.iter_mut().zip(gated.head) {
+        // While the mapper cannot vouch for its pose and the robot is
+        // standing, sweep the head: relocalization through one static 45°
+        // wedge aliases (measured — see maploc::mapper); a slow pan hands
+        // the accumulator a 150°-wide composite instead. Overrides only
+        // head yaw, only while searching; the EMA below glides both the
+        // takeover and the handback.
+        let mut head_target = gated.head;
+        let sweeping = params.maploc.search_sweep
+            && maploc_host.as_ref().is_some_and(maploc::Host::searching)
+            && !state.moving.load(Ordering::Relaxed)
+            && !in_recovery
+            && controller.as_ref().is_some_and(|c| !c.is_sitting());
+        if sweeping {
+            sweep_t += dt;
+            // A triangle wave, ±0.9 rad over 6 s, starting from centre:
+            // slow enough that every wall cell stays in view for the
+            // accumulator's 3-frame vote, wide enough to triple the FOV.
+            let phase = (sweep_t / 6.0 + 0.25).fract();
+            let tri = if phase < 0.5 {
+                4.0 * phase - 1.0
+            } else {
+                3.0 - 4.0 * phase
+            };
+            head_target[2] = 0.9 * tri;
+        } else {
+            sweep_t = 0.0;
+        }
+        for (ema, target) in head_ema.iter_mut().zip(head_target) {
             *ema += head_alpha * (target - *ema);
         }
         if snapshot.pose.active {

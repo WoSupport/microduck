@@ -153,10 +153,17 @@ impl PathMap {
     }
 }
 
-/// Draw a rendered occupancy map ([`proto::MapFrame`]) into `area`: walls as
-/// braille, confirmed floor as a sparse dim stipple, the robot's map-frame
-/// pose as the same yellow marker the odometry path uses. The panel never
-/// grows; the world scales to fit — the map's whole point is seeing all of it.
+/// Confirmed-floor fill. An indexed colour (256-colour dark grey) rather
+/// than RGB, so it renders everywhere the monitor does.
+const FLOOR: Color = Color::Indexed(236);
+
+/// Draw a rendered occupancy map ([`proto::MapFrame`]) into `area`: the
+/// confirmed floor as a solid dark fill, walls as bright braille covering
+/// their whole footprint, the robot's map-frame pose as the same yellow
+/// marker the odometry path uses. The room must read as a *shape* — the
+/// first cut drew one dot per wall cell over a sparse floor stipple, and a
+/// real lap rendered as scattered stars. The panel never grows; the world
+/// scales to fit — the map's whole point is seeing all of it.
 pub fn draw_map(frame: &proto::MapFrame, path: &PathMap, area: Rect, buf: &mut Buffer) {
     let (w, h) = (area.width as usize * 2, area.height as usize * 4);
     if w < 8 || h < 8 {
@@ -184,6 +191,10 @@ pub fn draw_map(frame: &proto::MapFrame, path: &PathMap, area: Rect, buf: &mut B
     };
 
     let mut grid = Grid::new(area.width as usize, area.height as usize);
+    // Each map cell covers a little rectangle of braille dots (or, zoomed
+    // out, a single dot) — filling the footprint is what joins a wall's
+    // cells into a line and a floor's into a surface.
+    let half = cell / 2.0;
     for i in 0..rows {
         for j in 0..cols {
             let v = cells[i * cols + j];
@@ -192,12 +203,12 @@ pub fn draw_map(frame: &proto::MapFrame, path: &PathMap, area: Rect, buf: &mut B
             }
             let x = frame.x_min + (j as f32 + 0.5) * cell;
             let y = frame.y_min + (i as f32 + 0.5) * cell;
+            let a = dot(x - half, y - half);
+            let b = dot(x + half, y + half);
             if v == 2 {
-                grid.set(dot(x, y), None);
-            } else if (i + 2 * j) % 5 == 0 {
-                // Free space as a sparse stipple: enough to read the room's
-                // shape, not enough to compete with its walls.
-                grid.set(dot(x, y), Some(Color::DarkGray));
+                grid.fill(a, b, Some(Color::Gray));
+            } else {
+                grid.shade(a, b);
             }
         }
     }
@@ -232,13 +243,17 @@ pub fn draw_map(frame: &proto::MapFrame, path: &PathMap, area: Rect, buf: &mut B
     grid.paint(area, buf);
 }
 
-/// A braille dot grid with per-cell colour and a few character overrides.
+/// A braille dot grid with per-cell colour, an optional background shade
+/// per dot (the map's floor), and a few character overrides.
 struct Grid {
     w: usize,
     h: usize,
     /// Braille dot mask per cell (`U+2800 + mask` is the glyph).
     dots: Vec<u8>,
     color: Vec<Option<Color>>,
+    /// Shaded ("floor") dots, one bit-mask per cell like `dots`. A cell
+    /// mostly covered by floor paints its background.
+    shade: Vec<u8>,
     /// A character that replaces the braille in its cell — markers beat track.
     over: Vec<Option<(char, Color)>>,
 }
@@ -250,7 +265,45 @@ impl Grid {
             h,
             dots: vec![0; w * h],
             color: vec![None; w * h],
+            shade: vec![0; w * h],
             over: vec![None; w * h],
+        }
+    }
+
+    /// Set every dot in the rectangle spanned by two (possibly unordered,
+    /// possibly off-screen) corners.
+    fn fill(&mut self, a: (isize, isize), b: (isize, isize), color: Option<Color>) {
+        let (x0, x1) = (
+            a.0.min(b.0).max(0),
+            a.0.max(b.0).min(self.w as isize * 2 - 1),
+        );
+        let (y0, y1) = (
+            a.1.min(b.1).max(0),
+            a.1.max(b.1).min(self.h as isize * 4 - 1),
+        );
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                self.set((x, y), color);
+            }
+        }
+    }
+
+    /// Mark every dot in the rectangle as floor.
+    fn shade(&mut self, a: (isize, isize), b: (isize, isize)) {
+        let (x0, x1) = (
+            a.0.min(b.0).max(0),
+            a.0.max(b.0).min(self.w as isize * 2 - 1),
+        );
+        let (y0, y1) = (
+            a.1.min(b.1).max(0),
+            a.1.max(b.1).min(self.h as isize * 4 - 1),
+        );
+        const BITS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let cell = (y as usize / 4) * self.w + x as usize / 2;
+                self.shade[cell] |= BITS[y as usize % 4][x as usize % 2];
+            }
         }
     }
 
@@ -312,6 +365,12 @@ impl Grid {
             for col in 0..self.w {
                 let cell = row * self.w + col;
                 let pos = (area.x + col as u16, area.y + row as u16);
+                // Floor: paint the background when at least half the
+                // cell's dots are confirmed floor — a solid surface reads
+                // as a room where a stipple read as noise.
+                if self.shade[cell].count_ones() >= 4 {
+                    buf[pos].set_bg(FLOOR);
+                }
                 if let Some((glyph, color)) = self.over[cell] {
                     buf[pos].set_char(glyph).set_style(Style::new().fg(color));
                 } else if self.dots[cell] != 0 {
@@ -379,6 +438,14 @@ mod tests {
                 .chars()
                 .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
             "no braille ink at all"
+        );
+        let floor_cells = (0..10)
+            .flat_map(|y| (0..30).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].bg == FLOOR)
+            .count();
+        assert!(
+            floor_cells > 10,
+            "the confirmed floor must paint a solid background, got {floor_cells} cells"
         );
 
         let searching = proto::MapFrame {
