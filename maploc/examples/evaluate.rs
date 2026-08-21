@@ -80,6 +80,23 @@ impl Truth {
         between(self.start, room_pose)
     }
 
+    /// Mean distance of a composite's endpoints (at `pose`, map frame) to
+    /// the nearest truth wall, clamped at 0.5 m — the same flavour of
+    /// number as the watchdog's, but judged by the tape measure instead of
+    /// the built map. Separates "the scan/pose is wrong" from "the map
+    /// painted this region wrong".
+    fn scan_agreement(&self, pose: Pose2, scan: &Scan) -> f32 {
+        let (sy, cy) = pose.2.sin_cos();
+        let (mut sum, mut n) = (0.0_f32, 0u32);
+        for (bx, by) in scan.endpoints_body() {
+            let ex = pose.0 + cy * bx - sy * by;
+            let ey = pose.1 + sy * bx + cy * by;
+            sum += self.wall_distance((ex, ey)).min(0.5);
+            n += 1;
+        }
+        if n > 0 { sum / n as f32 } else { 0.0 }
+    }
+
     /// Distance from a map-frame point to the nearest truth wall.
     fn wall_distance(&self, map_xy: (f32, f32)) -> f32 {
         // Map point → room frame.
@@ -136,6 +153,10 @@ fn main() {
     let mut first_odom: Option<Pose2> = None;
     let mut latest_odom: Option<maploc::replay::OdomRecord> = None;
 
+    // A clean snapshot of the map at the sit (pre-kidnap), for diagnosing
+    // what the kidnapped windows look like against it.
+    let mut sit_grid: Option<maploc::OccupancyGrid> = None;
+
     // Post-kidnap observations.
     let mut lost_at: Option<f32> = None;
     let mut relocalized: Option<(f32, Pose2, f32)> = None; // (t, pose, residual)
@@ -167,6 +188,7 @@ fn main() {
                         if sit_span.is_none() {
                             tracked_at_sit = Some(mapper.slam().tracked());
                             odom_at_sit = Some(odom);
+                            sit_grid = mapper.slam().render();
                         }
                     }
                 } else if let Some(since) = sitting_since.take()
@@ -223,7 +245,55 @@ fn main() {
         for note in notes.drain(..) {
             let after_kidnap = sit_span.is_some();
             match note {
-                Note::WindowIntegrated { .. } => {
+                Note::WindowIntegrated {
+                    beams,
+                    mean_residual_m,
+                    n_observed,
+                    n_beams,
+                    ..
+                } => {
+                    if let (true, Some(g), Some((p, sc))) =
+                        (after_kidnap, sit_grid.as_ref(), mapper.last_window())
+                    {
+                        // Breakdown vs the CLEAN pre-kidnap map.
+                        let cfg = *g.cfg();
+                        let (w, h) = (g.width(), g.height());
+                        let (sy, cy) = p.2.sin_cos();
+                        let (mut on_wall, mut in_free, mut unknown, mut out) =
+                            (0u32, 0u32, 0u32, 0u32);
+                        for (bx, by) in sc.endpoints_body() {
+                            let ex = p.0 + cy * bx - sy * by;
+                            let ey = p.1 + sy * bx + cy * by;
+                            let j = ((ex - cfg.x_range.0) / cfg.cell).floor() as i32;
+                            let i = ((ey - cfg.y_range.0) / cfg.cell).floor() as i32;
+                            if i < 0 || j < 0 || i as usize >= h || j as usize >= w {
+                                out += 1;
+                                continue;
+                            }
+                            let lo = g.log_at(i as usize, j as usize);
+                            if lo > 50 {
+                                on_wall += 1;
+                            } else if lo < -50 {
+                                in_free += 1;
+                            } else {
+                                unknown += 1;
+                            }
+                        }
+                        println!(
+                            "[{t:7.1}s]   vs pre-kidnap map: wall {on_wall}, FREE {in_free}, unknown {unknown}, off-map {out}"
+                        );
+                    }
+                    let tr = mapper.slam().tracked();
+                    let vs_truth = mapper
+                        .last_window()
+                        .map(|(p, s)| truth.scan_agreement(*p, s))
+                        .unwrap_or(f32::NAN);
+                    println!(
+                        "[{t:7.1}s] window {beams:5} beams  vs-map {mean_residual_m:.3} ({n_observed:5}/{n_beams:5})  vs-TRUTH {vs_truth:.3}  tracked ({:6.2}, {:6.2}, {:6.1}°)",
+                        tr.0,
+                        tr.1,
+                        tr.2.to_degrees()
+                    );
                     if after_kidnap && lost_at.is_none() && relocalized.is_none() {
                         windows_inked_while_wrong += 1;
                     }
@@ -232,8 +302,12 @@ fn main() {
                     mean_residual_m,
                     n_observed,
                 } => {
+                    let vs_truth = mapper
+                        .last_window()
+                        .map(|(p, s)| truth.scan_agreement(*p, s))
+                        .unwrap_or(f32::NAN);
                     println!(
-                        "[{t:7.1}s] LOST: residual {mean_residual_m:.3} m over {n_observed} beams"
+                        "[{t:7.1}s] LOST: vs-map {mean_residual_m:.3} m over {n_observed} beams, vs-TRUTH {vs_truth:.3}"
                     );
                     if after_kidnap && lost_at.is_none() {
                         lost_at = Some(t);
@@ -258,6 +332,31 @@ fn main() {
                     if after_kidnap {
                         reloc_rejections += 1;
                     }
+                }
+                Note::SuspectAfterSit => {
+                    println!("[{t:7.1}s] SAT — pose suspect");
+                    if lost_at.is_none() {
+                        lost_at = Some(t);
+                    }
+                }
+                Note::WindowQuarantined {
+                    mean_residual_m,
+                    n_observed,
+                } => {
+                    println!(
+                        "[{t:7.1}s] quarantined: vs-map {mean_residual_m:.3} m over {n_observed} beams"
+                    );
+                }
+                Note::RelocalizeCandidate {
+                    pose,
+                    mean_residual_m,
+                } => {
+                    println!(
+                        "[{t:7.1}s] candidate ({:.2}, {:.2}, {:.1}°) residual {mean_residual_m:.3} — awaiting confirmation",
+                        pose.0,
+                        pose.1,
+                        pose.2.to_degrees()
+                    );
                 }
                 Note::LoopClosed {
                     n_loops, dx, dy, ..
@@ -309,6 +408,9 @@ fn main() {
                 kidnap_map.2.to_degrees()
             );
             match lost_at {
+                Some(t) if t <= s1 => {
+                    println!("  pose suspect from the sit itself (armed at {t:.1} s)")
+                }
                 Some(t) => println!("  tracking lost {:.1} s after the stand", t - s1),
                 None => println!("  tracking was NEVER declared lost after the kidnap"),
             }

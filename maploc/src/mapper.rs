@@ -24,7 +24,9 @@
 //! a resumed session whose robot moved while the daemon was down.
 
 use crate::accumulator::{AccumulatorConfig, WindowAccumulator};
+use crate::grid::OccupancyGrid;
 use crate::pipeline::Slam;
+use crate::pose_graph::{between, compose};
 use crate::relocalize::{RelocalizeConfig, relocalize_against_grid, score_pose};
 use crate::submap::{Pose2, Scan};
 
@@ -57,7 +59,11 @@ impl Default for StillConfig {
 pub struct WatchdogConfig {
     /// The map must be able to judge at least this many beams.
     pub min_observed_beams: u32,
-    /// ... and at least this fraction of the window's beams.
+    /// ... and at least this fraction of the window's beams. A floor, not
+    /// a majority: a kidnapped robot mostly paints new territory (12 % of
+    /// beams judged, measured), and the verdict lives in the judged beams
+    /// — an explorer's judged beams agree with the map, a kidnapped
+    /// robot's contradict it.
     pub min_observed_fraction: f32,
     /// Mean residual over the judged beams above which the window is a
     /// contradiction, not noise. Map noise floor is ~0.05–0.09 m; honest
@@ -72,17 +78,23 @@ pub struct WatchdogConfig {
     pub wall_threshold_fp: i16,
     /// A cell is *observed* (judgeable) past this |log-odds|.
     pub observed_fp: i16,
+    /// Consecutive contradicting windows before tracking is declared
+    /// lost. The first contradiction is quarantined (not inked) — one
+    /// window can be a lean, a passer-by, or fresh phantom ink; a kidnap
+    /// contradicts on every window.
+    pub lost_after_windows: u32,
 }
 
 impl Default for WatchdogConfig {
     fn default() -> Self {
         Self {
             min_observed_beams: 100,
-            min_observed_fraction: 0.4,
+            min_observed_fraction: 0.05,
             max_mean_residual_m: 0.25,
             clamp_m: 0.5,
             wall_threshold_fp: 150,
             observed_fp: 50,
+            lost_after_windows: 2,
         }
     }
 }
@@ -113,6 +125,20 @@ pub struct MapperConfig {
     /// search is O(cells × yaws × beams) — full composites would cost
     /// seconds per attempt on the robot for no accuracy the search needs.
     pub relocalize_max_beams: usize,
+    /// A relocalize candidate never snaps tracking by itself: the NEXT
+    /// window, moved to the candidate-implied pose via odometry, must
+    /// also agree with the map this well. A wrong basin in a young map
+    /// scored 0.022 on the search's own probe (measured, field test
+    /// four) and poisoned everything after; a second, independent window
+    /// from a slightly different moment is what a coincidence fails.
+    pub relocalize_confirm_max_residual_m: f32,
+    /// ... and the map must be able to judge at least this fraction of
+    /// the confirming window. Through the ToF's keyhole, a wall wedge
+    /// aliases onto any other wall at the same range — the measured
+    /// kidnap landed 204 of 1680 beams on old walls at residual 0.005
+    /// while 0.3 m off the truth. A window that sees the scene it claims
+    /// to stand in gets judged on half its beams, not an eighth.
+    pub relocalize_confirm_min_fraction: f32,
 }
 
 impl Default for MapperConfig {
@@ -138,6 +164,8 @@ impl Default for MapperConfig {
                 ..RelocalizeConfig::default()
             },
             relocalize_max_beams: 256,
+            relocalize_confirm_max_residual_m: 0.10,
+            relocalize_confirm_min_fraction: 0.3,
         }
     }
 }
@@ -163,10 +191,32 @@ pub enum Note {
     WindowIntegrated {
         beams: usize,
         windows: u32,
+        /// The watchdog's agreement score for this window (residual over
+        /// the beams the map could judge, that count, and the window's
+        /// total) — diagnostics the bench plots to tune the thresholds.
+        mean_residual_m: f32,
+        n_observed: u32,
+        n_beams: u32,
     },
     WindowDiscarded {
         beams: usize,
     },
+    /// A first contradicting window: not inked, not yet lost.
+    WindowQuarantined {
+        mean_residual_m: f32,
+        n_observed: u32,
+    },
+    /// The search proposed a pose; the next window must confirm it.
+    RelocalizeCandidate {
+        pose: Pose2,
+        mean_residual_m: f32,
+    },
+    /// The robot sat: it may have been carried, and neither odometry nor
+    /// a keyhole ToF view can prove it was not (a kidnapped wall wedge
+    /// aliases onto any wall, measured). The pose is suspect until a
+    /// window confirms it — the current pose is pre-seeded as the
+    /// relocalize candidate, so an unmoved robot confirms in one window.
+    SuspectAfterSit,
     /// The map could judge this window and flatly contradicts it.
     LostTracking {
         mean_residual_m: f32,
@@ -198,6 +248,24 @@ pub struct Mapper {
     window_opened: Option<f32>,
     windows: u32,
     lost: bool,
+    /// Consecutive contradicting windows so far (reset by any agreeing one).
+    suspect: u32,
+    /// A relocalize candidate awaiting confirmation: (candidate pose, the
+    /// tracked pose when it was proposed — odometry deltas since then move
+    /// the candidate along with the robot).
+    pending_reloc: Option<(Pose2, Pose2)>,
+    /// The map as it stood when the current stand began — what the
+    /// watchdog judges the stand's windows against. Judging against the
+    /// LIVE map lets a kidnapped stand vouch for itself: its first window
+    /// paints the kidnapper's room, and every following window then
+    /// "agrees with the map" it just painted (measured: vs-map 0.005
+    /// while vs-truth 0.3–0.5). Ink earned during a stand never testifies
+    /// for that stand.
+    stand_grid: Option<OccupancyGrid>,
+    /// The last window handed to `absorb_window`, whatever became of it —
+    /// a bench inspects it to score composites against ground truth. One
+    /// composite clone per window; noise next to the integration itself.
+    last_window: Option<(Pose2, Scan)>,
 }
 
 impl Mapper {
@@ -211,6 +279,10 @@ impl Mapper {
             window_opened: None,
             windows: 0,
             lost: false,
+            suspect: 0,
+            pending_reloc: None,
+            stand_grid: None,
+            last_window: None,
         }
     }
 
@@ -234,6 +306,10 @@ impl Mapper {
     pub fn window_frames(&self) -> usize {
         self.acc.len()
     }
+    /// The pose and composite of the last closed window (see field doc).
+    pub fn last_window(&self) -> Option<&(Pose2, Scan)> {
+        self.last_window.as_ref()
+    }
 
     /// One control-loop tick. `t_s` is seconds on any monotonic timebase —
     /// the host's uptime, a recording's timestamps — as long as one mapper
@@ -244,6 +320,16 @@ impl Mapper {
             .push((t_s, sample.odom.0, sample.odom.1, sample.odom.2));
         let horizon = self.cfg.still.window_s;
         self.odom_window.retain(|&(at, ..)| t_s - at <= horizon);
+
+        // A sit invalidates the pose: the robot cannot feel a carry. Arm
+        // the lost machinery with "I was not moved" as the candidate —
+        // cheap to confirm when true, refused when false.
+        if sample.sitting && !self.lost {
+            self.lost = true;
+            self.suspect = 0;
+            self.pending_reloc = Some((self.slam.tracked(), self.slam.tracked()));
+            notes.push(Note::SuspectAfterSit);
+        }
 
         let still = !sample.moving
             && !sample.sitting
@@ -273,6 +359,11 @@ impl Mapper {
         if stand_ended {
             self.window_opened = None;
         }
+        if still && !self.was_still {
+            // A stand begins: freeze the map the watchdog will judge this
+            // stand's windows against.
+            self.stand_grid = self.slam.render();
+        }
         self.was_still = still;
 
         // While lost the tracked pose is a guess; freezing submaps or
@@ -289,6 +380,12 @@ impl Mapper {
                     dy: after.1 - before.1,
                     dyaw: wrap_pi(after.2 - before.2),
                 });
+                // The closure moved every anchor; a snapshot in the old
+                // frame would mis-judge the stand's remaining windows by
+                // exactly the correction.
+                if self.was_still {
+                    self.stand_grid = self.slam.render();
+                }
             }
         }
     }
@@ -313,6 +410,7 @@ impl Mapper {
     }
 
     fn absorb_window(&mut self, pose: Pose2, composite: &Scan, notes: &mut Vec<Note>) {
+        self.last_window = Some((pose, composite.clone()));
         let beams = composite.n_valid();
         if beams < self.cfg.min_window_beams {
             notes.push(Note::WindowDiscarded { beams });
@@ -323,13 +421,42 @@ impl Mapper {
             let Some(mut grid) = self.slam.render() else {
                 return;
             };
+            let wd = self.cfg.watchdog;
+            // A pending candidate from the previous window is confirmed by
+            // THIS window, carried to the candidate-implied pose by the
+            // odometry accumulated in between.
+            if let Some((cand, tracked_then)) = self.pending_reloc.take() {
+                let implied = compose(cand, between(tracked_then, self.slam.tracked()));
+                let a = score_pose(
+                    &mut grid,
+                    composite,
+                    implied,
+                    wd.clamp_m,
+                    wd.wall_threshold_fp,
+                    wd.observed_fp,
+                );
+                if a.n_observed >= wd.min_observed_beams
+                    && a.n_observed as f32
+                        >= self.cfg.relocalize_confirm_min_fraction * a.n_beams as f32
+                    && a.mean_residual_m <= self.cfg.relocalize_confirm_max_residual_m
+                {
+                    self.slam.set_tracked(implied);
+                    self.ink(implied, composite);
+                    self.lost = false;
+                    self.suspect = 0;
+                    notes.push(Note::Relocalized {
+                        pose: implied,
+                        mean_residual_m: a.mean_residual_m,
+                    });
+                    return;
+                }
+                // Fell through: the candidate was a coincidence — search anew.
+            }
             let probe = decimate(composite, self.cfg.relocalize_max_beams);
             match relocalize_against_grid(&mut grid, &probe, &self.cfg.relocalize) {
                 Some(r) if r.accepted => {
-                    self.slam.set_tracked(r.pose);
-                    self.ink(r.pose, composite);
-                    self.lost = false;
-                    notes.push(Note::Relocalized {
+                    self.pending_reloc = Some((r.pose, self.slam.tracked()));
+                    notes.push(Note::RelocalizeCandidate {
                         pose: r.pose,
                         mean_residual_m: r.mean_residual_m,
                     });
@@ -347,31 +474,50 @@ impl Mapper {
         // it. A window the map can judge but contradicts must not ink — it
         // would paint the kidnapper's room over the real one.
         let wd = self.cfg.watchdog;
-        if let Some(mut grid) = self.slam.render() {
+        let mut agreement = (0.0_f32, 0u32, beams as u32);
+        if let Some(grid) = self.stand_grid.as_mut() {
             let a = score_pose(
-                &mut grid,
+                grid,
                 composite,
                 pose,
                 wd.clamp_m,
                 wd.wall_threshold_fp,
                 wd.observed_fp,
             );
+            agreement = (a.mean_residual_m, a.n_observed, a.n_beams);
             if a.n_observed >= wd.min_observed_beams
                 && a.n_observed as f32 >= wd.min_observed_fraction * a.n_beams as f32
                 && a.mean_residual_m > wd.max_mean_residual_m
             {
-                self.lost = true;
-                notes.push(Note::LostTracking {
-                    mean_residual_m: a.mean_residual_m,
-                    n_observed: a.n_observed,
-                });
+                // Contradicting window: never ink it. One is a suspect
+                // (a lean, a passer-by, fresh phantom ink); a run of them
+                // is a kidnap.
+                self.suspect += 1;
+                if self.suspect >= wd.lost_after_windows {
+                    self.lost = true;
+                    self.suspect = 0;
+                    self.pending_reloc = None;
+                    notes.push(Note::LostTracking {
+                        mean_residual_m: a.mean_residual_m,
+                        n_observed: a.n_observed,
+                    });
+                } else {
+                    notes.push(Note::WindowQuarantined {
+                        mean_residual_m: a.mean_residual_m,
+                        n_observed: a.n_observed,
+                    });
+                }
                 return;
             }
+            self.suspect = 0;
         }
         self.ink(pose, composite);
         notes.push(Note::WindowIntegrated {
             beams,
             windows: self.windows,
+            mean_residual_m: agreement.0,
+            n_observed: agreement.1,
+            n_beams: agreement.2,
         });
     }
 
@@ -505,6 +651,23 @@ mod tests {
         assert!(mapper.windows() >= 2, "the stands must have inked windows");
         assert!(mapper.tracking());
 
+        // The carry: the robot is SAT, carried, and stood back up — the
+        // sit arms pose suspicion, which is the kidnap signal geometry
+        // cannot fake through the ToF keyhole.
+        for _ in 0..50 {
+            mapper.observe(
+                t,
+                MapperSample {
+                    odom: (0.0, 0.0, 0.0),
+                    moving: false,
+                    sitting: true,
+                },
+                &mut notes,
+            );
+            t += 0.02;
+        }
+        assert!(!mapper.tracking(), "a sit must make the pose suspect");
+
         // Kidnap: odometry still reads the origin, but the robot now really
         // stands at (0.8, 0.5, 0.9) — its scans are the room seen from
         // there, expressed in the body frame odometry believes in.
@@ -542,6 +705,40 @@ mod tests {
         assert!(err < 0.25, "relocalized {pose:?}, truth {truth:?}");
         assert!(wrap_pi(pose.2 - truth.2).abs() < 0.3);
         assert!(mapper.tracking());
+    }
+
+    /// A robot that sits and stands WITHOUT being moved confirms its own
+    /// pose from the first window and resumes mapping.
+    #[test]
+    fn a_sit_in_place_recovers_in_one_window() {
+        let mut mapper = Mapper::new(MapperConfig::default(), Slam::new(SlamConfig::default()));
+        let mut notes = Vec::new();
+        let mut t = drive(&mut mapper, 0.0, (0.0, 0.0, 0.0), 8.0, &mut notes);
+        for _ in 0..100 {
+            mapper.observe(
+                t,
+                MapperSample {
+                    odom: (0.0, 0.0, 0.0),
+                    moving: false,
+                    sitting: true,
+                },
+                &mut notes,
+            );
+            t += 0.02;
+        }
+        assert!(!mapper.tracking());
+        let before = mapper.slam().tracked();
+        drive(&mut mapper, t, (0.0, 0.0, 0.0), 8.0, &mut notes);
+        assert!(
+            mapper.tracking(),
+            "an unmoved robot must confirm its pose and resume"
+        );
+        let confirmed = notes.iter().rev().find_map(|n| match n {
+            Note::Relocalized { pose, .. } => Some(*pose),
+            _ => None,
+        });
+        let pose = confirmed.expect("confirmation shows up as a relocalization");
+        assert!((pose.0 - before.0).hypot(pose.1 - before.1) < 0.05);
     }
 
     /// Beams into unexplored territory must never read as "lost".

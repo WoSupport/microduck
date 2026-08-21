@@ -41,6 +41,13 @@ pub struct RelocalizeConfig {
     /// transient ToF flickers in the saved map don't pull the search
     /// off-target.
     pub wall_threshold_fp: i16,
+    /// Threshold for the SEE-THROUGH penalty (a ray crossing a wall).
+    /// Deliberately higher than `wall_threshold_fp`: a single window's
+    /// floor phantoms land as one-window ink, and treating them as
+    /// opaque mass-clamps every ray from the next stop nearby — the
+    /// measured false-LOST of field test four. Crossing only counts
+    /// against a wall more than one window confirmed.
+    pub see_through_fp: i16,
 }
 
 impl Default for RelocalizeConfig {
@@ -60,6 +67,7 @@ impl Default for RelocalizeConfig {
             min_beams_used: 24,
             clamp_m: 0.15,
             wall_threshold_fp: 200,
+            see_through_fp: 300,
         }
     }
 }
@@ -106,7 +114,7 @@ fn score_offsets(
     offsets: &[(f32, f32)],
     field: &[f32],
     log: &[i16],
-    wall_fp: i16,
+    see_through_fp: i16,
     w: usize,
     h: usize,
     x_min: f32,
@@ -126,14 +134,21 @@ fn score_offsets(
             continue;
         }
         // Midpoint of the (approximate) ray from the pose to the endpoint:
-        // seeing through a confident wall costs the full clamp.
+        // seeing through a confident wall costs the full clamp — but only
+        // when the crossed cell is well away from the endpoint's. A beam
+        // that ENDS on a wall at close range or grazing incidence has its
+        // midpoint inside that same wall's cells, and clamping it punishes
+        // the beam for hitting the very wall it measured (the measured
+        // false-LOST of field test four: a robot 10 cm from a divider had
+        // 4 200 of 10 800 beams "seeing through" the divider they hit).
         let mj = ((cx + ox * 0.5 - x_min) / cell).floor() as i32;
         let mi = ((cy + oy * 0.5 - y_min) / cell).floor() as i32;
         if mi >= 0
             && mj >= 0
             && (mi as usize) < h
             && (mj as usize) < w
-            && log[(mi as usize) * w + (mj as usize)] > wall_fp
+            && ((mi - i).abs() > 1 || (mj - j).abs() > 1)
+            && log[(mi as usize) * w + (mj as usize)] > see_through_fp
         {
             sum += clamp_m;
             n += 1;
@@ -175,6 +190,12 @@ pub struct PoseAgreement {
 /// walking into a new room must read as "cannot judge", never as "wrong".
 /// A kidnapped robot, by contrast, throws beams into territory the map
 /// knows well and disagrees with everywhere: high `n_observed`, high mean.
+///
+/// Endpoint distances only — no see-through term. The see-through clamp
+/// exists to break a degeneracy of the SEARCH (a wrong pose burying its
+/// scan in a wall blob); at a trusted pose there is nothing to exploit,
+/// and the clamp's failure mode — punishing beams that hit a wall the
+/// robot stands right next to — false-fired the watchdog in the field.
 pub fn score_pose(
     grid: &mut OccupancyGrid,
     scan: &Scan,
@@ -199,20 +220,6 @@ pub fn score_pose(
         let i = ((ey - y_min) / cell).floor() as i32;
         if i < 0 || j < 0 || (i as usize) >= h || (j as usize) >= w {
             continue; // off the map: nothing to compare against
-        }
-        // Seeing through a confident wall is a full-clamp disagreement,
-        // same as in the search kernel above.
-        let mj = ((pose.0 + (ex - pose.0) * 0.5 - x_min) / cell).floor() as i32;
-        let mi = ((pose.1 + (ey - pose.1) * 0.5 - y_min) / cell).floor() as i32;
-        if mi >= 0
-            && mj >= 0
-            && (mi as usize) < h
-            && (mj as usize) < w
-            && log[(mi as usize) * w + (mj as usize)] > wall_threshold_fp
-        {
-            sum += clamp_m;
-            n_observed += 1;
-            continue;
         }
         let lo = log[(i as usize) * w + (j as usize)];
         if lo.abs() < observed_fp {
@@ -299,7 +306,7 @@ pub fn relocalize_against_grid(
                 &offsets,
                 &field,
                 &log,
-                cfg.wall_threshold_fp,
+                cfg.see_through_fp,
                 w,
                 h,
                 x_min,
@@ -412,7 +419,7 @@ pub fn relocalize_against_grid(
                         &offsets,
                         &field,
                         &log,
-                        cfg.wall_threshold_fp,
+                        cfg.see_through_fp,
                         w,
                         h,
                         x_min,

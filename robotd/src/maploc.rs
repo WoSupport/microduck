@@ -273,11 +273,47 @@ fn worker(
 
         for note in notes.drain(..) {
             match note {
-                Note::WindowIntegrated { beams, windows } => {
-                    tracing::info!(beams, windows, "maploc: still window integrated");
+                Note::WindowIntegrated {
+                    beams,
+                    windows,
+                    mean_residual_m,
+                    n_observed,
+                    ..
+                } => {
+                    tracing::info!(
+                        beams,
+                        windows,
+                        agree = format!("{mean_residual_m:.3}/{n_observed}"),
+                        "maploc: still window integrated"
+                    );
                 }
                 Note::WindowDiscarded { beams } => {
                     tracing::debug!(beams, "maploc: window too thin to ink; discarded");
+                }
+                Note::WindowQuarantined {
+                    mean_residual_m,
+                    n_observed,
+                } => {
+                    tracing::info!(
+                        residual = format!("{mean_residual_m:.3}"),
+                        n_observed,
+                        "maploc: window contradicts the map; quarantined"
+                    );
+                }
+                Note::SuspectAfterSit => {
+                    tracing::info!("maploc: robot sat — pose suspect until a window confirms it");
+                }
+                Note::RelocalizeCandidate {
+                    pose,
+                    mean_residual_m,
+                } => {
+                    tracing::info!(
+                        x = format!("{:.2}", pose.0),
+                        y = format!("{:.2}", pose.1),
+                        yaw = format!("{:.2}", pose.2),
+                        residual = format!("{mean_residual_m:.3}"),
+                        "maploc: relocalize candidate; awaiting confirmation"
+                    );
                 }
                 Note::LostTracking {
                     mean_residual_m,
