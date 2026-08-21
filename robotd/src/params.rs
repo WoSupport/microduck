@@ -51,6 +51,13 @@ pub struct MaplocParams {
     pub map_path: PathBuf,
     /// Start from a clean slate instead of restoring the saved session.
     pub wipe_on_boot: bool,
+    /// When set, every odometry tick and depth frame the mapper consumes is
+    /// also appended to a timestamped `.mdlg` log in this directory — the
+    /// ground-truth bench (`maploc`'s `evaluate` example) replays such a
+    /// log byte-for-byte the way the live worker saw it. ~6 KB/s while
+    /// mapping; nothing cleans the directory up, so this is an experiment
+    /// switch, not a default.
+    pub record_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -67,6 +74,7 @@ impl Default for MaplocParams {
             mode: MaplocMode::StopAndScan,
             map_path: PathBuf::from("/var/lib/robot/maploc.session"),
             wipe_on_boot: false,
+            record_dir: None,
         }
     }
 }

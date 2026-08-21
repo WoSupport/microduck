@@ -13,28 +13,30 @@
 //!     loop the core whenever they compete.
 //!
 //! Frames are reprojected through the head FK with the IMU-levelled floor
-//! filter, and — in stop-and-scan mode — vetted by the still-window
-//! accumulator before anything inks the map (see `maploc::accumulator` for
-//! why). Posture pairing uses the newest odometry tick: over a unix socket
-//! the frame is milliseconds old, and stop-and-scan integrates only while
-//! standing, where the pose is not going anywhere.
+//! filter and handed to [`maploc::mapper::Mapper`], which owns every
+//! mapping decision — stillness, window vetting, the tracking watchdog,
+//! kidnap relocalization. This file only moves bytes: channel in, log
+//! lines and map frames out, the session to disk, and (when
+//! `record_dir` is set) a ground-truth `.mdlg` recording of everything the
+//! mapper consumed, replayable through the offline bench byte-for-byte.
 
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use duck_ipc_proto as proto;
 use kinematics::tof::{Posture, Reprojector};
-use maploc::accumulator::{AccumulatorConfig, WindowAccumulator};
+use maploc::mapper::{Mapper, MapperConfig, MapperSample, Note};
 use maploc::pipeline::{Slam, SlamConfig};
+use maploc::record::SessionRecorder;
 use maploc::session::SessionState;
 use maploc::submap::Scan;
 
 use crate::params::{MaplocMode, MaplocParams};
 
 /// The loop-side channel depth. Sized for ~2 s of ticks plus frames: if the
-/// worker stalls longer than that, dropping samples is the correct behaviour
-/// (odometry deltas re-fold on the next accepted sample; a dropped depth
-/// frame is one of fifteen a second).
+/// worker stalls longer than that (a relocalize search, say), dropping
+/// samples is the correct behaviour — odometry deltas re-fold on the next
+/// accepted sample; a dropped depth frame is one of fifteen a second.
 const EVENT_BUFFER: usize = 128;
 
 /// ST's status codes for a usable range — the same wire contract
@@ -50,27 +52,6 @@ const AUTOSAVE_EVERY: Duration = Duration::from_secs(60);
 /// Map publish cadence when someone is subscribed.
 const PUBLISH_EVERY: Duration = Duration::from_secs(1);
 
-/// A still window is flushed into the map after this long even if the robot
-/// keeps standing — the first field test stood the robot in place, watched
-/// the map, and saw nothing: the window only integrated on the next MOTION,
-/// which never came. The map must build while you look at it.
-const WINDOW_FLUSH_AFTER: Duration = Duration::from_secs(3);
-
-/// A vetted window with fewer beams than this is discarded, not inked. The
-/// second field test sat the robot down and left it: every 3-second window
-/// distilled to 2–27 beams of floor clutter, and each one minted map ink
-/// and, worse, fresh submaps for the loop closer to swear against. A real
-/// stop in front of anything measures in the hundreds.
-const MIN_WINDOW_BEAMS: usize = 60;
-
-/// How many times a vetted window's composite is inked. One pass writes
-/// log-odds 85 per wall cell, and the wire frame only calls a cell a wall
-/// past 150 — so a lap that stops once per spot painted the whole walk
-/// invisibly (field test two's "scattered white points" were the rare
-/// twice-visited cells). A window has already survived per-cell frame
-/// voting; it is worth more than one raw frame's confidence.
-const WINDOW_INK_PASSES: usize = 2;
-
 /// One tick's worth of the robot's own state, as the control loop sees it.
 #[derive(Debug, Clone, Copy)]
 pub struct OdomSample {
@@ -84,6 +65,9 @@ pub struct OdomSample {
     pub head: [f64; 4],
     /// The loop's own "the robot is doing something" verdict.
     pub moving: bool,
+    /// Seated. The mapper never maps from sitting height, and the
+    /// ground-truth protocol uses the sit as its kidnap marker.
+    pub sitting: bool,
 }
 
 enum Event {
@@ -161,7 +145,7 @@ fn worker(
     rx: mpsc::Receiver<Event>,
     map_tx: tokio::sync::broadcast::Sender<proto::MapFrame>,
 ) {
-    let mut slam = if params.wipe_on_boot {
+    let slam = if params.wipe_on_boot {
         tracing::info!("maploc: starting fresh (wipe_on_boot)");
         Slam::new(SlamConfig::default())
     } else {
@@ -177,21 +161,44 @@ fn worker(
             }
         }
     };
+    let mut mapper = Mapper::new(
+        MapperConfig {
+            continuous: params.mode == MaplocMode::Continuous,
+            ..MapperConfig::default()
+        },
+        slam,
+    );
+
+    let mut recorder = params.record_dir.as_ref().and_then(|dir| {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(error = %e, dir = %dir.display(), "maploc: cannot create record_dir");
+            return None;
+        }
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = dir.join(format!("{stamp}.mdlg"));
+        match SessionRecorder::create(&path) {
+            Ok(rec) => {
+                tracing::info!(path = %path.display(), "maploc: recording session");
+                Some(rec)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "maploc: cannot open recording; not recording");
+                None
+            }
+        }
+    });
 
     let reprojector = Reprojector::alpha();
-    let mut acc = WindowAccumulator::new(AccumulatorConfig::default());
     let started = Instant::now();
     let mut latest: Option<OdomSample> = None;
-    let mut was_still = false;
-    // Stillness from odometry itself, not just the commanded flag: a robot
-    // pushed by hand is moving whatever the loop thinks it asked for.
-    let mut odom_window: Vec<(Instant, f32, f32, f32)> = Vec::new();
+    let mut notes: Vec<Note> = Vec::new();
     let mut last_publish = Instant::now();
     let mut last_save = Instant::now();
     let mut seq = 0u64;
     let mut unsaved = false;
-    let mut windows = 0u32;
-    let mut window_opened: Option<Instant> = None;
     // Field diagnostics: one line every 5 s says what mapping is actually
     // doing, because "the map shows nothing" has half a dozen distinct
     // causes and a journal that names the live one beats guessing.
@@ -202,78 +209,49 @@ fn worker(
     while let Ok(event) = rx.recv() {
         match event {
             Event::Odom(sample) => {
-                let now = Instant::now();
-                slam.observe_odom(sample.odom);
-                odom_window.push((now, sample.odom.0, sample.odom.1, sample.odom.2));
-                odom_window
-                    .retain(|(at, ..)| now.duration_since(*at) <= Duration::from_millis(500));
-
-                let still = !sample.moving
-                    && odom_window.first().is_some_and(|first| {
-                        let dx = sample.odom.0 - first.1;
-                        let dy = sample.odom.1 - first.2;
-                        let dyaw = wrap_pi(sample.odom.2 - first.3);
-                        (dx * dx + dy * dy).sqrt() < 0.01 && dyaw.abs() < 0.05
-                    });
-
-                // A window flushes when the stand ends — or after
-                // WINDOW_FLUSH_AFTER while it continues, so the map builds
-                // while you watch instead of waiting for the next step.
-                let stand_ended = was_still && !still;
-                let ripe = window_opened.is_some_and(|at| at.elapsed() >= WINDOW_FLUSH_AFTER);
-                if (stand_ended || ripe) && !acc.is_empty() {
-                    // The window closes here whatever comes of it: leaving
-                    // `window_opened` armed after a fruitless finish keeps
-                    // `ripe` true, and every subsequent frame would flush
-                    // alone — too few frames to vote, so junk passes through.
-                    window_opened = None;
-                    match acc.finish() {
-                        Some((pose, composite)) if composite.n_valid() >= MIN_WINDOW_BEAMS => {
-                            tracing::info!(
-                                beams = composite.n_valid(),
-                                windows = windows + 1,
-                                "maploc: still window integrated"
-                            );
-                            for _ in 0..WINDOW_INK_PASSES {
-                                slam.integrate(pose, &composite);
-                            }
-                            windows += 1;
-                            unsaved = true;
-                        }
-                        Some((_, composite)) => {
-                            tracing::debug!(
-                                beams = composite.n_valid(),
-                                "maploc: window too thin to ink; discarded"
-                            );
-                        }
-                        None => {}
-                    }
+                if let Some(rec) = recorder.as_mut()
+                    && rec
+                        .odom(
+                            sample.odom,
+                            sample.gravity.map(|g| g as f32),
+                            sample.trunk_z as f32,
+                            sample.head.map(|h| h as f32),
+                            sample.moving,
+                            sample.sitting,
+                        )
+                        .is_err()
+                {
+                    tracing::warn!("maploc: recording write failed; recording stopped");
+                    recorder = None;
                 }
-                if stand_ended {
-                    window_opened = None;
-                }
-                was_still = still;
+                mapper.observe(
+                    started.elapsed().as_secs_f32(),
+                    MapperSample {
+                        odom: sample.odom,
+                        moving: sample.moving,
+                        sitting: sample.sitting,
+                    },
+                    &mut notes,
+                );
                 latest = Some(sample);
                 n_odom += 1;
-
-                let loops_before = slam.n_loops();
-                let before = slam.tracked();
-                if slam.tick(started.elapsed().as_secs_f32()) {
-                    unsaved = true;
-                }
-                if slam.n_loops() > loops_before {
-                    let after = slam.tracked();
-                    tracing::info!(
-                        loops = slam.n_loops(),
-                        dx = format!("{:.3}", after.0 - before.0),
-                        dy = format!("{:.3}", after.1 - before.1),
-                        dyaw = format!("{:.3}", wrap_pi(after.2 - before.2)),
-                        "maploc: loop closed; tracked pose corrected"
-                    );
-                }
             }
             Event::Frame(frame) => {
                 n_frames += 1;
+                if let Some(rec) = recorder.as_mut()
+                    && rec
+                        .tof(
+                            frame.at_us as f64 / 1e6,
+                            frame.rows,
+                            frame.cols,
+                            &frame.distance_mm,
+                            &frame.status,
+                        )
+                        .is_err()
+                {
+                    tracing::warn!("maploc: recording write failed; recording stopped");
+                    recorder = None;
+                }
                 let Some(sample) = latest else { continue };
                 let Some(ranges) = decode_ranges(&frame) else {
                     continue;
@@ -287,63 +265,105 @@ fn worker(
                     continue;
                 }
                 let scan = Scan::from_polar(&flat.angles_body, &flat.ranges, flat.sensor_xy, 1e-3);
-                match params.mode {
-                    MaplocMode::StopAndScan => {
-                        if was_still {
-                            if acc.is_empty() {
-                                window_opened = Some(Instant::now());
-                            }
-                            acc.push(slam.tracked(), scan);
-                            n_frames_kept += 1;
-                        }
-                    }
-                    MaplocMode::Continuous => {
-                        slam.integrate(slam.tracked(), &scan);
-                        unsaved = true;
-                    }
+                if mapper.frame(started.elapsed().as_secs_f32(), scan) {
+                    n_frames_kept += 1;
                 }
             }
         }
 
+        for note in notes.drain(..) {
+            match note {
+                Note::WindowIntegrated { beams, windows } => {
+                    tracing::info!(beams, windows, "maploc: still window integrated");
+                }
+                Note::WindowDiscarded { beams } => {
+                    tracing::debug!(beams, "maploc: window too thin to ink; discarded");
+                }
+                Note::LostTracking {
+                    mean_residual_m,
+                    n_observed,
+                } => {
+                    tracing::warn!(
+                        residual = format!("{mean_residual_m:.3}"),
+                        n_observed,
+                        "maploc: scans contradict the map here — tracking lost, searching"
+                    );
+                }
+                Note::Relocalized {
+                    pose,
+                    mean_residual_m,
+                } => {
+                    tracing::info!(
+                        x = format!("{:.2}", pose.0),
+                        y = format!("{:.2}", pose.1),
+                        yaw = format!("{:.2}", pose.2),
+                        residual = format!("{mean_residual_m:.3}"),
+                        "maploc: relocalized"
+                    );
+                }
+                Note::RelocalizeRejected {
+                    best_pose,
+                    mean_residual_m,
+                } => {
+                    tracing::debug!(
+                        x = format!("{:.2}", best_pose.0),
+                        y = format!("{:.2}", best_pose.1),
+                        residual = format!("{mean_residual_m:.3}"),
+                        "maploc: relocalize attempt rejected"
+                    );
+                }
+                Note::LoopClosed {
+                    n_loops,
+                    dx,
+                    dy,
+                    dyaw,
+                } => {
+                    tracing::info!(
+                        loops = n_loops,
+                        dx = format!("{dx:.3}"),
+                        dy = format!("{dy:.3}"),
+                        dyaw = format!("{dyaw:.3}"),
+                        "maploc: loop closed; tracked pose corrected"
+                    );
+                }
+            }
+        }
+        if mapper.slam_mut().take_dirty() {
+            unsaved = true;
+        }
+
         if last_status.elapsed() >= Duration::from_secs(5) {
             last_status = Instant::now();
-            let (dxy, dyaw) = odom_window
-                .first()
-                .zip(latest.as_ref())
-                .map(|(first, s)| {
-                    let dx = s.odom.0 - first.1;
-                    let dy = s.odom.1 - first.2;
-                    (
-                        (dx * dx + dy * dy).sqrt(),
-                        wrap_pi(s.odom.2 - first.3).abs(),
-                    )
-                })
-                .unwrap_or((f32::NAN, f32::NAN));
             tracing::info!(
                 odom = n_odom,
                 frames = n_frames,
                 kept = n_frames_kept,
-                windows,
-                still = was_still,
+                windows = mapper.windows(),
+                still = mapper.still(),
+                tracking = mapper.tracking(),
                 moving = latest.as_ref().is_some_and(|s| s.moving),
-                window_frames = acc.len(),
-                dxy_500ms = format!("{dxy:.4}"),
-                dyaw_500ms = format!("{dyaw:.4}"),
-                submaps = slam.n_submaps(),
+                window_frames = mapper.window_frames(),
+                submaps = mapper.slam().n_submaps(),
                 "maploc: status"
             );
+            if let Some(rec) = recorder.as_mut()
+                && rec.flush().is_err()
+            {
+                tracing::warn!("maploc: recording flush failed; recording stopped");
+                recorder = None;
+            }
         }
 
         if map_tx.receiver_count() > 0 && last_publish.elapsed() >= PUBLISH_EVERY {
             last_publish = Instant::now();
-            if let Some(frame) = render_frame(&slam, &mut seq, windows, was_still) {
+            if let Some(frame) = render_frame(&mapper, &mut seq) {
                 let _ = map_tx.send(frame);
             }
         }
 
         if unsaved && last_save.elapsed() >= AUTOSAVE_EVERY {
             last_save = Instant::now();
-            match slam.save(&params.map_path) {
+            match mapper.slam().save(&params.map_path) {
                 Ok(()) => unsaved = false,
                 Err(e) => tracing::warn!(error = %e, "maploc: autosave failed"),
             }
@@ -353,11 +373,14 @@ fn worker(
     // Shutdown: the session is the product; losing the last minute of a
     // mapping walk to a restart would be a sour note to end on.
     if unsaved {
-        if let Err(e) = slam.save(&params.map_path) {
+        if let Err(e) = mapper.slam().save(&params.map_path) {
             tracing::warn!(error = %e, "maploc: final save failed");
         } else {
             tracing::info!(path = %params.map_path.display(), "maploc: session saved");
         }
+    }
+    if let Some(rec) = recorder.as_mut() {
+        let _ = rec.flush();
     }
 }
 
@@ -383,8 +406,8 @@ fn decode_ranges(
 }
 
 /// The composite map as a wire frame: trinary cells, base64.
-fn render_frame(slam: &Slam, seq: &mut u64, windows: u32, still: bool) -> Option<proto::MapFrame> {
-    let grid = slam.render()?;
+fn render_frame(mapper: &Mapper, seq: &mut u64) -> Option<proto::MapFrame> {
+    let grid = mapper.slam().render()?;
     let mut cells = Vec::with_capacity(grid.width() * grid.height());
     for i in 0..grid.height() {
         for j in 0..grid.width() {
@@ -398,24 +421,24 @@ fn render_frame(slam: &Slam, seq: &mut u64, windows: u32, still: bool) -> Option
             });
         }
     }
-    let (x, y, yaw) = slam.tracked();
+    let (x, y, yaw) = mapper.slam().tracked();
     *seq += 1;
     Some(proto::MapFrame {
         seq: *seq,
         x: f64::from(x),
         y: f64::from(y),
         yaw: f64::from(yaw),
-        tracking: slam.n_submaps() > 0,
+        tracking: mapper.tracking() && mapper.slam().n_submaps() > 0,
         x_min: grid.cfg().x_range.0,
         y_min: grid.cfg().y_range.0,
         cell_m: grid.cell(),
         rows: grid.height() as u32,
         cols: grid.width() as u32,
         cells: proto::b64::encode(&cells),
-        n_submaps: slam.n_submaps() as u32,
-        n_loops: slam.n_loops() as u32,
-        windows,
-        still,
+        n_submaps: mapper.slam().n_submaps() as u32,
+        n_loops: mapper.slam().n_loops() as u32,
+        windows: mapper.windows(),
+        still: mapper.still(),
     })
 }
 
@@ -472,14 +495,4 @@ async fn feed_tof(host: Host) {
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(10));
     }
-}
-
-fn wrap_pi(a: f32) -> f32 {
-    use std::f32::consts::PI;
-    let two_pi = 2.0 * PI;
-    let mut y = (a + PI).rem_euclid(two_pi) - PI;
-    if y == PI {
-        y = -PI;
-    }
-    y
 }

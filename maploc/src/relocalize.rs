@@ -156,6 +156,82 @@ fn beam_offsets(endpoints: &[(f32, f32)], yaw: f32) -> Vec<(f32, f32)> {
         .collect()
 }
 
+/// How well a scan agrees with the map at one given pose — the tracking
+/// watchdog's number.
+#[derive(Debug, Clone, Copy)]
+pub struct PoseAgreement {
+    /// Mean clamped per-beam residual over the beams the map can judge.
+    pub mean_residual_m: f32,
+    /// Beams the map could judge: endpoint in a cell it has an opinion on
+    /// (|log-odds| ≥ `observed_fp`), or a ray that would have had to see
+    /// through a confident wall.
+    pub n_observed: u32,
+    /// All valid beams in the scan.
+    pub n_beams: u32,
+}
+
+/// Score a scan against the map at a *known* pose. Beams landing in
+/// unexplored cells are excluded from the mean and from `n_observed` —
+/// walking into a new room must read as "cannot judge", never as "wrong".
+/// A kidnapped robot, by contrast, throws beams into territory the map
+/// knows well and disagrees with everywhere: high `n_observed`, high mean.
+pub fn score_pose(
+    grid: &mut OccupancyGrid,
+    scan: &Scan,
+    pose: (f32, f32, f32),
+    clamp_m: f32,
+    wall_threshold_fp: i16,
+    observed_fp: i16,
+) -> PoseAgreement {
+    let field = grid.distance_field_shared(wall_threshold_fp);
+    let cfg_g = *grid.cfg();
+    let (w, h) = (grid.width(), grid.height());
+    let (cell, x_min, y_min) = (cfg_g.cell, cfg_g.x_range.0, cfg_g.y_range.0);
+    let log = grid.log_raw();
+
+    let (sy, cy) = pose.2.sin_cos();
+    let (mut sum, mut n_observed, mut n_beams) = (0.0_f32, 0u32, 0u32);
+    for (bx, by) in scan.endpoints_body() {
+        n_beams += 1;
+        let ex = pose.0 + cy * bx - sy * by;
+        let ey = pose.1 + sy * bx + cy * by;
+        let j = ((ex - x_min) / cell).floor() as i32;
+        let i = ((ey - y_min) / cell).floor() as i32;
+        if i < 0 || j < 0 || (i as usize) >= h || (j as usize) >= w {
+            continue; // off the map: nothing to compare against
+        }
+        // Seeing through a confident wall is a full-clamp disagreement,
+        // same as in the search kernel above.
+        let mj = ((pose.0 + (ex - pose.0) * 0.5 - x_min) / cell).floor() as i32;
+        let mi = ((pose.1 + (ey - pose.1) * 0.5 - y_min) / cell).floor() as i32;
+        if mi >= 0
+            && mj >= 0
+            && (mi as usize) < h
+            && (mj as usize) < w
+            && log[(mi as usize) * w + (mj as usize)] > wall_threshold_fp
+        {
+            sum += clamp_m;
+            n_observed += 1;
+            continue;
+        }
+        let lo = log[(i as usize) * w + (j as usize)];
+        if lo.abs() < observed_fp {
+            continue; // unexplored cell: cannot judge this beam
+        }
+        sum += field[(i as usize) * w + (j as usize)].min(clamp_m);
+        n_observed += 1;
+    }
+    PoseAgreement {
+        mean_residual_m: if n_observed > 0 {
+            sum / n_observed as f32
+        } else {
+            0.0
+        },
+        n_observed,
+        n_beams,
+    }
+}
+
 /// Search the grid for the best matching pose. Returns the global
 /// minimum-residual candidate (ignoring acceptance — caller checks
 /// `accepted` to decide whether to use the pose).

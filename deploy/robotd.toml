@@ -239,3 +239,9 @@ mode = "walk"
 
 # Start from a clean slate instead of restoring the saved session.
 # wipe_on_boot = false
+
+# Record everything the mapper consumes (odometry ticks + raw depth frames) to a
+# timestamped .mdlg file in this directory — replayable offline through the maploc
+# crate's `evaluate` bench, byte-for-byte the way the robot saw it. ~6 KB/s while
+# mapping, and nothing cleans the directory up: an experiment switch, not a default.
+# record_dir = "/var/lib/robot/maploc-logs"

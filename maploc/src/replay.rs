@@ -46,10 +46,13 @@ use std::io::{self, BufReader, ErrorKind, Read};
 use std::path::Path;
 
 const MAGIC: &[u8; 4] = b"MDLG";
-const VERSION: u32 = 1;
+/// Version 1 is the prototype's format (twin packets); version 2 is what
+/// [`crate::record::SessionRecorder`] writes (odom records). Both read.
+const VERSIONS: [u32; 2] = [1, 2];
 
 const STREAM_TOF: u8 = 0;
 const STREAM_TWIN: u8 = 1;
+const STREAM_ODOM: u8 = 2;
 
 const TOF_ROWS: usize = 8;
 const TOF_COLS: usize = 8;
@@ -100,10 +103,33 @@ pub struct TwinRecord {
     pub contact_anchor: Option<(f32, f32)>,
 }
 
+/// A version-2 robot-state record — what robotd's mapping worker consumed
+/// on one control-loop tick. See [`crate::record`] for the layout.
+#[derive(Debug, Clone, Copy)]
+pub struct OdomRecord {
+    /// Recorder-side timestamp (µs since session start).
+    pub ts_us: u64,
+    pub odom_x: f32,
+    pub odom_y: f32,
+    pub odom_yaw: f32,
+    /// Projected gravity, body frame.
+    pub gravity: [f32; 3],
+    /// Trunk height above the floor, metres.
+    pub trunk_z: f32,
+    /// neck_pitch, head_pitch, head_yaw, head_roll.
+    pub head: [f32; 4],
+    /// The control loop's verdict (scripted move mid-flight or walking).
+    pub moving: bool,
+    /// Seated — the ground-truth protocol's kidnap marker: a carried robot
+    /// is sat first, and odometry cannot see a carry but cannot miss a sit.
+    pub sitting: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum Record {
     Tof(TofRecord),
     Twin(TwinRecord),
+    Odom(OdomRecord),
 }
 
 impl Record {
@@ -111,6 +137,7 @@ impl Record {
         match self {
             Record::Tof(t) => t.ts_us,
             Record::Twin(t) => t.ts_us,
+            Record::Odom(o) => o.ts_us,
         }
     }
 }
@@ -133,12 +160,12 @@ impl SessionReplayer {
             ));
         }
         let version = read_u32(&mut reader)?;
-        if version != VERSION {
+        if !VERSIONS.contains(&version) {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 format!(
-                    "unsupported mdlg version {} (this build expects {})",
-                    version, VERSION
+                    "unsupported mdlg version {} (this build reads {:?})",
+                    version, VERSIONS
                 ),
             ));
         }
@@ -180,6 +207,7 @@ impl Iterator for SessionReplayer {
         match stream_id {
             STREAM_TOF => Some(decode_tof(ts_us, &payload).map(Record::Tof)),
             STREAM_TWIN => Some(decode_twin(ts_us, &payload).map(Record::Twin)),
+            STREAM_ODOM => Some(decode_odom(ts_us, &payload).map(Record::Odom)),
             other => Some(Err(io::Error::new(
                 ErrorKind::InvalidData,
                 format!("unknown stream_id {}", other),
@@ -284,6 +312,29 @@ fn decode_twin(ts_us: u64, payload: &[u8]) -> io::Result<TwinRecord> {
     })
 }
 
+fn decode_odom(ts_us: u64, payload: &[u8]) -> io::Result<OdomRecord> {
+    const SIZE: usize = 11 * 4 + 1;
+    if payload.len() != SIZE {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("odom payload {} != expected {}", payload.len(), SIZE),
+        ));
+    }
+    let f = |idx: usize| -> f32 { read_f32_le(&payload[idx * 4..idx * 4 + 4]) };
+    let flags = payload[SIZE - 1];
+    Ok(OdomRecord {
+        ts_us,
+        odom_x: f(0),
+        odom_y: f(1),
+        odom_yaw: f(2),
+        gravity: [f(3), f(4), f(5)],
+        trunk_z: f(6),
+        head: [f(7), f(8), f(9), f(10)],
+        moving: flags & crate::record::FLAG_MOVING != 0,
+        sitting: flags & crate::record::FLAG_SITTING != 0,
+    })
+}
+
 // ── Byte helpers ─────────────────────────────────────────────────────────────
 
 fn read_u8<R: Read>(r: &mut R) -> io::Result<u8> {
@@ -323,7 +374,7 @@ mod tests {
         let mut f = std::fs::File::create(path).unwrap();
         // Header.
         f.write_all(MAGIC).unwrap();
-        f.write_all(&VERSION.to_le_bytes()).unwrap();
+        f.write_all(&1u32.to_le_bytes()).unwrap(); // a v1 prototype capture
         f.write_all(&123_456_789u64.to_le_bytes()).unwrap();
         // ToF record at ts_us = 1000.
         let mut tof_payload = Vec::new();

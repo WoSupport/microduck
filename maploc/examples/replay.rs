@@ -96,6 +96,10 @@ fn main() {
                     println!("loops: {} (total)", slam.n_loops());
                 }
             }
+            Record::Odom(_) => {
+                // Version-2 logs (robotd's own recorder) are the `evaluate`
+                // example's domain — this bench replays prototype captures.
+            }
             Record::Tof(frame) => {
                 n_frames += 1;
                 let Some(twin) = latest_twin.as_ref() else {
