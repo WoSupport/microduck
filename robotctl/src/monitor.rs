@@ -1057,6 +1057,12 @@ struct View {
     show_duck: bool,
     /// The odometry track, drawn as a top-down map under the robot view.
     path: path_map::PathMap,
+    /// The *tracked* (map-frame) pose history, fed from map frames. The map
+    /// view overlays this one, not the odometry track: after a session
+    /// resume or a loop closure the two live in different frames, and an
+    /// odometry path drawn over the map diverges from the robot marker by
+    /// exactly that frame offset — which reads as a bug, not a frame.
+    tracked_path: path_map::PathMap,
     /// The latest rendered occupancy map, when robotd's maploc is on.
     map: Option<proto::MapFrame>,
     map_arrived: Option<Instant>,
@@ -1098,6 +1104,7 @@ impl View {
             duck: duck::DuckView::new(),
             show_duck: true,
             path: path_map::PathMap::new(),
+            tracked_path: path_map::PathMap::new(),
             map: None,
             map_arrived: None,
             mapping_enabled: false,
@@ -1185,6 +1192,7 @@ impl View {
                 Ok(self.show_pad)
             }
             Update::Map(frame) => {
+                self.tracked_path.observe(frame.x, frame.y, frame.yaw);
                 self.map = Some(*frame);
                 self.map_arrived = Some(Instant::now());
                 Ok(true)
@@ -1414,7 +1422,7 @@ impl View {
                 );
             let inner = block.inner(area);
             frame.render_widget(block, area);
-            path_map::draw_map(&map, &self.path, inner, frame.buffer_mut());
+            path_map::draw_map(&map, &self.tracked_path, inner, frame.buffer_mut());
             return;
         }
         let hint = if self.fullscreen_map {

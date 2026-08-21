@@ -40,6 +40,12 @@ pub struct SubmapManagerConfig {
     pub max_age_s: f32,
     /// Max in-submap travel before forcing a switch.
     pub max_travel_m: f32,
+    /// The age rule only fires once the robot has moved at least this far
+    /// from the anchor: the rule exists to bound intra-submap odometry
+    /// drift, and a robot standing still accrues none — age-freezing it
+    /// just mints identical same-viewpoint submaps (a fresh one every
+    /// 8 s on the first field test's standing robot).
+    pub min_travel_for_age_m: f32,
 }
 
 impl Default for SubmapManagerConfig {
@@ -54,6 +60,7 @@ impl Default for SubmapManagerConfig {
             grid,
             max_age_s: 20.0,
             max_travel_m: 2.0,
+            min_travel_for_age_m: 0.15,
         }
     }
 }
@@ -162,14 +169,14 @@ impl SubmapManager {
             Some(c) => c,
             None => return false,
         };
-        let age = now_s - self.current_started_s.unwrap_or(now_s);
-        if age >= self.cfg.max_age_s {
-            return true;
-        }
         let (ax, ay, _) = cur.anchor_pose();
         let dx = tracked_pose.0 - ax;
         let dy = tracked_pose.1 - ay;
         let travel = (dx * dx + dy * dy).sqrt();
+        let age = now_s - self.current_started_s.unwrap_or(now_s);
+        if age >= self.cfg.max_age_s && travel >= self.cfg.min_travel_for_age_m {
+            return true;
+        }
         travel >= self.cfg.max_travel_m
     }
 
@@ -202,11 +209,12 @@ mod tests {
         assert_eq!(mgr.tick(6.0, (1.0, 0.0, 0.0)), TickOutcome::Reanchored);
         assert_eq!(mgr.n_frozen(), 0, "an empty submap must not freeze");
         assert_eq!(mgr.current().unwrap().anchor_pose().0, 1.0);
-        // With content, the same condition freezes.
+        // With content (and a step away from the anchor, arming the age
+        // rule), the same condition freezes.
         mgr.current_mut()
             .unwrap()
             .integrate_scan((1.0, 0.0, 0.0), &sc());
-        assert_eq!(mgr.tick(12.0, (1.0, 0.0, 0.0)), TickOutcome::Opened);
+        assert_eq!(mgr.tick(12.0, (1.2, 0.0, 0.0)), TickOutcome::Opened);
         assert_eq!(mgr.n_frozen(), 1);
     }
 
@@ -226,18 +234,44 @@ mod tests {
         mgr.current_mut()
             .unwrap()
             .integrate_scan((0.0, 0.0, 0.0), &sc());
-        // First tick (resume at t=100): arms the clock, no switch.
-        assert_eq!(mgr.tick(100.0, (0.0, 0.0, 0.0)), TickOutcome::Idle);
+        // First tick (resume at t=100): arms the clock, no switch. Poses sit
+        // slightly off the anchor so the age rule is armed.
+        assert_eq!(mgr.tick(100.0, (0.2, 0.0, 0.0)), TickOutcome::Idle);
         assert_eq!(mgr.n_frozen(), 0);
         // Just under the age limit: still no switch.
-        assert_eq!(mgr.tick(109.0, (0.0, 0.0, 0.0)), TickOutcome::Idle);
+        assert_eq!(mgr.tick(109.0, (0.2, 0.0, 0.0)), TickOutcome::Idle);
         // Past the age limit: the restored submap must freeze.
         assert_eq!(
-            mgr.tick(110.5, (0.0, 0.0, 0.0)),
+            mgr.tick(110.5, (0.2, 0.0, 0.0)),
             TickOutcome::Opened,
             "restored submap never aged out"
         );
         assert_eq!(mgr.n_frozen(), 1);
+    }
+
+    /// A robot standing at its anchor never age-freezes: there is no drift
+    /// to bound, and freezing would mint identical submaps every few
+    /// seconds for as long as it stands.
+    #[test]
+    fn standing_still_does_not_age_freeze() {
+        let cfg = SubmapManagerConfig {
+            max_age_s: 5.0,
+            max_travel_m: 1000.0,
+            ..SubmapManagerConfig::default()
+        };
+        let mut mgr = SubmapManager::new(cfg);
+        mgr.tick(0.0, (0.0, 0.0, 0.0));
+        mgr.current_mut()
+            .unwrap()
+            .integrate_scan((0.0, 0.0, 0.0), &sc());
+        for t in 1..60 {
+            assert_eq!(
+                mgr.tick(t as f32, (0.0, 0.0, 0.0)),
+                TickOutcome::Idle,
+                "a standing robot minted a submap at t={t}"
+            );
+        }
+        assert_eq!(mgr.n_total(), 1);
     }
 
     #[test]
@@ -282,9 +316,10 @@ mod tests {
         mgr.current_mut()
             .unwrap()
             .integrate_scan((0.0, 0.0, 0.0), &sc());
-        mgr.tick(3.0, (0.0, 0.0, 0.0));
+        // Slightly away from the anchor, so the age rule is armed.
+        mgr.tick(3.0, (0.2, 0.0, 0.0));
         assert_eq!(mgr.n_frozen(), 0);
-        mgr.tick(6.0, (0.0, 0.0, 0.0));
+        mgr.tick(6.0, (0.2, 0.0, 0.0));
         assert_eq!(mgr.n_frozen(), 1);
     }
 

@@ -56,6 +56,21 @@ const PUBLISH_EVERY: Duration = Duration::from_secs(1);
 /// which never came. The map must build while you look at it.
 const WINDOW_FLUSH_AFTER: Duration = Duration::from_secs(3);
 
+/// A vetted window with fewer beams than this is discarded, not inked. The
+/// second field test sat the robot down and left it: every 3-second window
+/// distilled to 2–27 beams of floor clutter, and each one minted map ink
+/// and, worse, fresh submaps for the loop closer to swear against. A real
+/// stop in front of anything measures in the hundreds.
+const MIN_WINDOW_BEAMS: usize = 60;
+
+/// How many times a vetted window's composite is inked. One pass writes
+/// log-odds 85 per wall cell, and the wire frame only calls a cell a wall
+/// past 150 — so a lap that stops once per spot painted the whole walk
+/// invisibly (field test two's "scattered white points" were the rare
+/// twice-visited cells). A window has already survived per-cell frame
+/// voting; it is worth more than one raw frame's confidence.
+const WINDOW_INK_PASSES: usize = 2;
+
 /// One tick's worth of the robot's own state, as the control loop sees it.
 #[derive(Debug, Clone, Copy)]
 pub struct OdomSample {
@@ -206,19 +221,33 @@ fn worker(
                 // while you watch instead of waiting for the next step.
                 let stand_ended = was_still && !still;
                 let ripe = window_opened.is_some_and(|at| at.elapsed() >= WINDOW_FLUSH_AFTER);
-                if (stand_ended || ripe)
-                    && !acc.is_empty()
-                    && let Some((pose, composite)) = acc.finish()
-                {
-                    tracing::info!(
-                        beams = composite.n_valid(),
-                        windows = windows + 1,
-                        "maploc: still window integrated"
-                    );
-                    slam.integrate(pose, &composite);
-                    windows += 1;
-                    unsaved = true;
+                if (stand_ended || ripe) && !acc.is_empty() {
+                    // The window closes here whatever comes of it: leaving
+                    // `window_opened` armed after a fruitless finish keeps
+                    // `ripe` true, and every subsequent frame would flush
+                    // alone — too few frames to vote, so junk passes through.
                     window_opened = None;
+                    match acc.finish() {
+                        Some((pose, composite)) if composite.n_valid() >= MIN_WINDOW_BEAMS => {
+                            tracing::info!(
+                                beams = composite.n_valid(),
+                                windows = windows + 1,
+                                "maploc: still window integrated"
+                            );
+                            for _ in 0..WINDOW_INK_PASSES {
+                                slam.integrate(pose, &composite);
+                            }
+                            windows += 1;
+                            unsaved = true;
+                        }
+                        Some((_, composite)) => {
+                            tracing::debug!(
+                                beams = composite.n_valid(),
+                                "maploc: window too thin to ink; discarded"
+                            );
+                        }
+                        None => {}
+                    }
                 }
                 if stand_ended {
                     window_opened = None;
@@ -227,8 +256,20 @@ fn worker(
                 latest = Some(sample);
                 n_odom += 1;
 
+                let loops_before = slam.n_loops();
+                let before = slam.tracked();
                 if slam.tick(started.elapsed().as_secs_f32()) {
                     unsaved = true;
+                }
+                if slam.n_loops() > loops_before {
+                    let after = slam.tracked();
+                    tracing::info!(
+                        loops = slam.n_loops(),
+                        dx = format!("{:.3}", after.0 - before.0),
+                        dy = format!("{:.3}", after.1 - before.1),
+                        dyaw = format!("{:.3}", wrap_pi(after.2 - before.2)),
+                        "maploc: loop closed; tracked pose corrected"
+                    );
                 }
             }
             Event::Frame(frame) => {
