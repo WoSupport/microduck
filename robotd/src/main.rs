@@ -1107,13 +1107,13 @@ async fn control_loop<T: RobotIo>(
     let mut odometry = odometry::Odometry::alpha();
 
     // Mapping, when asked for: a niced worker thread fed by this loop's own
-    // samples, plus a task pumping tofd's depth stream to it. The loop's
-    // entire cost is one `try_send` per tick.
+    // samples, plus a sibling thread pumping tofd's depth stream to it (its
+    // own thread with its own IO-enabled runtime — THIS runtime is
+    // deliberately time-only, and a socket task spawned on it dies at the
+    // first connect). The loop's entire cost is one `try_send` per tick.
     let maploc_host = params.maploc.enabled.then(|| {
         tracing::info!(mode = state.maploc_mode, "maploc enabled");
-        let host = maploc::spawn(params.maploc.clone(), state.map_tx.clone());
-        tokio::spawn(maploc::feed_tof(host.clone()));
-        host
+        maploc::spawn(params.maploc.clone(), state.map_tx.clone())
     });
 
     // The sit-then-power-off sequence, and fall recovery.

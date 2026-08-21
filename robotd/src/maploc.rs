@@ -96,8 +96,8 @@ impl Host {
     }
 }
 
-/// Start the worker. `map_tx` is where rendered maps go; the connection
-/// handler hands subscribers its receivers.
+/// Start the worker and its tofd feed. `map_tx` is where rendered maps go;
+/// the connection handler hands subscribers its receivers.
 pub fn spawn(
     params: MaplocParams,
     map_tx: tokio::sync::broadcast::Sender<proto::MapFrame>,
@@ -114,6 +114,30 @@ pub fn spawn(
             worker(params, rx, map_tx);
         })
         .expect("spawning the maploc thread cannot fail");
+
+    // The tofd subscription gets its own thread and its own tiny runtime,
+    // WITH an IO driver. It must not ride the control loop's runtime: that
+    // one is built time-only, and a socket task spawned there dies on its
+    // first connect — silently, inside the JoinHandle nobody reads. That is
+    // not hypothetical; it is how field test three produced `frames=0`.
+    let feed = Host { tx: tx.clone() };
+    std::thread::Builder::new()
+        .name("maploc-tof".into())
+        .spawn(move || {
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+            }
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+            {
+                Ok(rt) => rt.block_on(feed_tof(feed)),
+                Err(e) => tracing::error!(error = %e, "maploc: no runtime for the tofd feed"),
+            }
+        })
+        .expect("spawning the maploc feed thread cannot fail");
+
     Host { tx }
 }
 
@@ -357,7 +381,7 @@ fn render_frame(slam: &Slam, seq: &mut u64, windows: u32, still: bool) -> Option
 /// Subscribe to `tofd`'s depth stream and pump frames into the host.
 /// Reconnects with backoff forever: tofd restarting (or absent on a board
 /// with no sensor) idles mapping, nothing more.
-pub async fn feed_tof(host: Host) {
+async fn feed_tof(host: Host) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let mut backoff = Duration::from_millis(500);
