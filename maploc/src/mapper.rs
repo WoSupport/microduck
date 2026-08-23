@@ -257,6 +257,17 @@ pub enum Note {
     },
 }
 
+/// One confirmation attempt's outcome: a candidate pose checked against a
+/// fresh window. Confirmed = the window agrees at the implied pose;
+/// refuted = the map judged it and said no (real evidence of
+/// displacement); unjudgeable = the view lands where the map has no
+/// opinion.
+enum Verdict {
+    Confirmed(Pose2, f32),
+    Refuted,
+    Unjudgeable,
+}
+
 pub struct Mapper {
     cfg: MapperConfig,
     slam: Slam,
@@ -281,6 +292,9 @@ pub struct Mapper {
     soft_seed: Option<(Pose2, Pose2)>,
     /// Windows since suspicion that could not be judged either way.
     unjudged: u32,
+    /// Consecutive windows that AGREED with the soft seed. Two are needed
+    /// before tracking resumes on it — see the seed-confirmation comment.
+    seed_agreed: u32,
     /// The map as it stood when the current stand began — what the
     /// watchdog judges the stand's windows against. Judging against the
     /// LIVE map lets a kidnapped stand vouch for itself: its first window
@@ -310,6 +324,7 @@ impl Mapper {
             pending_reloc: None,
             soft_seed: None,
             unjudged: 0,
+            seed_agreed: 0,
             stand_grid: None,
             last_window: None,
         };
@@ -331,6 +346,7 @@ impl Mapper {
         self.lost = true;
         self.suspect = 0;
         self.unjudged = 0;
+        self.seed_agreed = 0;
         let here = self.slam.tracked();
         self.soft_seed = Some((here, here));
         self.pending_reloc = None;
@@ -371,19 +387,6 @@ impl Mapper {
         let horizon = self.cfg.still.window_s;
         self.odom_window.retain(|&(at, ..)| t_s - at <= horizon);
 
-        // A sit or a fall invalidates the pose: the robot cannot feel a
-        // carry, and a fall can drag and spin it. Arm the lost machinery
-        // with "I was not moved" as the seed — cheap to confirm when
-        // true, refused when false.
-        if (sample.sitting || sample.fallen) && !self.lost {
-            self.arm_suspicion();
-            notes.push(if sample.fallen {
-                Note::SuspectAfterFall
-            } else {
-                Note::SuspectAfterSit
-            });
-        }
-
         let still = !sample.moving
             && !sample.sitting
             && !sample.fallen
@@ -419,6 +422,23 @@ impl Mapper {
             self.stand_grid = self.slam.render();
         }
         self.was_still = still;
+
+        // A sit or a fall invalidates the pose: the robot cannot feel a
+        // carry, and a fall can drag and spin it. Arm the lost machinery
+        // with "I was not moved" as the seed — cheap to confirm when
+        // true, refused when false. AFTER the window flush above, on
+        // purpose: the window that closes at the sit describes the world
+        // BEFORE the carry, and letting it count as the seed's first
+        // agreement handed a real kidnap half its confirmation for free
+        // (measured — field test five's second carry).
+        if (sample.sitting || sample.fallen) && !self.lost {
+            self.arm_suspicion();
+            notes.push(if sample.fallen {
+                Note::SuspectAfterFall
+            } else {
+                Note::SuspectAfterSit
+            });
+        }
 
         // While lost the tracked pose is a guess; freezing submaps or
         // running closures on it would launder the guess into the graph.
@@ -475,55 +495,29 @@ impl Mapper {
             let Some(mut grid) = self.slam.render() else {
                 return;
             };
-            // Candidates are confirmed by THIS window, carried to the
-            // candidate-implied pose by the odometry accumulated since
-            // they were proposed. Three verdicts per attempt: confirmed
-            // (tracking resumes there), refuted (a judgeable window
-            // disagreed — real evidence), or unjudgeable (unmapped view).
-            enum Verdict {
-                Confirmed(Pose2, f32),
-                Refuted,
-                Unjudgeable,
-            }
-            let wd = self.cfg.watchdog;
-            let check = |cand: Pose2,
-                             tracked_then: Pose2,
-                             grid: &mut OccupancyGrid,
-                             tracked_now: Pose2|
-             -> (Pose2, Verdict) {
-                let implied = compose(cand, between(tracked_then, tracked_now));
-                let a = score_pose(
-                    grid,
-                    composite,
-                    implied,
-                    wd.clamp_m,
-                    wd.wall_threshold_fp,
-                    wd.observed_fp,
-                );
-                let judgeable = a.n_observed >= wd.min_observed_beams
-                    && a.n_observed as f32
-                        >= self.cfg.relocalize_confirm_min_fraction * a.n_beams as f32;
-                let verdict = if judgeable
-                    && a.mean_residual_m <= self.cfg.relocalize_confirm_max_residual_m
-                {
-                    Verdict::Confirmed(implied, a.mean_residual_m)
-                } else if judgeable {
-                    Verdict::Refuted
-                } else {
-                    Verdict::Unjudgeable
-                };
-                (implied, verdict)
-            };
             let now = self.slam.tracked();
 
             // The soft seed first: "I was not moved" outranks any search
-            // candidate while it stands unrefuted.
+            // candidate while it stands unrefuted. It must agree with TWO
+            // windows before tracking resumes on it: a single static wedge
+            // falsely confirmed a real kidnap in the field (residual 0.010
+            // at the old pose — the new spot's wall matched the old spot's
+            // wall), and the head sweep only decorrelates the second
+            // window from the first if we wait for it.
             if let Some((cand, then)) = self.soft_seed.take() {
-                match check(cand, then, &mut grid, now) {
+                match self.check_candidate(&mut grid, composite, cand, then, now) {
                     (implied, Verdict::Confirmed(pose, resid)) => {
-                        let _ = implied;
-                        self.resume_at(pose, composite);
-                        notes.push(Note::Relocalized {
+                        self.seed_agreed += 1;
+                        if self.seed_agreed >= 2 {
+                            self.resume_at(pose, composite);
+                            notes.push(Note::Relocalized {
+                                pose,
+                                mean_residual_m: resid,
+                            });
+                            return;
+                        }
+                        self.soft_seed = Some((implied, now));
+                        notes.push(Note::RelocalizeCandidate {
                             pose,
                             mean_residual_m: resid,
                         });
@@ -532,8 +526,10 @@ impl Mapper {
                     (_, Verdict::Refuted) => {
                         // Evidence of displacement: suspicion hardens, the
                         // give-up escape is off the table.
+                        self.seed_agreed = 0;
                     }
                     (implied, Verdict::Unjudgeable) => {
+                        self.seed_agreed = 0;
                         self.unjudged += 1;
                         if self.unjudged >= self.cfg.suspect_give_up_windows {
                             self.resume_at(implied, composite);
@@ -545,9 +541,11 @@ impl Mapper {
                 }
             }
 
-            // Then the search's last candidate, if one is pending.
+            // Then the search's last candidate, if one is pending. (Already
+            // two independent windows: one nominated it, this one judges.)
             if let Some((cand, then)) = self.pending_reloc.take()
-                && let (_, Verdict::Confirmed(pose, resid)) = check(cand, then, &mut grid, now)
+                && let (_, Verdict::Confirmed(pose, resid)) =
+                    self.check_candidate(&mut grid, composite, cand, then, now)
             {
                 self.resume_at(pose, composite);
                 notes.push(Note::Relocalized {
@@ -634,8 +632,44 @@ impl Mapper {
         self.lost = false;
         self.suspect = 0;
         self.unjudged = 0;
+        self.seed_agreed = 0;
         self.soft_seed = None;
         self.pending_reloc = None;
+    }
+
+    /// Check one candidate pose against a fresh window, carried to the
+    /// candidate-implied pose by the odometry accumulated since it was
+    /// proposed. (A plain method, not a closure — a four-parameter closure
+    /// is exactly the construct two rustfmt versions disagree about.)
+    fn check_candidate(
+        &self,
+        grid: &mut OccupancyGrid,
+        composite: &Scan,
+        cand: Pose2,
+        tracked_then: Pose2,
+        tracked_now: Pose2,
+    ) -> (Pose2, Verdict) {
+        let wd = self.cfg.watchdog;
+        let implied = compose(cand, between(tracked_then, tracked_now));
+        let a = score_pose(
+            grid,
+            composite,
+            implied,
+            wd.clamp_m,
+            wd.wall_threshold_fp,
+            wd.observed_fp,
+        );
+        let judgeable = a.n_observed >= wd.min_observed_beams
+            && a.n_observed as f32 >= self.cfg.relocalize_confirm_min_fraction * a.n_beams as f32;
+        let verdict =
+            if judgeable && a.mean_residual_m <= self.cfg.relocalize_confirm_max_residual_m {
+                Verdict::Confirmed(implied, a.mean_residual_m)
+            } else if judgeable {
+                Verdict::Refuted
+            } else {
+                Verdict::Unjudgeable
+            };
+        (implied, verdict)
     }
 
     fn ink(&mut self, pose: Pose2, composite: &Scan) {
