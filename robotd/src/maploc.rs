@@ -442,6 +442,8 @@ fn worker(
                 still = mapper.still(),
                 tracking = mapper.tracking(),
                 moving = latest.as_ref().is_some_and(|s| s.moving),
+                sitting = latest.as_ref().is_some_and(|s| s.sitting),
+                fallen = latest.as_ref().is_some_and(|s| s.fallen),
                 window_frames = mapper.window_frames(),
                 submaps = mapper.slam().n_submaps(),
                 "maploc: status"
@@ -456,7 +458,8 @@ fn worker(
 
         if map_tx.receiver_count() > 0 && last_publish.elapsed() >= PUBLISH_EVERY {
             last_publish = Instant::now();
-            if let Some(frame) = render_frame(&mapper, &mut seq) {
+            let seated = latest.as_ref().is_some_and(|s| s.sitting || s.fallen);
+            if let Some(frame) = render_frame(&mapper, &mut seq, seated) {
                 let _ = map_tx.send(frame);
             }
         }
@@ -506,7 +509,7 @@ fn decode_ranges(
 }
 
 /// The composite map as a wire frame: trinary cells, base64.
-fn render_frame(mapper: &Mapper, seq: &mut u64) -> Option<proto::MapFrame> {
+fn render_frame(mapper: &Mapper, seq: &mut u64, seated: bool) -> Option<proto::MapFrame> {
     let grid = mapper.slam().render()?;
     let mut cells = Vec::with_capacity(grid.width() * grid.height());
     for i in 0..grid.height() {
@@ -539,6 +542,7 @@ fn render_frame(mapper: &Mapper, seq: &mut u64) -> Option<proto::MapFrame> {
         n_loops: mapper.slam().n_loops() as u32,
         windows: mapper.windows(),
         still: mapper.still(),
+        seated,
     })
 }
 

@@ -2644,6 +2644,12 @@ pub struct MapFrame {
     /// (i.e. a scan window is accumulating right now).
     #[serde(default)]
     pub still: bool,
+    /// Seated (or fallen): the mapper refuses to map or relocalize from
+    /// the floor, so a "searching" that never ends while this is set is
+    /// a robot waiting to be stood up — a field test spent three minutes
+    /// puzzling over exactly that.
+    #[serde(default)]
+    pub seated: bool,
 }
 
 /// Standard base64 (RFC 4648, with padding), owned here so both ends of

@@ -1403,7 +1403,14 @@ impl View {
         // With maploc on and frames flowing, the panel is the live map; the
         // odometry track is what it shows the rest of the time.
         if let Some(map) = self.live_map() {
-            let searching = if map.tracking { "" } else { " · searching" };
+            // "seated" outranks "searching": a seated robot will not even
+            // try to relocalize, and a caption that only said "searching"
+            // once cost a field test three minutes of confusion.
+            let searching = match (map.tracking, map.seated) {
+                (_, true) => " · seated — stand the robot to map",
+                (false, false) => " · searching",
+                (true, false) => "",
+            };
             let standing = if map.still { " · scanning" } else { "" };
             let hint = if self.fullscreen_map {
                 " m back "

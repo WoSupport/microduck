@@ -424,6 +424,7 @@ mod tests {
             n_loops: 0,
             windows: 1,
             still: false,
+            seated: false,
         };
         let area = Rect::new(0, 0, 30, 10);
         let mut buf = Buffer::empty(area);
