@@ -264,6 +264,9 @@ struct RobotState {
     /// `[maploc]` is enabled, quiet otherwise. Small buffer: frames arrive
     /// at ~1 Hz and only the newest matters.
     map_tx: tokio::sync::broadcast::Sender<proto::MapFrame>,
+    /// The mapping worker's handle, when maploc is enabled — set once by the
+    /// control loop at spawn so the IPC side can ask for a wipe.
+    maploc: std::sync::OnceLock<maploc::Host>,
     /// What `robot.map`'s answer says about this robot's mapping.
     maploc_enabled: bool,
     maploc_mode: &'static str,
@@ -340,6 +343,7 @@ impl RobotState {
             shutdown: AtomicBool::new(false),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
             map_tx: tokio::sync::broadcast::Sender::new(4),
+            maploc: std::sync::OnceLock::new(),
             maploc_enabled: params.maploc.enabled,
             maploc_mode: match params.maploc.mode {
                 crate::params::MaplocMode::StopAndScan => "stop_and_scan",
@@ -1116,7 +1120,9 @@ async fn control_loop<T: RobotIo>(
     // first connect). The loop's entire cost is one `try_send` per tick.
     let maploc_host = params.maploc.enabled.then(|| {
         tracing::info!(mode = state.maploc_mode, "maploc enabled");
-        maploc::spawn(params.maploc.clone(), state.map_tx.clone())
+        let host = maploc::spawn(params.maploc.clone(), state.map_tx.clone());
+        let _ = state.maploc.set(host.clone());
+        host
     });
 
     // The sit-then-power-off sequence, and fall recovery.
@@ -2337,6 +2343,20 @@ fn dispatch(
                 mode: state.maploc_enabled.then(|| state.maploc_mode.to_owned()),
             },
         ),
+
+        proto::Call::RobotMapWipe => match state.maploc.get() {
+            Some(host) if host.wipe() => {
+                proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+            }
+            Some(_) => proto::Response::ok(
+                Some(id),
+                &proto::IntentResult::refused("the mapper is overloaded; try again"),
+            ),
+            None => proto::Response::ok(
+                Some(id),
+                &proto::IntentResult::refused("mapping is not enabled on this robot"),
+            ),
+        },
 
         proto::Call::RobotStop => {
             intents.stop();

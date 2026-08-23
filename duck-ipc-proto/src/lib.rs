@@ -134,7 +134,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// The live occupancy map, when `[maploc]` is enabled in robotd.toml. A subscription like
 /// `robot.state`: the answer says whether mapping runs, then `map.frame` notifications
 /// carry the rendered grid and the map-frame pose at a slow cadence.
-pub const API_VERSION: u32 = 13;
+pub const API_VERSION: u32 = 14;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -435,6 +435,11 @@ pub mod method {
     /// arrive as [`MAP_FRAME`] notifications at a slow cadence.
     pub const ROBOT_MAP: &str = "robot.map";
 
+    /// Wipe the mapping session: the map, the pose graph, the tracked pose
+    /// and any suspicion all reset, and the saved session file is deleted.
+    /// The experiment reset button — no ssh, no daemon restart.
+    pub const ROBOT_MAP_WIPE: &str = "robot.map_wipe";
+
     /// One rendered map, pushed after [`ROBOT_MAP`].
     pub const MAP_FRAME: &str = "map.frame";
 }
@@ -584,6 +589,8 @@ pub enum Call {
     TofStream,
     /// Subscribe to the live occupancy map. Answered by `robotd`.
     RobotMap,
+    /// Reset the mapping session — see [`method::ROBOT_MAP_WIPE`].
+    RobotMapWipe,
 }
 
 impl Call {
@@ -636,6 +643,7 @@ impl Call {
             Call::PadInput => method::PAD_INPUT,
             Call::TofStream => method::TOF_STREAM,
             Call::RobotMap => method::ROBOT_MAP,
+            Call::RobotMapWipe => method::ROBOT_MAP_WIPE,
         }
     }
 
@@ -735,7 +743,8 @@ impl Call {
             | Call::PadStatus
             | Call::PadInput
             | Call::TofStream
-            | Call::RobotMap => Value::Object(serde_json::Map::new()),
+            | Call::RobotMap
+            | Call::RobotMapWipe => Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -805,6 +814,7 @@ impl Call {
             method::PAD_INPUT => Call::PadInput,
             method::TOF_STREAM => Call::TofStream,
             method::ROBOT_MAP => Call::RobotMap,
+            method::ROBOT_MAP_WIPE => Call::RobotMapWipe,
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -3105,6 +3115,7 @@ mod tests {
             }),
             Call::TofStream,
             Call::RobotMap,
+            Call::RobotMapWipe,
         ]
     }
 
@@ -3116,7 +3127,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            45,
+            46,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

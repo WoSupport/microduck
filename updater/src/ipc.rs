@@ -607,7 +607,8 @@ impl Server {
             | Call::RobotShutdown
             | Call::RobotMode
             | Call::RobotSubscribe(_)
-            | Call::RobotMap => Response::err(
+            | Call::RobotMap
+            | Call::RobotMapWipe => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,

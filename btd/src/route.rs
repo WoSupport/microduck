@@ -161,6 +161,7 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         // A 40 KB map frame is not a 20-byte BLE notification's business; the
         // app path reads maps over WebRTC when it exists (§5.2).
         RobotMap => None,
+        RobotMapWipe => None,
 
         // Powering the machine off from a phone in the room is `system.reboot` without the
         // coming back. The sit-then-power-off flow wants whoever asked to be watching the

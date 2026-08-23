@@ -76,6 +76,9 @@ pub struct OdomSample {
 enum Event {
     Odom(OdomSample),
     Frame(Box<proto::TofFrame>),
+    /// Reset everything: map, graph, tracked pose, suspicion — and delete
+    /// the saved session. `robotctl robot map-wipe`.
+    Wipe,
 }
 
 /// Handle the rest of robotd holds. Dropping every clone (robotd shutting
@@ -96,6 +99,13 @@ impl Host {
     /// Feed one depth frame (called from the tofd subscription task).
     pub fn frame(&self, frame: proto::TofFrame) {
         let _ = self.tx.try_send(Event::Frame(Box::new(frame)));
+    }
+
+    /// Ask the worker to reset the mapping session. Returns false when the
+    /// channel is jammed (the caller reports the refusal; retrying is the
+    /// operator's one keystroke).
+    pub fn wipe(&self) -> bool {
+        self.tx.try_send(Event::Wipe).is_ok()
     }
 
     /// Is the mapper's pose suspect or lost right now? The control loop
@@ -262,6 +272,22 @@ fn worker(
                 );
                 latest = Some(sample);
                 n_odom += 1;
+            }
+            Event::Wipe => {
+                mapper = Mapper::new(
+                    MapperConfig {
+                        continuous: params.mode == MaplocMode::Continuous,
+                        ..MapperConfig::default()
+                    },
+                    Slam::new(SlamConfig::default()),
+                );
+                if let Err(e) = std::fs::remove_file(&params.map_path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(error = %e, "maploc: wipe could not delete the session file");
+                }
+                unsaved = false;
+                tracing::info!("maploc: session wiped by request");
             }
             Event::Frame(frame) => {
                 n_frames += 1;
