@@ -1521,8 +1521,15 @@ async fn control_loop<T: RobotIo>(
         // head yaw, only while searching; the EMA below glides both the
         // takeover and the handback.
         let mut head_target = gated.head;
+        // Sweep while searching — AND at every stop-and-scan stop: the
+        // prototype panned the head at every stop (130–230° spans), and
+        // that width is where its map quality came from. A static stop
+        // keeps whatever 45° wedge the head happens to face and throws
+        // the rest of the stop away.
         let sweeping = params.maploc.search_sweep
-            && maploc_host.as_ref().is_some_and(maploc::Host::searching)
+            && maploc_host.as_ref().is_some_and(|host| {
+                host.searching() || params.maploc.mode == params::MaplocMode::StopAndScan
+            })
             && !state.moving.load(Ordering::Relaxed)
             && !in_recovery
             && controller.as_ref().is_some_and(|c| !c.is_sitting());

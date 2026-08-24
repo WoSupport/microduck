@@ -240,10 +240,10 @@ mode = "walk"
 # Start from a clean slate instead of restoring the saved session.
 # wipe_on_boot = false
 
-# While the mapper is unsure of its pose (after a sit, a fall, a reboot, or scans that
-# contradict the map) and the robot stands still, sweep the head slowly so relocalization
-# sees a wide arc instead of a narrow wedge. The commanded head pose comes back as soon as
-# the pose is confirmed.
+# Sweep the head slowly at every stop while mapping (and whenever the pose is suspect —
+# after a sit, a fall, a reboot, or scans that contradict the map): each stop then captures
+# a ~150° arc instead of a 45° wedge, which is where both map quality and relocalization
+# reliability come from. The commanded head pose comes back as soon as the robot moves.
 # search_sweep = true
 
 # Record everything the mapper consumes (odometry ticks + raw depth frames) to a
