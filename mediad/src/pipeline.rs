@@ -25,12 +25,12 @@
 //! NV12 because that is what the rkisp capture path emits and what `mpph264enc` takes, so nothing
 //! *converts* anywhere: no `videoconvert`, and no RGA pass, between capture and either consumer.
 //!
-//! **`videoflip` is the one pass, and it is a rotation rather than a conversion.** The head camera
-//! is mounted a quarter turn off, so a straight capture is sideways; turning it before the tee is
-//! what lets both consumers — and the console's drag-to-look, which maps a gaze off the same
-//! geometry — agree about which way is up. It costs CPU on the SoC that runs `robotd`'s control
-//! loop, which is why it is one element and one flag ([`Rotation`], `--rotate 0`) rather than a
-//! property of the pipeline nobody can take out.
+//! **Nothing converts and nothing rotates.** The head camera is mounted a quarter turn off, and for
+//! one afternoon this pipeline fixed that with a `videoflip` before the tee — which broke
+//! `mpph264enc`'s zero-copy path to the 2D engine and had MPP converting every frame in software:
+//! 97 °C, the CPU throttled to 408 MHz, 8 fps out of a 30 fps camera. Rotation is now the
+//! consumer's business, because for both consumers it is free — a CSS transform in the browser, and
+//! a resample the detector was doing anyway. [`Rotation`] has the numbers.
 //!
 //! **Each branch has its own `queue`, and the raw one is leaky.** A `tee` without queues runs its
 //! branches on one thread, so a slow consumer stalls the others — here that would mean a
@@ -89,17 +89,22 @@ use gstreamer_video as gst_video;
 use gstreamer_webrtc as gst_webrtc;
 use tokio::sync::mpsc;
 
-/// How far the picture is turned before anything downstream sees it.
+/// How far the picture is turned *in the pipeline* — which, by default, is not at all.
 ///
-/// **The head camera is mounted a quarter turn off**, so the sensor's rows run down the world
-/// rather than across it and a straight capture comes out sideways. That is a fact about the
-/// robot, not a preference, which is why the default is a quarter turn rather than none.
+/// **This defaulted to a quarter turn for one afternoon and cost 145% of a core.** `mpph264enc`
+/// hands the UYVY→NV12 conversion to the SoC's 2D engine and pays nothing for it; `videoflip`'s
+/// output is a buffer the RGA refuses — `10000 is unsupport format`, then `RGA_BLIT fail: Bad
+/// address` on a `rect[0, 0, 720, 1280]` — so MPP fell back to converting **every frame in
+/// software**. Measured on the robot: 97 °C, the CPU throttled from 1.8 GHz to 408 MHz, 1565 frames
+/// lost by `v4l2src` in one session, and 8 fps out of a 30 fps camera. The boot before that change
+/// had zero RGA failures and zero lost frames.
 ///
-/// Turned here rather than in the console, and the console is the reason: it maps a drag on the
-/// picture to a gaze (`aim` in `webclient/index.html`), so a page that rotated the video in CSS
-/// would send the robot looking 90° away from where the operator pointed. Rotating before the tee
-/// also means the raw branch — the one a perception consumer reads — sees the same picture the
-/// stream does, rather than each consumer having to know about the mount.
+/// So the pipeline no longer rotates pixels. The camera is still mounted a quarter turn off, and the
+/// consumer that has to care rotates for itself, for free: the console does it with a CSS transform
+/// on the GPU, and a perception consumer folds the turn into the resampling it already does.
+/// [`Settings::rotation`] stays for a consumer that genuinely needs an upright *encoded* stream —
+/// `--flip-in-pipeline` — and now that its cost is written down, that is a choice rather than a
+/// default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rotation {
     /// Leave the frame as the sensor delivered it.
@@ -162,13 +167,17 @@ pub struct Settings {
     pub host: String,
     /// The signalling server's port, which is *not* the console's: [`crate::web`] owns that one.
     pub port: u32,
-    /// Starting video bitrate, bits per second. Congestion control moves it from here.
+    /// Starting video bitrate, bits per second. Congestion control moves it from here — unless
+    /// it is `disabled`, which is what makes this the rate rather than a starting point.
     pub bitrate: u32,
+    /// Whether the send rate adapts to the link, and by what. `robotd_params::CongestionControl`
+    /// has the trade, and it is a CPU one as much as a network one.
+    pub congestion_control: robotd_params::CongestionControl,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    /// How far to turn the picture; see [`Rotation`]. The capture geometry above is the sensor's,
-    /// *before* this is applied.
+    /// How far the *pipeline* turns the picture; see [`Rotation`]. Almost always `None` — the
+    /// capture geometry above is then also what leaves the tee.
     pub rotation: Rotation,
 }
 
@@ -186,11 +195,11 @@ pub enum Source {
 ///
 /// **These are a starting exposure, not a policy.** A capture with the driver's boot defaults
 /// comes out black, so something has to write the sensor before the first frame — that is what
-/// these are for, and they are the difference between a picture and no picture on a board with
-/// no 3A. Where `scripts/setup-rkaiq.sh` has run, Rockchip's engine owns exposure from its first
-/// statistics onward and these hold for the few frames before that; where it has not, they are
-/// all there is and the picture stays at one exposure. Values are in the sensor's own units:
-/// exposure in lines (~19 µs each) and analogue gain where 256 is 1x, up to 2816 for 11x.
+/// these are for. From there [`crate::exposure`] meters the picture and takes over, because
+/// Rockchip's 3A engine converges once at stream start and then stops — and does not manage even
+/// that if it missed the stream-start event. With `--no-auto-exposure` these are all there is and
+/// the picture stays at one brightness. Values are in the sensor's own units: exposure in lines (~19 µs each)
+/// and analogue gain where 256 is 1x, up to 2816 for 11x.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Camera {
     pub device: String,
@@ -220,6 +229,15 @@ pub struct Frame {
 pub struct Frames(Arc<Mutex<Option<Frame>>>);
 
 impl Frames {
+    /// Read the latest frame in place, without copying it. `None` until the first one arrives.
+    ///
+    /// For a reader that wants a number out of a frame rather than the frame — the auto-exposure
+    /// loop wants a mean, and cloning 1.8 MB twice a second to average 11k bytes of it is a memcpy
+    /// nobody needs.
+    pub fn inspect<T>(&self, read: impl FnOnce(&Frame) -> T) -> Option<T> {
+        self.0.lock().expect("frame lock").as_ref().map(read)
+    }
+
     /// The latest frame, cloned. `None` until the first one arrives.
     pub fn latest(&self) -> Option<Frame> {
         self.0.lock().expect("frame lock").clone()
@@ -246,6 +264,7 @@ pub fn start(
     let &Settings {
         port,
         bitrate,
+        congestion_control,
         width,
         height,
         fps,
@@ -321,20 +340,16 @@ pub fn start(
         .build()
         .map_err(|_| anyhow!("no capsfilter element; gstreamer core is incomplete"))?;
 
-    // ── the turn ────────────────────────────────────────────────────────────
+    // ── the turn, when somebody asks for it ─────────────────────────────────
     //
-    // `videoflip` from `gstreamer1.0-plugins-good`, which the board already has — see the package
-    // list in `scripts/setup-gstreamer.sh`. It is a CPU pass, and this pipeline was built to have
-    // none: "no `videoconvert`, and no RGA pass, between capture and either consumer". A quarter
-    // turn of 4:2:2 720p is real work (a scattered write per pixel, so the copy is cache-hostile
-    // rather than merely large), and it lands on the SoC that also runs `robotd`'s control loop.
+    // `videoflip` from `gstreamer1.0-plugins-good`, and **off unless asked**: see [`Rotation`] for
+    // the measurement. It does not merely cost a CPU pass of its own — it takes the encoder's
+    // zero-copy path down with it, because the RGA will not touch what it produces, so the true
+    // price is a software colour conversion of every frame as well.
     //
-    // It buys a picture that is the right way up for every consumer at once, which is worth a
-    // pass — but if the loop starts missing ticks when the camera streams, this is the first
-    // thing to suspect and `--rotate 0` is how to confirm it in one restart. The cheaper fix, if
-    // it comes to that, is the SoC's 2D engine: the RGA is already doing one operation per frame
-    // inside `mpph264enc`, and a rotation is the same class of operation — it needs an RGA element
-    // in the plugin set, which this one does not have.
+    // Left in for the consumer that cannot rotate for itself and can afford this. If that ever
+    // becomes the common case, the fix is an RGA element in the plugin set (the 2D engine can
+    // rotate for nothing), not this.
     let flip = match rotation.video_direction() {
         Some(direction) => Some(
             gst::ElementFactory::make("videoflip")
@@ -430,8 +445,11 @@ pub fn start(
 
     // The starting bitrate. `webrtcsink` moves it from here as congestion control learns the
     // link — which is the whole point of letting it own the encoder, so this is a starting
-    // point rather than the setting it was when we encoded ourselves.
+    // point rather than the setting it was when we encoded ourselves. Unless the estimator is
+    // off, and then nothing moves it and this is the rate.
     sink.set_property("start-bitrate", bitrate);
+
+    set_congestion_control(&sink, congestion_control);
 
     // The encoder settings, applied through the hook that exists for it.
     //
@@ -905,7 +923,7 @@ fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
 /// This shells out to `media-ctl` once at startup, because the switch is a subdev ioctl on an
 /// entity whose name embeds its I2C bus and address (`m00_b_imx219 2-0010`) and therefore has to
 /// be discovered from the topology rather than named. Doing it here rather than in the unit means
-/// a `--camera`-less run needs no camera at all.
+/// a run with `[media] camera` off needs no camera at all.
 fn pin_sensor_mode(fps: u32) -> Result<()> {
     let (media, entity) = find_sensor()?;
 
@@ -1003,6 +1021,41 @@ fn find_sensor() -> Result<(String, String)> {
         "read {nodes} media device(s) and none has an imx219 entity. The overlay loaded something, \
          so DUCK_CAMERA_OVERLAY may name the wrong module for this camera."
     )
+}
+
+/// Tell `webrtcsink` whether to adapt the send rate to the link, and by what.
+///
+/// **Set rather than inherited.** `gcc` is the element's own default, so naming it changes nothing
+/// today — which is the point: what a plugin we ship from a pinned release defaults to is not a
+/// decision this robot should discover it inherited on the day upstream changes it.
+///
+/// **And set defensively, because this is the one value in this function that comes from a config
+/// file rather than a literal.** `set_property_from_str` panics both on a property the element
+/// lacks and on a nickname its enum does not know, and a panic here is a daemon that will not
+/// start — costing the video *and* the control channel to gain a setting. So the property is
+/// looked up and the nickname resolved through the enum's own class; either failing leaves the
+/// element on its default and says so, which is a far better failure than no robot at all. Same
+/// reasoning as the `meta` property above.
+fn set_congestion_control(sink: &gst::Element, mode: robotd_params::CongestionControl) {
+    let Some(pspec) = sink.find_property("congestion-control") else {
+        tracing::warn!(
+            "webrtcsink has no congestion-control property on these plugins, so the send rate \
+             adapts however this build defaults. Everything else is unaffected."
+        );
+        return;
+    };
+    let Some(value) = glib::EnumClass::with_type(pspec.value_type())
+        .and_then(|class| class.to_value_by_nick(mode.nick()))
+    else {
+        tracing::warn!(
+            nick = mode.nick(),
+            "webrtcsink's congestion-control has no such value on these plugins; leaving its own \
+             default"
+        );
+        return;
+    };
+    sink.set_property_from_value("congestion-control", &value);
+    tracing::info!(congestion_control = mode.nick(), "send rate");
 }
 
 /// Configure each encoder `webrtcsink` builds, before it runs.

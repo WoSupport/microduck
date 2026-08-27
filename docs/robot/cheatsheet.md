@@ -68,9 +68,28 @@ network is configured at all — because `walk` is a mode two releases with diff
 report. A robot with no policy says so, and one whose policy would not load says that instead,
 which the stream's `held` cannot distinguish.
 
+Down the right-hand side, **the robot drawn as it is standing** — the same visual model the
+policies were trained against, posed by the measured joint angles and tilted by the IMU's gravity
+vector. A leg folded the wrong way, a head pitched into the floor and a duck lying on its side are
+all just numbers in the joints table; every one of them is obvious here. It is on by default and
+appears whenever the terminal is wide enough (about 110 columns — the tables come first, and the
+robot takes what is spare). **`d`** turns it off; **`[`** and **`]`**, or `←`/`→`, orbit it.
+
+Whenever the ToF is delivering frames, what it sees is drawn into the same scene — yellow for a
+hit, green for floor — depth-tested against the robot's own body, so a point behind the beak is
+hidden by it. That is what makes "is it seeing my hand, or is it seeing itself" answerable. It
+needs no key: the points appear when frames arrive and go when they stop.
+
+Under it, when the column is tall enough, **a map of where the robot has been**: odometry's track
+from the foot contacts and the IMU, in braille. The panel never grows — the world zooms out as the
+track does, so the whole path stays in frame. `+` is where it started, `●` is the robot with a
+short ray for its heading, screen-up is the heading it booted with. There is no magnetometer, so
+this is relative motion and it drifts; it answers "did it walk in a circle" and not "where is it".
+
 `q` quits; `↑`/`↓` scroll the joint list on a window too short for all of it; `u` switches the
-angles between degrees and radians; `p` opens the pad's raw input stream — every evdev report from
-the gamepad, with the gaps between them, which is the only place a stalled radio is visible
+angles between degrees and radians; `t` opens the [ToF matrix](#the-tof-sensor-tofd); `d` toggles
+the robot view and `[` / `]` orbit it; `p` opens the pad's raw input stream — every evdev report
+from the gamepad, with the gaps between them, which is the only place a stalled radio is visible
 ([pair a gamepad](pair-a-gamepad.md#when-it-drops-while-you-are-driving)). Angles are degrees on screen — joints, head and the yaw rate.
 Redirected or piped it prints one line per tick instead, so `> run.log` and `| grep FALLEN`
 behave, and those numbers stay radians whatever the screen is set to. The joint vectors are in
@@ -80,15 +99,15 @@ behave, and those numbers stay radians whatever the screen is set to. The joint 
 robotctl monitor --json --hz 50 > run.jsonl
 ```
 
-### Configuring `robotd`
+### Configuring the robot
 
 ```
 sudo robotctl configure
 ```
 
-An interactive editor over `/etc/robot/robotd.toml`: every key the daemon knows, the feature
+An interactive editor over `/etc/robot/robotd.toml`: every key the daemons know, the feature
 switches first (policy on/off, walk/roller, limp-fall, audio, pet detection, battery
-shutdown…), current value against default, one line of doc. SPACE toggles, ENTER types a
+shutdown, camera and video quality…), current value against default, one line of doc. SPACE toggles, ENTER types a
 value, `u` reverts a key to its default. Values in yellow (marked `•`) are the keys where
 this robot diverges from the defaults; everything else is the built-in default, and `unset`
 optionals show what they resolve to `(auto)`.
@@ -105,10 +124,57 @@ Three properties worth trusting:
 - **It cannot write a file robotd refuses to start on.** Every save is validated through the
   daemon's own loader first, atomically (temp file + rename), and rejected with the reason.
 
-`robotd` reads the file once at startup, so saving offers a restart. `sudo`, because the file
+The daemons read the file once at startup, so saving offers a restart — of the ones that read
+what you changed: `[media]` is `mediad`, everything else is `robotd`. `sudo`, because the file
 is root-owned — without it the editor opens read-only and says so on the first write.
 `--file` points it elsewhere for a bench copy. The shipped `deploy/robotd.toml` stays the
 reference for *why* each knob exists; this is for flipping them.
+
+#### Video quality
+
+```
+sudo robotctl configure
+```
+
+Set `media.quality` — `1080p30`, `720p30`, `720p15` or `360p30` — and take the restart it
+offers. `media.camera` off streams a test pattern instead, which is what a board with no camera
+wants: the WebRTC *control* channel rides on the video track, so a pipeline that cannot start
+costs both. `media.bitrate` follows the quality unless you set it; the unit is bits per second.
+
+`media.congestion_control` is the other knob in that section, and it is the one that moves CPU:
+`disabled` drops the bandwidth estimator, which is the largest single consumer in `mediad` (7.6% of
+a core against capture's 0.3%), and makes `media.bitrate` the rate rather than a starting point. It
+costs adaptivity — on a link that degrades, the picture stalls instead of the rate falling.
+
+720p30 is the rung the pipeline was measured at; a rung that does not hold runs slower rather
+than failing. `robotctl monitor` reports the achieved rate on the bottom border, in yellow with
+`of <target>` beside it when it is under 90% of what was asked for. What was applied:
+
+```
+journalctl -u mediad -b | grep streaming
+```
+
+#### Your own policy
+
+You do not need to cut a release to try a network. Point `robotd` at your own `.onnx` on the
+board, in `/etc/robot/robotd.toml`:
+
+```toml
+[policy]
+walk = "/home/radxa/my_walking.onnx"
+stand = "/home/radxa/my_stand.onnx"
+```
+
+```
+sudo systemctl restart robotd
+```
+
+Your paths survive updates — a release replaces the binaries and the policies it ships, not the
+file that points elsewhere. Delete the lines to go back to the ones the release carries.
+
+A policy that could not be loaded reports **unhealthy**, and `robotctl health` and the bottom
+border of `monitor` both name the reason. The shape a policy has to have, and what else is
+checked at load, are in [`../design/robotd-design.md`](../design/robotd-design.md) §2.3.
 
 ### Power to the joints (`robotd`)
 
@@ -169,6 +235,8 @@ mapping is the prototype's, so muscle memory carries over:
 
 | control | does |
 | --- | --- |
+| left stick | drive: forward/back and strafe · head: head yaw and pitch · body pose: up and crouch |
+| right stick | drive: turn · head: neck pitch and head roll · body pose: pitch and roll |
 | **Start** | toggle the policy — nothing moves until it is on |
 | **Y** / triangle | head mode: sticks pose the head (body holds still) |
 | **B** / circle | body-pose mode: sticks lean and crouch the standing robot |
@@ -262,9 +330,10 @@ The loudest way to tell ducks apart: every robot's voice bank is generated from 
 serial (`sounds ensure-bank`, run by every release install), so the robot that answers — in
 a voice that is only its own — is the one you're SSH'd into. A robot with no voice — audio
 off, or no bank — says so instead of printing 🦆, so silence always means the wrong duck.
-The robot also greets when `robotd` comes up, pecks goodbye before powering off, and coos
-when the mic hears its head being scratched (walk mode; the classifier ships in the
-release). The startup greet has its own switch, for anyone restarting the daemon all day:
+The robot also greets when `robotd` comes up, pecks goodbye before powering off, and — if you
+ask it to — coos when the mic hears its head being scratched. That one is off by default in
+both modes (`audio.pet_detect = true` turns it on; the classifier ships in the release): the
+always-on version cooed at every incidental brush and wore thin. The startup greet has its own switch, for anyone restarting the daemon all day:
 
 ```
 sudo robotctl configure

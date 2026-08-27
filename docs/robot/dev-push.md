@@ -73,7 +73,7 @@ export DUCK_BOARD=radxa@192.168.1.42
 
 It cross-compiles the workspace, packages the same artifact a release does, signs it with the dev
 key, copies it to `~/duck-sideload` on the board, and applies it there through
-`robotctl update apply --from`. Then it waits for the five daemons to report the new release:
+`robotctl update apply --from`. Then it waits for the daemons to report the new release:
 
 ```
 ==> building 0.5.1-dev.local.1763400000.g7fc1444 for the board (zigbuild)
@@ -89,12 +89,18 @@ key, copies it to `~/duck-sideload` on the board, and applies it there through
     [ok] padd
     [ok] updaterd
     [ok] btd
+    [ok] mediad
+    [ok] tofd
 ==> every daemon on radxa@192.168.1.42 is running 0.5.1-dev.local.1763400000.g7fc1444
 ```
 
 `updaterd` and `btd` restart five seconds after the apply replies, so those two lines take a moment
 to arrive. A `[--] padd published nothing` is not a failure — it is also what a stopped or
-deliberately disabled daemon looks like.
+deliberately disabled daemon looks like, and what `mediad` looks like on a board with no camera.
+
+A `[--] tofd published nothing` means a release from before `tofd` published an identity at all —
+one more push fixes it — rather than a sensor that is missing: `tofd` runs whether or not one is
+fitted.
 
 On the board, that version is what `robotctl version` reports:
 

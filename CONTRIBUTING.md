@@ -5,14 +5,32 @@ For working on the daemons themselves. To use a robot rather than change it, see
 
 ## Building and testing
 
-Needs Rust **1.89+** (stable) and nothing else. macOS and Linux both work for development; the
-robot is aarch64 Linux.
+Needs Rust **1.89+** (stable). The robot is aarch64 Linux; you develop on Linux or macOS, and
+the two are not quite the same checkout — see below.
 
 ```bash
 cargo test --workspace
 ```
 
-508 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
+No hardware, no network, no Docker. If they pass, your checkout is sound.
+
+**On Linux** that command needs some C libraries first, the same ones CI installs: `padd` binds
+`libudev` through `gilrs`, and `mediad`'s pipeline is `cfg(target_os = "linux")`, so a Linux host
+compiles GStreamer where a Mac does not.
+
+```bash
+sudo apt-get install -y libudev-dev libgstreamer1.0-dev
+```
+
+```bash
+sudo apt-get install -y libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
+```
+
+**On macOS** the command above is the whole of it — **942 tests passing**, nothing excluded. Two
+of the ToF driver's own tests do not run there, because there is no driver to run them against:
+`vendor/platform.c` reaches the bus through `linux/i2c.h`, so `build.rs` compiles it on Linux
+targets only and `sensor.rs` offers a `Sensor` that cannot be opened. `tofd` still builds and
+`tofd --fake` still serves frames, which is the only way it runs off a board anyway.
 
 Those tests are also where the engine's failure paths are: a bad signature, a release that comes
 up unhealthy, a post-install hook that fails, power loss between the swap and the health gate.
@@ -38,9 +56,9 @@ RUSTFLAGS="-D warnings" cargo clippy -p configd --all-targets --target aarch64-u
 ```
 
 `scripts/board-test.sh` runs in CI against the userland we ship: it cross-compiles for the board
-and executes 13 checks — rollback, tampered-artifact refusal, boot-counter recovery, socket
-modes, peer-credential authorization — on Debian 13 (Trixie). `BOARD_IMAGES=` runs it against
-another.
+and executes 60 assertions — rollback, tampered-artifact refusal, boot-counter recovery, socket
+modes, peer-credential authorization, and everything `setup-board.sh` and `install.sh` do to a
+board — on Debian 13 (Trixie). `BOARD_IMAGES=` runs it against another.
 
 To run a change on a real robot without publishing it, `scripts/dev-push.sh <user@board>` builds
 here and installs there as an ordinary gated update. It cross-compiles with `cargo zigbuild` by
@@ -51,22 +69,42 @@ set up at all. Setup, the flags and the failure modes:
 ## The layout
 
 ```
-duck-ipc-proto/ the wire contract
-duck-control/   the control core: model · bus · IMU · observations · policy · safety
-padd/           gamepad → intents — an ordinary socket client, no privileged access
-updater/        engine + updaterd
-robotd/         control daemon
-configd/        wifi · robot name · pairing PIN · reboot · gamepad pairing
-btd/            the BLE front door
-duckctl/        the laptop-side client — never shipped, never cross-built
-robotctl/       the local CLI
-xtask/          package · sign · promote — build tooling, never shipped
+the daemons — one crate each, one unit each, all in the same release artifact
+  robotd/         control daemon: the 50 Hz loop, the voice, the theremin, the chorale
+  updater/        engine + updaterd
+  configd/        wifi · robot name · pairing PIN · reboot · gamepad pairing
+  btd/            the BLE front door
+  padd/           gamepad → intents — an ordinary socket client, no privileged access
+  mediad/         camera, mic, WebRTC, the remote gateway, and the console it serves
+  tof/            tofd: the head's 8×8 depth sensor. Publishes frames, reads nothing
+
+the libraries they drive — no sockets, no systemd, nothing starts them
+  duck-ipc-proto/ the wire contract
+  duck-control/   the control core: model · bus · IMU · observations · policy · safety
+  kinematics/     the MJCF model and forward kinematics; head and hand chains
+  odometry/       where the robot has been, from foot contacts and the IMU
+  sounds/         synthesis, per-robot voice personality, the chorale's score
+  pet-detect/     a small CNN that hears head scratches on the onboard mic
+  robotd-params/  robotd's startup parameters: schema, defaults, validation
+
+the tools
+  robotctl/       the local CLI, including `monitor`
+  duckctl/        the laptop-side client — never shipped, never cross-built
+  xtask/          package · sign · promote — build tooling, never shipped
+  test-support/   signed-release fixtures for tests; never shipped
+
 deploy/         what a robot is configured with: updater.toml, robotd.toml, trust anchor, journald
+policies/       the ONNX networks a release ships
+hooks/          preinstall · postinstall — what runs inside an update, from the artifact
 scripts/        provision-board.sh · dev-push.sh + dev-build.Dockerfile (from your machine) ·
-                provision.sh → setup-board.sh · migrate-network.sh · install.sh (on the board) ·
+                provision.sh → setup-board.sh → setup-gstreamer.sh · setup-rkaiq.sh ·
+                migrate-network.sh · install.sh (on the board) ·
+                robot-boot-check · robot-rescue (recovery, installed to /usr/local/sbin) ·
                 pad-link-test.sh · pad-stack-report.sh (gamepad radio, on the board) ·
-                board-test.sh (CI)
-docs/           robot/ (using one) · design/ (how it works) · project/ (roadmap, records)
+                board-test.sh · systemd-test.sh (CI) · cross-sysroot.sh (cross-builds) ·
+                bake-duck-mesh.py (the monitor's 3D model, run by hand)
+docs/           robot/ (using one) · design/ (how it works) · project/ (roadmap, records) ·
+                ideas/ (not designed yet)
 ```
 
 Services talk over unix sockets, JSON-RPC 2.0 one object per line. The contract lives in
@@ -85,6 +123,32 @@ process. [`docs/project/roadmap.md`](docs/project/roadmap.md) has what actually 
 - **Reach for an existing crate** before writing it yourself. Dependency count is not the thing
   being optimised; maintenance is.
 - Commit trailers use `Assisted-by:`, not `Co-Authored-By:`, for AI assistance.
+
+## Media in the README
+
+The videos and the hero image are **GitHub attachments, not files in this repo**: drop a clip into
+the comment box of any issue or pull request and GitHub hands back a
+`https://github.com/user-attachments/assets/<id>` URL. Nothing to commit, nothing to keep in sync —
+and nothing in a clone either, so those tiles are blank without a network.
+
+Inside the README's `<table>` the URL has to go in an element, because markdown is not parsed in
+block HTML and a bare URL there stays text:
+
+```html
+<video src="https://github.com/user-attachments/assets/<id>" controls width="100%"></video>
+```
+
+**A video cannot autoplay or loop.** Verified against the renderer itself
+(`POST https://api.github.com/markdown`): of `src autoplay muted loop controls playsinline preload
+poster width`, only `src`, `muted`, `controls` and `width` survive the sanitiser. So a video waits
+for a click, and the only media that moves on its own is an animated image — a GIF, or an animated
+WebP at a fraction of the size:
+
+```bash
+ffmpeg -i clip.mp4 -vf "fps=15,scale=560:-1:flags=lanczos" -loop 0 -q:v 55 walk.webp
+```
+
+Two or three seconds, treated as a moving thumbnail. Use a video where sound or length matters.
 
 ## Releasing
 

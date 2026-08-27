@@ -471,38 +471,46 @@ done only when genuinely needed, never unconditionally on every update.
 - CI side: `cargo-dist` can build and publish signed artifacts to GitHub
   Releases; we host manifests as additional assets.
 
-### 6.1 ⚠ A private repository cannot serve the fleet
+### 6.1 A private repository cannot serve the fleet — so this one does not stay private
 
-**Unresolved, and it constrains M4.** `pollen-robotics/microduck` is private, and a
-private repo's `releases/download/<tag>/<asset>` URL returns **404 — with or without a
-token**. Verified directly:
+**Decided (2026-08-26): publish `pollen-robotics/microduck`.** While it is private a robot in
+the field cannot download anything, and the reason is worth keeping because it is not obvious:
+a private repo's `releases/download/<tag>/<asset>` URL returns **404 with or without a token**.
+Verified directly:
 
 | URL | private repo |
 |---|---|
 | `https://github.com/<repo>/releases/download/<tag>/<asset>` | 404, authenticated or not |
 | `https://api.github.com/repos/<repo>/releases/assets/<id>` + `Accept: application/octet-stream` | 200 with a token |
 
-The engine now resolves every asset through the API endpoint, so a **developer's board**
-works: `GITHUB_TOKEN` is in the environment and `--ref` installs a branch build. Verified end
-to end against this repo.
+So the engine resolves every asset through the API endpoint, which works for a **developer's
+board** — `GITHUB_TOKEN` is in the environment and `--ref` installs a branch build — and for a
+public repo, but not for a customer robot, which has no token and should not have one: a
+fleet-wide credential baked into an image leaks and cannot be rotated without reflashing, the
+same problem the signing keys are tiered to avoid.
 
-**A customer robot has no token, and should not.** A fleet-wide credential baked into an
-image is a credential that leaks and cannot be rotated without reflashing — the same problem
-the signing keys are tiered to avoid. So as things stand, robots in the field cannot download
-anything. The options, none of them chosen yet:
+Three other options were on the table, and are recorded because the decision could be revisited
+if the source ever needs to close again:
 
 | option | keeps zero-backend | notes |
 |---|---|---|
-| A **public repo holding only release artifacts** | yes | signatures are what make an artifact safe, not obscurity — a public artifact repo leaks build metadata and nothing else. Source stays private. |
-| Make this repo public | yes | product source; presumably not. |
-| An object store or CDN with a plain HTTP source | mostly | one more thing to own and pay for; the engine's source trait already abstracts it. |
-| A read-only token in the image | yes | rejected reasoning above: an unrotatable fleet credential. |
+| A **public repo holding only release artifacts** | yes | signatures are what make an artifact safe, not obscurity — an artifact repo leaks build metadata and nothing else. Source stays private. The fallback if this repo ever goes private again. |
+| An object store or CDN with a plain HTTP source | mostly | one more thing to own and pay for; the source trait already abstracts it. |
+| A read-only token in the image | yes | rejected: an unrotatable fleet credential. |
 
-The first is the conventional answer and costs nothing but a second repository. It does not
-change the engine — only `repo` in `updater.toml` and where `release.yml` publishes.
+**Going public changes no code.** The API path stays correct — it is the one path for private
+and public alike, which is why it was written that way.
 
-Nothing about this blocks M2 or M3: dev boards have tokens and sim needs no downloads. It
-blocks the first robot that has to update itself without a developer present, which is M4.
+**What it does change is a budget.** Unauthenticated GitHub API requests are limited to 60 per
+hour *per IP*, and a token lifts that; a robot in someone's home has no token, so its checks
+spend from the anonymous pool shared by everything behind that address. At `check_interval =
+"6h"` and a handful of calls per check, one duck is nowhere near it — a room of twenty on the
+same wifi, updating together, can be. It is not a correctness problem: `http.rs` already reads
+403 and 429 as "come back later" and says so in the message. It is a reason to prefer
+`browser_download_url` for the bytes once the repo is public, since object downloads from
+`objects.githubusercontent.com` spend nothing from that pool, and to keep the API path for
+private repos and dev boards. Worth doing before a room full of ducks exists, not before the
+first one ships.
 
 ## 7. `updaterd` state machine
 
@@ -850,10 +858,61 @@ so no unsigned code ever runs. Rust binary or shell script — the engine just
   - `UPDATE_NEW_SCHEMA_VERSION`, and `UPDATE_OLD_SCHEMA_VERSION` when known
 - Hooks run with a **cleared environment** plus a fixed `PATH`, so behaviour doesn't
   depend on how systemd happened to invoke `updaterd`.
-- Output is captured and truncated; on failure it is included in the error and
-  therefore in the update log. On success it is currently **discarded** — see §17.
-- Typical uses: config-schema migrations, `udev`/permission tweaks, data
-  conversions across `schema_version` bumps.
+- Output is captured and truncated, and reaches the update log either way: on failure
+  inside the error, on success line by line (`updater/src/hooks.rs`). It is logged on
+  success because the pre-install hook's report — which plugins, which runtime, whether
+  this board has an NPU — is the answer to "what can this robot actually do at this
+  release", and a `journalctl -u updaterd` grep for it once came back empty on a board
+  where the hook had plainly run.
+- Typical uses: installing what the release needs and the board may not have (§9.1),
+  config-schema migrations, `udev`/permission tweaks, data conversions across
+  `schema_version` bumps.
+
+### 9.1 If a board needs it, the hook does it
+
+**A release is not installed until everything it needs is on the board.** Shipping a file
+into the release directory is not installing it; shipping a script into the release
+directory is not running it. The hook is the only thing that runs on every board on every
+update, so it is where "this board must have X before this release works" belongs — not in
+a provisioning script that ran once before X existed, and not in a human's memory.
+
+This has now been got wrong three times, in three different shapes:
+
+1. **Units.** A release that added a daemon put its `.service` inside the artifact and
+   nowhere systemd looks. `btd` failed with `203/EXEC` on a board where the release was
+   complete and correct, and `on_apply` could not restart a unit that did not exist yet.
+   `docs/project/install-path-gap.md` is the write-up; `hooks/postinstall` is the fix.
+2. **The GStreamer stack and the 3A engine.** Provisioning installed them, so boards
+   provisioned before they existed did not have them, and neither did a board whose plugins
+   were older than the release was built against. `hooks/preinstall` runs the release's own
+   `setup-gstreamer.sh` and `setup-rkaiq.sh` on every update, which is what closed it.
+3. **The NPU.** The branch that added the duck detector wrote `setup-npu.sh`, packaged it
+   into the release beside the model — and never called it. Every board would have shipped
+   a detector that could not reach the NPU until somebody SSH'd in, and the way you find
+   that out is `rknn_init` returning a number.
+
+The shape is the same every time: the work was *done*, and the thing that makes the work
+reach a board was left out. It is invisible in review, because the diff that adds the
+script looks complete.
+
+**Corollaries, each of which has a test.**
+
+- **A script the hook runs must be packaged.** `every_script_the_hooks_run_is_packaged`
+  reads `script=scripts/…` assignments out of both hooks and fails the build if any
+  packaging site omits one.
+- **What a script needs must travel with it.** `setup-rkaiq.sh` compiles an LD_PRELOAD
+  shim from a C file beside it; `setup-npu.sh` compiles a device-tree overlay from a `.dts`
+  beside it. Each has a test saying so, because the failure is silent: the script runs, it
+  cannot find its source, and the update succeeds with one warning in a log.
+- **Optional hardware is never fatal.** Non-zero from a hook fails the update and rolls it
+  back, so a hook may only fail for things that mean the release is not installable. A
+  board with no camera, no Bluetooth adapter or no NPU is still a robot; those install
+  steps say what was lost, name the command to retry, and return success.
+
+**This is what the split between provisioning and updating is for.** `provision.sh` sets up
+a new board. Every board provisioned before a thing existed is fixed by an ordinary update
+— which means a release may assume nothing about when its board was provisioned, and a
+setup step that only provisioning performs is a step half the fleet will never get.
 
 ## 10. Reusable, config-driven engine
 
@@ -862,7 +921,7 @@ components. Adapting to a new robot = new config + new signing key + (maybe) a
 new health probe.
 
 The authoritative, parse-tested example is
-[`updater/updater.example.toml`](../updater/updater.example.toml) — a unit test
+[`updater/updater.example.toml`](../../updater/updater.example.toml) — a unit test
 parses it, so it cannot drift from the code. Abridged here:
 
 ```toml
@@ -1267,9 +1326,6 @@ Known gaps between this document and the implementation, deliberately open:
 - **No recovery mode.** §8.2's chain is `current → previous → golden`, all three
   implemented including escalation past a missing or known-bad previous. The final
   "minimal recovery mode that can still re-fetch" does not exist.
-- **Successful hook output is discarded.** Only failure text reaches the log, via the
-  error. Recording successful output too would help debug a migration that "worked"
-  but did the wrong thing.
 - **One `RobotClient` serves every component.** A `HealthCheck::Socket { path }` is
   honoured for *which probe to run*, but the socket path itself comes from whatever
   `main` constructed. Fine while both components probe `robotd`; a trap if a

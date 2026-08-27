@@ -142,8 +142,10 @@ jobs:
           # anyone drives the robot from, and the intent API only stays honest if the
           # thing exercising it daily is actually on the robot.
           cp target/aarch64-unknown-linux-gnu/release/padd staged/
-          # mediad is the WebRTC gateway. Shipped so a board *can* run it; its unit has no
-          # [Install], so nothing starts it until someone does. See mediad/systemd/mediad.service.
+          # mediad is the WebRTC gateway. Its unit carries an [Install] section, so postinstall
+          # enables it and an update restarts it like any other daemon
+          # (docs/design/restart-order.md §1). It was once shipped inert, and this comment
+          # said so for two releases after that stopped being true.
           cp target/aarch64-unknown-linux-gnu/release/mediad staged/
           # The voice generator (postinstall renders the per-robot bank with it) and the
           # mic classifier pair — pet-detect for live listening, pet-features for training.
@@ -166,6 +168,10 @@ jobs:
             --include "robotd/systemd/robotd.service=systemd/robotd.service" \
             --include "hooks/postinstall=hooks/postinstall" \
             --include "scripts/setup-gstreamer.sh=scripts/setup-gstreamer.sh" \
+            --include "duck-detect/models/duck_detect.rknn=models/duck_detect.rknn" \
+            --include "duck-detect/models/duck_detect.onnx=models/duck_detect.onnx" \
+            --include "scripts/setup-npu.sh=scripts/setup-npu.sh" \
+            --include "deploy/overlays/rk3568-npu-enable.dts=deploy/overlays/rk3568-npu-enable.dts" \
             --include "scripts/setup-rkaiq.sh=scripts/setup-rkaiq.sh" \
             --include "scripts/rkaiq-modinfo-shim.c=scripts/rkaiq-modinfo-shim.c" \
             --include "scripts/robot-rescue=scripts/robot-rescue" \
