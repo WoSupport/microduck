@@ -1,0 +1,163 @@
+#!/bin/sh
+# A duck in MuJoCo, driven by the real daemon, in one command.
+#
+#   scripts/duck-sim              # a window opens, the duck stands up, and it is yours
+#   scripts/duck-sim drive        # walk it forward for a few seconds
+#   scripts/duck-sim ctl health   # anything robotctl does
+#   scripts/duck-sim down
+#
+# What is running afterwards is `robotd` — the same binary a robot runs, with the same policies, the
+# same 50 Hz loop and the same IPC — with `duck_control::sim::RemoteIo` in place of the servo bus.
+# `docs/design/simulation.md` says what that is and is not a twin of.
+#
+# The three things this exists to stop anyone typing by hand, because none of them is guessable:
+#
+#   * policies live at /opt/robot/daemon/current on a robot and in this repo on a laptop, so every
+#     one has to be named in a params file;
+#   * `ort` dlopens libonnxruntime and a laptop has no system one — the RL repo's venv does;
+#   * a unix socket path is capped at ~108 bytes, so the state directory has to be short.
+set -eu
+
+STATE="${DUCK_SIM_STATE:-$HOME/.cache/duck-sim}"
+RL="${DUCK_SIM_RL:-$HOME/Pollen/microduck_rl}"
+PORT="${DUCK_SIM_PORT:-7801}"
+SOCK="$STATE/duck.sock"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+say()  { printf '\033[36m==\033[0m %s\n' "$*"; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+ctl() { "$REPO/target/debug/robotctl" --robot-socket "$SOCK" "$@"; }
+
+# ── stopping ──────────────────────────────────────────────────────────────────
+# By pidfile, never by name. `pkill -f robotd` also matches the shell that is about to start one,
+# which is a good way to kill your own terminal — three times in one afternoon, in this case.
+stop_one() {
+    [ -f "$STATE/$1.pid" ] || return 0
+    pid="$(cat "$STATE/$1.pid")"
+    kill "$pid" 2>/dev/null || true
+    rm -f "$STATE/$1.pid"
+}
+
+down() {
+    stop_one robotd
+    stop_one body
+    rm -f "$SOCK"
+    say "down"
+}
+
+# ── starting ──────────────────────────────────────────────────────────────────
+
+up() {
+    [ -d "$RL" ] || die "no simulator at $RL. It is the microduck_rl repo — set DUCK_SIM_RL."
+    [ -x "$RL/.venv/bin/python" ] || die "$RL has no .venv. Run \`uv sync\` there first."
+    ORT="$(ls "$RL"/.venv/lib/python*/site-packages/onnxruntime/capi/libonnxruntime.so.* 2>/dev/null | head -1)"
+    [ -n "$ORT" ] || die "no onnxruntime in $RL/.venv — the policies cannot load without it."
+
+    down
+    mkdir -p "$STATE"
+
+    if [ ! -x "$REPO/target/debug/robotd" ] || [ ! -x "$REPO/target/debug/robotctl" ]; then
+        say "building robotd and robotctl"
+        (cd "$REPO" && cargo build --quiet -p robotd -p robotctl)
+    fi
+
+    # Every policy named explicitly: `RELEASE_DIR` is /opt/robot/daemon/current, which exists on a
+    # robot and not here, and `PolicyParams::resolved` uses a named path verbatim when it has one.
+    cat > "$STATE/robotd.toml" <<TOML
+[policy]
+enabled = true
+walk = "$REPO/policies/alpha_walking.onnx"
+stand = "$REPO/policies/alpha_stand.onnx"
+sitstand = "$REPO/policies/alpha_sitstand.onnx"
+ground_pick = "$REPO/policies/alpha_ground_pick.onnx"
+kick_left = "$REPO/policies/ball_kick_left.onnx"
+kick_right = "$REPO/policies/ball_kick_right.onnx"
+roulade = "$REPO/policies/roulade.onnx"
+TOML
+
+    # Folded on the floor, which is the boot `robotd` is written for: it recognises a seated duck
+    # and stands it up with the sitstand policy. `STAND` starts upright and topples in about a
+    # second, because a position hold at the real servos' 0.75 N·m cannot balance a biped.
+    say "starting the body — a MuJoCo window should open"
+    ( cd "$RL" && nohup .venv/bin/python -m mjlab_microduck.sim.body_server \
+        --port "$PORT" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" \
+        > "$STATE/body.log" 2>&1 & echo $! > "$STATE/body.pid" )
+    wait_for_port || die "the simulator did not come up. $STATE/body.log has why."
+
+    say "starting robotd"
+    DUCK_RUNTIME_DIR="$STATE" ORT_DYLIB_PATH="$ORT" RUST_LOG="${RUST_LOG:-info}" \
+        nohup "$REPO/target/debug/robotd" --sim "127.0.0.1:$PORT" \
+        --params "$STATE/robotd.toml" --socket "$SOCK" \
+        > "$STATE/robotd.log" 2>&1 & echo $! > "$STATE/robotd.pid"
+    wait_for_socket || die "robotd did not come up. $STATE/robotd.log has why."
+
+    say "standing up"
+    ctl robot init >/dev/null 2>&1 || true
+    sleep 4
+    ctl health | head -3
+
+    cat <<'NEXT'
+
+  Your duck is up. From here:
+
+    scripts/duck-sim drive        walk it forward, then stop
+    scripts/duck-sim ctl health   or anything else robotctl does
+    scripts/duck-sim ctl robot do roulade
+    scripts/duck-sim log          what the daemon is saying
+    scripts/duck-sim down
+
+NEXT
+}
+
+wait_for_port() {
+    i=0
+    while [ $i -lt 100 ]; do
+        # Not /dev/tcp: that is a bash builtin and this is #!/bin/sh, which is dash on Debian
+        # and Ubuntu. python3 is already required by `drive`, so it is the portable knock.
+        if python3 -c "import socket,sys;s=socket.socket();s.settimeout(.3);sys.exit(s.connect_ex(('127.0.0.1',$PORT)))" 2>/dev/null; then
+            return 0
+        fi
+        i=$((i + 1)); sleep 0.2
+    done
+    return 1
+}
+
+wait_for_socket() {
+    i=0
+    while [ $i -lt 150 ]; do
+        [ -S "$SOCK" ] && ctl health >/dev/null 2>&1 && return 0
+        i=$((i + 1)); sleep 0.2
+    done
+    return 1
+}
+
+# Walking has no robotctl subcommand — intents come from a pad or the console — so this is the
+# smallest client that sends one. Resent at 10 Hz because `robotd` expires an intent 500 ms after
+# they stop arriving, which is what makes a dropped connection stop the robot rather than run it
+# into a wall.
+drive() {
+    [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
+    say "walking forward for 8 s"
+    python3 - "$SOCK" "${1:-0.15}" "${2:-0.0}" <<'PY'
+import json, socket, sys, time
+sock, vx, vyaw = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+s = socket.socket(socket.AF_UNIX); s.connect(sock)
+f = s.makefile("w")
+for _ in range(80):
+    f.write(json.dumps({"jsonrpc": "2.0", "method": "robot.move",
+                        "params": {"vx": vx, "vy": 0.0, "vyaw": vyaw}}) + "\n")
+    f.flush()
+    time.sleep(0.1)
+PY
+    say "stopped — the intent expires on its own"
+}
+
+case "${1:-up}" in
+    up|"")   up ;;
+    down)    down ;;
+    drive)   shift; drive "$@" ;;
+    ctl)     shift; ctl "$@" ;;
+    log)     tail -f "$STATE/robotd.log" ;;
+    *)       die "unknown command '$1'. Try: up, down, drive, ctl, log" ;;
+esac

@@ -14,11 +14,27 @@ the desk. Not a mock, and not a test harness. A twin, with a written-down bounda
 
 One command to get a duck. After that it is a robot, and you already know the commands.
 
+**What works today** (`scripts/duck-sim`, one duck, no container):
+
 ```
-duck-sim up                    # one duck in the apartment, ready in seconds
-duck-sim up 4                  # four, sharing one MuJoCo window
+scripts/duck-sim               # a window opens, the duck stands up, and it is yours
+scripts/duck-sim drive         # walk it forward, then stop
+scripts/duck-sim ctl health    # or anything else robotctl does
+scripts/duck-sim log
+scripts/duck-sim down
+```
+
+It builds what is missing, writes the params, finds the ONNX Runtime in the RL repo's venv, starts
+both halves and stands the duck up. Three things it exists to stop anyone typing, because none is
+guessable: policies live at `/opt/robot/daemon/current` on a robot and in this repo on a laptop;
+`ort` dlopens a libonnxruntime a laptop does not have; and a unix socket path is capped at ~108
+bytes, so the state directory has to be short.
+
+**Where it goes**, once the containers are in:
+
+```
+duck-sim up 4                  # four ducks, sharing one MuJoCo window
 duck-sim shell duck-a          # you are on duck-a
-duck-sim down
 ```
 
 Inside, nothing is special:
