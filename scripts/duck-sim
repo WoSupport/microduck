@@ -59,7 +59,13 @@ stop_one() {
 
 down() {
     stop_one robotd
+    stop_one ether
     stop_one body
+    i=0
+    while [ "$i" -lt 16 ]; do
+        stop_one "$(duck_name "$i")"
+        i=$((i + 1))
+    done
     rm -f "$SOCK"
     # Verified, not assumed: `down` reporting success while a MuJoCo window is still open is worse
     # than saying nothing, and is exactly what the subshell bug above produced.
@@ -99,23 +105,86 @@ ground_pick = "$REPO/policies/alpha_ground_pick.onnx"
 kick_left = "$REPO/policies/ball_kick_left.onnx"
 kick_right = "$REPO/policies/ball_kick_right.onnx"
 roulade = "$REPO/policies/roulade.onnx"
+
+# Singing is opt-in, and a room full of ducks that will not sing together is a poor demonstration
+# of a room full of ducks. On a real robot this is a decision someone makes; here it is the point.
+[chorale]
+accept = true
+
+[audio]
+bank = "$STATE/sounds/DUCK"
 TOML
+
+    # **A voice each, and it is not decoration.** `robotctl chorale` refuses without one — but more
+    # than that, `robotd` takes its chorale id from the seed recorded in the bank it plays from, and
+    # that id is how a duck recognises its own beacon reflected back. Ducks sharing a bank share an
+    # id, drop each other as their own reflection, and sit there hearing nobody. So: one bank per
+    # duck, seeded from its name.
+    [ -x "$REPO/target/debug/sounds" ] || (cd "$REPO" && cargo build --quiet -p sounds)
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        sed "s|/sounds/DUCK|/sounds/$name|" "$STATE/robotd.toml" > "$STATE/robotd-$name.toml"
+        if [ ! -d "$STATE/sounds/$name" ]; then
+            say "rendering $name a voice"
+            DUCK_IDENTITY="$name" "$REPO/target/debug/sounds" ensure-bank \
+                --dir "$STATE/sounds/$name" >/dev/null 2>&1 || say "$name has no voice"
+        fi
+        i=$((i + 1))
+    done
 
     start_body
 
     say "starting robotd"
-    DUCK_RUNTIME_DIR="$STATE" ORT_DYLIB_PATH="$ORT" RUST_LOG="${RUST_LOG:-info}" \
-        setsid nohup "$REPO/target/debug/robotd" --sim "127.0.0.1:$PORT" \
-        --params "$STATE/robotd.toml" --socket "$SOCK" \
-        > "$STATE/robotd.log" 2>&1 &
-    echo $! > "$STATE/robotd.pid"
-    wait_for_socket || die "robotd did not come up. $STATE/robotd.log has why."
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        # Its own identity, or every duck on this laptop has the same one — and a chorale id is
+        # how a duck recognises its own beacon reflected back, so identical ducks drop each
+        # other's beacons and never hear anybody. A container gets this from its own machine-id.
+        DUCK_IDENTITY="$name" \
+        DUCK_RUNTIME_DIR="$STATE" ORT_DYLIB_PATH="$ORT" RUST_LOG="${RUST_LOG:-info}" \
+            setsid nohup "$REPO/target/debug/robotd" --sim "127.0.0.1:$(duck_port "$i")" \
+            --params "$STATE/robotd-$name.toml" --socket "$STATE/$name.sock" \
+            > "$STATE/$name.log" 2>&1 &
+        echo $! > "$STATE/$name.pid"
+        i=$((i + 1))
+    done
+    # `duck.sock` is whichever duck `ctl` and `drive` talk to — the first one, unless asked.
+    ln -sf "$STATE/$(duck_name 0).sock" "$SOCK"
+    ln -sf "$STATE/$(duck_name 0).log" "$STATE/robotd.log"
+    wait_for_socket || die "robotd did not come up. $STATE/$(duck_name 0).log has why."
+
+    # The radio, once there is more than one duck to hear. It is a client of each `robotd` exactly
+    # as `btd` is, so nothing above the socket knows the difference.
+    if [ "$DUCKS" -gt 1 ]; then
+        [ -x "$REPO/target/debug/duck-ether" ] || (cd "$REPO" && cargo build --quiet -p duck-ether)
+        args=""
+        i=0
+        while [ "$i" -lt "$DUCKS" ]; do
+            args="$args --duck $(duck_name "$i")=$STATE/$(duck_name "$i").sock@$(duck_port "$i")"
+            i=$((i + 1))
+        done
+        # shellcheck disable=SC2086
+        setsid nohup "$REPO/target/debug/duck-ether" $args > "$STATE/ether.log" 2>&1 &
+        echo $! > "$STATE/ether.pid"
+        say "the ether is open — $DUCKS ducks can hear each other"
+    fi
 
     say "standing up"
-    stand || die "could not enable the policy. $STATE/robotd.log has why."
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        SOCK_I="$STATE/$(duck_name "$i").sock" stand_at "$STATE/$(duck_name "$i").sock" || \
+            say "$(duck_name "$i") would not enable"
+        i=$((i + 1))
+    done
     sleep 6
     ctl health | head -3
-    upright || return 0
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        upright_at "$(duck_port "$i")" "$(duck_name "$i")" || true
+        i=$((i + 1))
+    done
 
     cat <<'NEXT'
 
@@ -138,8 +207,10 @@ NEXT
 # to 0.116 m, upright and steady.
 #
 # There is no `robotctl` subcommand for it — the console has the button — so this is the call.
-stand() {
-    python3 - "$SOCK" <<'PY'
+stand() { stand_at "$SOCK"; }
+
+stand_at() {
+    python3 - "$1" <<'PY'
 import json, socket, sys
 s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1])
 f = s.makefile("rw")

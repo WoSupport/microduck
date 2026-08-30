@@ -1077,6 +1077,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "duck-ether"
+version = "0.10.0"
+dependencies = [
+ "clap",
+ "duck-ipc-proto",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "duck-ipc-proto"
 version = "0.10.0"
 dependencies = [
