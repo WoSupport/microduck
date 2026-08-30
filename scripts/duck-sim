@@ -264,6 +264,29 @@ PY
     say "stopped — the intent expires on its own"
 }
 
+# How fast the world is actually running. The daemons' loops are wall-clock, so a simulator below
+# real time is not merely slow to watch — the policies are driving robots that move less than they
+# expect, and they cannot balance one. Reported rather than left to be felt.
+realtime() {
+    factor="$(python3 - "$PORT" <<'PY'
+import json, socket, sys, time
+s = socket.socket(); s.settimeout(5); s.connect(("127.0.0.1", int(sys.argv[1])))
+f = s.makefile("rw")
+f.write(json.dumps({"op": "hello", "protocol": 1, "joints": 15}) + "\n"); f.flush(); f.readline()
+def now():
+    f.write('{"op":"read"}\n'); f.flush(); return json.loads(f.readline())["sim_time"]
+a, w = now(), time.perf_counter()
+time.sleep(3.0)
+print("%.2f" % ((now() - a) / (time.perf_counter() - w)))
+PY
+)" || return 0
+    case "$factor" in
+        1.0*|0.9[5-9]) say "the world is running at ${factor}x real time" ;;
+        *) say "the world is at ${factor}x real time — below 1.0 the policies cannot balance. \
+Try DUCK_SIM_VIEWER=0, or fewer ducks." ;;
+    esac
+}
+
 # ── the container ─────────────────────────────────────────────────────────────
 
 # Every duck this script could have started, stopped and unmounted. By name from the same list that
@@ -415,8 +438,13 @@ boot() {
     i=0
     while [ "$i" -lt "$DUCKS" ]; do
         name="$(duck_name "$i")"
-        sudo machinectl shell "$name" /usr/local/bin/robotctl robot enable >/dev/null 2>&1 || \
+        # `systemd-run --machine`, not `machinectl shell`: the latter allocates a PTY and is
+        # unhappy with its output redirected, which is how three ducks out of four were quietly
+        # never enabled. This runs the command in the container and waits for its exit status.
+        if ! sudo systemd-run --machine="$name" --pipe --wait --quiet \
+            /usr/local/bin/robotctl robot enable >/dev/null 2>&1; then
             say "$name would not enable — shell in and try \`robotctl robot enable\`"
+        fi
         i=$((i + 1))
     done
     sleep 5
@@ -425,6 +453,8 @@ boot() {
         PORT_I="$(duck_port "$i")" upright_at "$(duck_port "$i")" "$(duck_name "$i")" || true
         i=$((i + 1))
     done
+
+    realtime
 
     cat <<NEXT
 
@@ -452,5 +482,7 @@ case "${1:-up}" in
     stand)   stand && sleep 6 && upright ;;
     status)  ctl health | head -4; upright ;;
     log)     tail -f "$STATE/robotd.log" ;;
+    simlog)  tail -f "$STATE/body.log" ;;
+    realtime) realtime ;;
     *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, ctl, log, status" ;;
 esac
