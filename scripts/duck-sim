@@ -135,24 +135,35 @@ TOML
 NEXT
 }
 
-# Did it actually stand? The daemon reporting healthy only means the loop is turning — a duck that
-# never rose is healthy and sitting. Gravity in the trunk frame is the answer: -1 is upright.
+# Did it actually stand? Two numbers, because one of them is not enough.
+#
+# **Trunk height is the one that answers it.** An earlier version asked only for gravity in the
+# trunk frame and called -0.978 upright — but a duck sitting on its bottom with a vertical trunk has
+# gravity [0, 0, -1] as surely as a standing one does, so it reported a seated duck as standing
+# while the window showed it sitting. `STAND` is 0.12 and `SIT` is 0.07; halfway is the line.
+# Orientation still matters, for the duck that stood up and then fell over.
 upright() {
-    z="$(python3 - "$PORT" <<'PY'
+    read_z="$(python3 - "$PORT" <<'PY'
 import json, socket, sys
 s = socket.socket(); s.settimeout(2); s.connect(("127.0.0.1", int(sys.argv[1])))
 f = s.makefile("rw")
 f.write(json.dumps({"op": "hello", "protocol": 1, "joints": 15}) + "\n"); f.flush(); f.readline()
 f.write('{"op":"read"}\n'); f.flush()
-print("%.3f" % json.loads(f.readline())["imu"]["gravity"][2])
+r = json.loads(f.readline())
+print("%.3f %.3f" % (r.get("trunk_z", -1.0), r["imu"]["gravity"][2]))
 PY
 )" || return 0
-    case "$z" in
-        -0.9*|-1*) say "upright (gravity z $z)"; return 0 ;;
-    esac
+    trunk="${read_z% *}"
+    z="${read_z#* }"
+    standing="$(python3 -c "print(1 if $trunk > 0.095 else 0)" 2>/dev/null || echo 0)"
+    if [ "$standing" = 1 ]; then
+        case "$z" in
+            -0.9*|-1*) say "standing (trunk $trunk m, gravity z $z)"; return 0 ;;
+        esac
+    fi
 
     printf '\n'
-    say "the duck did not stand up (gravity z $z, upright is about -1.0)"
+    say "the duck did not stand up (trunk ${trunk}m, standing is about 0.12; gravity z $z)"
     if grep -q "behind real time" "$STATE/body.log" 2>/dev/null; then
         cat <<'WHY'
   The simulator could not keep real time, and that is almost certainly why. The daemon's loop is
