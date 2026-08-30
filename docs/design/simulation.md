@@ -1,7 +1,10 @@
 # Simulation: the same daemons, a body in MuJoCo
 
-**Status:** `robotd --sim` and `duck_control::sim` exist. Everything else here is designed and
-measured but not built.
+**Status:** working end to end for one duck. `robotd --sim` and `duck_control::sim` are here;
+`microduck_rl`'s `duck-body` serves the other half. Measured: the daemon holds `50.0 of 50.0 Hz · 0
+missed` against a MuJoCo body, detects a seated boot from the simulator's own joint angles, and
+`robotctl robot init` runs the sitstand policy until the duck is upright and stays there. The
+containers, the ether, the camera and ToF are designed and measured but not built.
 
 The goal is a duck you develop against exactly as you develop against a robot: the same binaries,
 the same units, the same `robotctl`, the same `duckctl open` — with the body in MuJoCo instead of on
@@ -203,7 +206,29 @@ more than N fifteen-DoF bodies, so cameras should be opt-in per duck. The 45 Hz 
 both a hard edge rather than a soft one — too many ducks and they do not get slow, they go
 *unhealthy* and the updater starts rolling releases back.
 
-## 8. Known material to reuse
+## 8. Three ways to pick the wrong model
+
+Each of these presents as "the duck is on its back", and each cost an hour.
+
+**`scene_walk.xml` has no collisions.** It includes the model the RL work trains against, whose
+actuator default classes carry `contype="0" conaffinity="0"`. The duck sinks through a floor the
+scene really does contain — trunk z from 0.120 to -0.105 in a second — and the daemon reports a robot
+lying down, correctly. `scene.xml` includes `robot_allcollisions.xml`, and is what a twin wants.
+
+**`qpos0` is not a pose.** Every joint at zero is a shape this robot is never in; the daemon measured
+0.41 rad from its home frame and quite reasonably tried to stand up a robot that was already folded.
+The scenes carry `INIT`, `STAND`, `SIT` and `FOLD`, and `STAND` matches
+`duck_control::DEFAULT_POSITION` — whose right leg is *mirrored*, not symmetric, which is worth
+reading rather than assuming.
+
+**Torque belongs on at startup.** `robotd` never enables torque when it starts, because a daemon
+restarted by an update must leave a standing robot standing — the servos are already holding. A
+simulator that starts limp has its duck on the floor before the first read.
+
+The boot the daemon is actually written for is `--keyframe SIT`: a duck found folded, which it
+recognises and stands up with the sitstand policy.
+
+## 9. Known material to reuse
 
 `~/MISC/microduck_maploc` (outdated in every other respect) has two things worth taking: a simulated
 VL53L5CX in `sim/tof_sensor.py` — 8×8 zones, 45° square FoV, 4 m range, noise that grows with
