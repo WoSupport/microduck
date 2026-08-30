@@ -325,6 +325,10 @@ stage() {
         install -m755 "$REPO/target/debug/robotd" "$REPO/target/debug/robotctl" "$REL/bin/"
         cp "$REPO"/policies/*.onnx "$REL/policies/"
         ln -sfn /opt/robot/daemon/releases/sim "$ROOTFS/opt/robot/daemon/current"
+        # On PATH, because the first thing anybody types after logging into a duck is `robotctl`
+        # and `command not found` is a poor greeting. A symlink rather than a profile.d line: it
+        # works for `machinectl shell duck-a robotctl …` too, which does not read a profile.
+        ln -sfn /opt/robot/daemon/current/bin/robotctl "$ROOTFS/usr/local/bin/robotctl"
         cp "$ORT" "$ROOTFS/usr/lib/"
         ln -sfn "/usr/lib/$(basename "$ORT")" "$ROOTFS/usr/lib/libonnxruntime.so"
         cp "$REPO"/robotd/systemd/robotd.service "$ROOTFS/etc/systemd/system/"
@@ -337,11 +341,9 @@ stage() {
 ExecStart=
 ExecStart=/opt/robot/daemon/current/bin/robotd --sim 127.0.0.1:$PORT
 CONF
-        mkdir -p "$ROOTFS/etc/robot"
-        sed "s|$REPO/policies|/opt/robot/daemon/current/policies|g" > "$ROOTFS/etc/robot/robotd.toml" <<TOML
-[policy]
-enabled = true
-TOML
+        # No params file at all: inside the container `RELEASE_DIR` is real, so every policy
+        # resolves the way it does on a robot. That is the whole point of booting one.
+        rm -f "$ROOTFS/etc/robot/robotd.toml"
         printf "root:x:0:\n" >/dev/null
         chroot "$ROOTFS" /usr/bin/passwd -d root >/dev/null 2>&1 || true
         chroot "$ROOTFS" /usr/bin/systemctl enable robotd.service >/dev/null 2>&1 || true
@@ -356,13 +358,20 @@ boot() {
     say "booting $MACHINE"
     sudo systemd-run --collect --unit="$MACHINE" --quiet \
         systemd-nspawn -D "$ROOTFS" --machine="$MACHINE" --boot \
-        --resolv-conf=copy-host
+        --hostname="$MACHINE" --resolv-conf=copy-host
     i=0
     while [ $i -lt 60 ]; do
         sudo machinectl show "$MACHINE" >/dev/null 2>&1 && break
         i=$((i + 1)); sleep 0.5
     done
-    sleep 4
+    sleep 5
+    # Hand it to the policy, from inside — the socket lives in the container's own /run, which is
+    # the point. `enable` rather than `init`: see `robotctl robot enable`.
+    say "standing up"
+    sudo machinectl shell "$MACHINE" /usr/local/bin/robotctl robot enable >/dev/null 2>&1 || \
+        say "could not enable from here — try: scripts/duck-sim shell, then robotctl robot enable"
+    sleep 5
+    upright || true
     say "$MACHINE is up"
     cat <<NEXT
 

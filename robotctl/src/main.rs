@@ -363,6 +363,28 @@ enum RobotCommand {
         json: bool,
     },
 
+    /// Hand the robot to its policy, or take it back.
+    ///
+    /// **This is the gamepad's Start button**, and the difference from `init` is the whole point:
+    /// `init` powers the joints and position-ramps to the home pose with nothing balancing, while
+    /// this gives the robot to the policy, which then holds it up. A biped cannot stand by being
+    /// commanded to a pose — in simulation, where nobody is steadying it, `init` puts the robot on
+    /// the floor and `enable` stands it up from sitting.
+    ///
+    /// The console has had this button since it existed; the CLI did not, which is a gap nobody
+    /// noticed until a robot with no hands to hold it needed one.
+    Enable {
+        /// Take it back: the policy stops driving and the robot holds its pose.
+        #[arg(long)]
+        off: bool,
+        /// Flip whichever state it is in — what Start does, and what a client cannot get right by
+        /// remembering, because the robot's state moves without asking it.
+        #[arg(long, conflicts_with = "off")]
+        toggle: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Cut power to the joints.
     ///
     /// **The robot collapses** if nothing is holding it. This is what you want before picking it up
@@ -2167,6 +2189,13 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     let (call, json) = match &command {
         RobotCommand::Init { json } => (proto::Call::RobotInit, *json),
         RobotCommand::Relax { json, .. } => (proto::Call::RobotRelax, *json),
+        RobotCommand::Enable { off, toggle, json } => (
+            proto::Call::RobotEnable(proto::EnableParams {
+                on: !*off,
+                toggle: *toggle,
+            }),
+            *json,
+        ),
         RobotCommand::Do { skill, json } => (
             proto::Call::RobotDo(proto::DoParams {
                 skill: skill.as_skill(),
@@ -2234,6 +2263,15 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     match command {
         RobotCommand::Init { .. } => println!("standing up — about two seconds to the home pose"),
         RobotCommand::Relax { .. } => println!("torque off"),
+        // The daemon's own `reason` names the state it ended in, which is the only trustworthy
+        // answer for a toggle — the client cannot know which way it went.
+        RobotCommand::Enable { .. } => println!(
+            "{}",
+            outcome
+                .reason
+                .as_deref()
+                .unwrap_or("the policy has the robot")
+        ),
         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
         RobotCommand::Mode { .. } | RobotCommand::Look { .. } => unreachable!("answered above"),
     }
