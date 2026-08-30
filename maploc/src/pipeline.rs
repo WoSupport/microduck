@@ -258,8 +258,14 @@ impl Slam {
     /// Ink one scan into the current submap at the given body pose (usually
     /// [`Slam::tracked`], but a still-window composite carries its own).
     pub fn integrate(&mut self, pose: Pose2, scan: &Scan) {
+        self.integrate_weighted(pose, scan, 1);
+    }
+
+    /// Like [`Slam::integrate`], applying the log-odds `passes` times while
+    /// storing the scan once — see `Submap::integrate_scan_weighted`.
+    pub fn integrate_weighted(&mut self, pose: Pose2, scan: &Scan, passes: usize) {
         if let Some(cur) = self.mgr.current_mut() {
-            cur.integrate_scan(pose, scan);
+            cur.integrate_scan_weighted(pose, scan, passes);
             self.dirty = true;
         }
     }

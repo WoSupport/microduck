@@ -15,6 +15,7 @@
 //! single-cell / fine-bin resolution around the best coarse candidate.
 
 use crate::grid::OccupancyGrid;
+use crate::pose_graph::wrap_pi;
 use crate::submap::Scan;
 
 #[derive(Debug, Clone)]
@@ -449,17 +450,6 @@ pub fn relocalize_against_grid(
     best.accepted =
         best.mean_residual_m <= cfg.max_mean_residual_m && best.n_beams_used >= cfg.min_beams_used;
     Some(best)
-}
-
-#[inline]
-fn wrap_pi(a: f32) -> f32 {
-    use std::f32::consts::PI;
-    let two_pi = 2.0 * PI;
-    let mut y = (a + PI).rem_euclid(two_pi) - PI;
-    if y == PI {
-        y = -PI;
-    }
-    y
 }
 
 #[cfg(test)]

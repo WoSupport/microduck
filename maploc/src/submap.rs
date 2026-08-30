@@ -11,6 +11,7 @@
 //! owns the lifecycle.
 
 use crate::grid::{GridConfig, OccupancyGrid};
+use crate::pose_graph::wrap_pi;
 
 /// Pose in SE(2): `(x, y, yaw)`.
 pub type Pose2 = (f32, f32, f32);
@@ -39,6 +40,21 @@ pub struct Scan {
 }
 
 impl Scan {
+    /// Every k-th beam, sized to land at or under `max_beams` — what the
+    /// relocalize search and the loop closer probe with: their cost is
+    /// O(candidates × beams), and a few hundred beams position as well as
+    /// nine thousand.
+    pub fn decimated(&self, max_beams: usize) -> Scan {
+        let n = self.beams.len();
+        if n <= max_beams.max(1) {
+            return self.clone();
+        }
+        let step = n.div_ceil(max_beams.max(1));
+        Scan {
+            beams: self.beams.iter().copied().step_by(step).collect(),
+        }
+    }
+
     /// From parallel azimuth/range arrays measured at one sensor origin.
     /// Beams with non-finite or shorter-than-`min_range` values are
     /// dropped here, once, instead of in every consumer.
@@ -83,17 +99,6 @@ impl Scan {
 pub struct RawScan {
     pub pose_in_submap: Pose2,
     pub scan: Scan,
-}
-
-#[inline]
-fn wrap_pi(a: f32) -> f32 {
-    use std::f32::consts::PI;
-    let two_pi = 2.0 * PI;
-    let mut y = (a + PI).rem_euclid(two_pi) - PI;
-    if y == PI {
-        y = -PI;
-    }
-    y
 }
 
 /// SE(2) inverse-compose: returns the body pose expressed in the
@@ -170,6 +175,16 @@ impl Submap {
     /// the sensor's *own* cell occupied (`at_end` wins over the
     /// free-space pass) and saturate it within a second at 15 Hz.
     pub fn integrate_scan(&mut self, body_pose_world: Pose2, scan: &Scan) {
+        self.integrate_scan_weighted(body_pose_world, scan, 1);
+    }
+
+    /// Integrate one scan, applying its log-odds `passes` times — a vetted
+    /// still-window composite is worth more than one raw frame — while
+    /// remembering it as ONE raw scan. The old shape (call `integrate_scan`
+    /// twice) stored duplicate raw scans, and byte-identical duplicates
+    /// filled both of the loop closer's witness slots: its two-witness
+    /// independence gate was cross-examining a scan against itself.
+    pub fn integrate_scan_weighted(&mut self, body_pose_world: Pose2, scan: &Scan, passes: usize) {
         debug_assert!(
             body_pose_world.0.is_finite()
                 && body_pose_world.1.is_finite()
@@ -188,20 +203,27 @@ impl Submap {
         let pose_local = world_to_local(self.anchor_pose, body_pose_world);
         let (bx, by, byaw) = pose_local;
         let (cy, sy) = (byaw.cos(), byaw.sin());
-        for &((obx, oby), (ebx, eby)) in &scan.beams {
-            let dbx = ebx - obx;
-            let dby = eby - oby;
-            if dbx * dbx + dby * dby < min_range_sq {
-                continue;
+        let mut touched = false;
+        for _ in 0..passes.max(1) {
+            for &((obx, oby), (ebx, eby)) in &scan.beams {
+                let dbx = ebx - obx;
+                let dby = eby - oby;
+                if dbx * dbx + dby * dby < min_range_sq {
+                    continue;
+                }
+                let ox = bx + cy * obx - sy * oby;
+                let oy = by + sy * obx + cy * oby;
+                let hx = bx + cy * ebx - sy * eby;
+                let hy = by + sy * ebx + cy * eby;
+                touched |= self.grid.integrate_ray(ox, oy, hx, hy, true);
             }
-            let ox = bx + cy * obx - sy * oby;
-            let oy = by + sy * obx + cy * oby;
-            let hx = bx + cy * ebx - sy * eby;
-            let hy = by + sy * ebx + cy * eby;
-            self.grid.integrate_ray(ox, oy, hx, hy, true);
         }
-        // Retain the first `MAX_RAW_SCANS` for loop closure.
-        if self.raw_scans.len() < MAX_RAW_SCANS {
+        // Retain the first `MAX_RAW_SCANS` for loop closure — but only
+        // scans that actually reached the grid: a fully clipped scan in a
+        // witness slot is a witness that saw nothing, blocking the real
+        // ones behind it, and `has_content()` calling such a submap
+        // non-empty froze inkless husks into the pose graph.
+        if touched && self.raw_scans.len() < MAX_RAW_SCANS {
             self.raw_scans.push(RawScan {
                 pose_in_submap: pose_local,
                 scan: scan.clone(),

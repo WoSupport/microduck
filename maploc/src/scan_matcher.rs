@@ -18,6 +18,7 @@
 //! comfortably on a Pi Zero 2 W.
 
 use crate::grid::OccupancyGrid;
+use crate::pose_graph::wrap_pi;
 use crate::submap::Scan;
 
 /// Hyperparameters for [`match_scan`].
@@ -257,16 +258,16 @@ pub fn match_scan(
         if !d.is_finite() {
             continue;
         }
-        // Observed = the submap has an opinion about this cell at all.
-        // |log| ≥ 50 is half a single hit/miss — anything it ever saw.
-        if let Some((i, j)) = grid.world_to_idx(ex, ey) {
-            if grid.log_at(i, j).unsigned_abs() >= 50 {
-                n_observed += 1;
-            } else {
-                continue;
-            }
-        } else {
-            continue;
+        // Observed = the submap has an opinion about this cell at all
+        // (|log| ≥ 50 is half a single hit/miss). A separate METRIC, not a
+        // filter on the residual: the Gauss-Newton loop above optimizes
+        // every finite beam within sigma, and a score computed over a
+        // stricter subset than was optimized deflated n_beams_used under
+        // the loop closer's gates — good closures bounced for it.
+        if let Some((i, j)) = grid.world_to_idx(ex, ey)
+            && grid.log_at(i, j).unsigned_abs() >= 50
+        {
+            n_observed += 1;
         }
         if d > cfg.sigma_m {
             continue;
@@ -321,16 +322,6 @@ fn solve_3x3(a: &[[f32; 3]; 3], b: &[f32; 3]) -> Option<[f32; 3]> {
         inv[1][0] * b[0] + inv[1][1] * b[1] + inv[1][2] * b[2],
         inv[2][0] * b[0] + inv[2][1] * b[1] + inv[2][2] * b[2],
     ])
-}
-
-fn wrap_pi(a: f32) -> f32 {
-    use std::f32::consts::PI;
-    let two_pi = 2.0 * PI;
-    let mut y = (a + PI).rem_euclid(two_pi) - PI;
-    if y == PI {
-        y = -PI;
-    }
-    y
 }
 
 #[cfg(test)]

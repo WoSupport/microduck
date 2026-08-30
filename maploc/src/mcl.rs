@@ -18,6 +18,7 @@
 //! effective sample size falls below `resample_ess_frac * N`.
 
 use crate::grid::OccupancyGrid;
+use crate::pose_graph::wrap_pi;
 use crate::rng::Rng;
 use crate::submap::{Pose2, Scan};
 
@@ -59,6 +60,10 @@ pub struct MclConfig {
     /// transient noise — useful when the saved map is fuzzy. 200 ≈ "a
     /// cell needed 3+ net hits to be a wall".
     pub wall_threshold_fp: i16,
+    /// See-through penalties only count walls past this — higher than
+    /// `wall_threshold_fp` so one window's phantoms do not read as opaque
+    /// (mirrors `RelocalizeConfig::see_through_fp`).
+    pub see_through_fp: i16,
     /// Tempering factor for the observation likelihood. log-likelihoods
     /// are multiplied by this before normalising. 1.0 = raw (very peaky
     /// with ~64 beams; the cloud collapses to a single cluster after
@@ -106,6 +111,7 @@ impl Default for MclConfig {
             jitter_xy_m: 0.005,
             jitter_yaw_rad: 0.005,
             wall_threshold_fp: 200,
+            see_through_fp: 300,
             // Soften the posterior. With 64 beams and σ=0.20 m the
             // raw posterior spans ~200 nats; temper=0.30 compresses
             // that to ~60 per frame, but multiplied across 5 grace
@@ -237,7 +243,13 @@ impl Localizer {
             let j = (p.1 * inv).floor() as i32;
             *counts.entry((i, j)).or_insert(0) += 1;
         }
-        let ((bi, bj), _) = counts.iter().max_by_key(|entry| *entry.1).unwrap();
+        // Ties broken by bin coordinates, not HashMap order: RandomState
+        // reseeds per process, and the crate's whole reason for carrying
+        // its own RNG is that a recorded run replays bit-for-bit.
+        let ((bi, bj), _) = counts
+            .iter()
+            .max_by_key(|(bin, count)| (**count, std::cmp::Reverse(**bin)))
+            .unwrap();
         ((*bi as f32 + 0.5) * bin_m, (*bj as f32 + 0.5) * bin_m)
     }
 
@@ -421,7 +433,7 @@ impl Localizer {
         // truncation (`as i32`) aliased a one-cell band outside the
         // min-x/min-y borders onto row/col 0.
         let log: Vec<i16> = grid.log_raw().to_vec();
-        let wall_fp = self.cfg.wall_threshold_fp;
+        let see_through_fp = self.cfg.see_through_fp;
         let endpoint_d = |px: f32, py: f32, cy: f32, sy: f32, bx: f32, by: f32| -> f32 {
             let ex = cy * bx - sy * by;
             let ey = sy * bx + cy * by;
@@ -433,14 +445,20 @@ impl Localizer {
                 return clamp;
             }
             // Seeing through a confident wall at the ray's midpoint is as
-            // damning as missing the endpoint — see relocalize::score_offsets.
+            // damning as missing the endpoint — see relocalize::score_offsets,
+            // INCLUDING its graze exemption: a beam that ends on a wall at
+            // close range or grazing incidence has its midpoint inside that
+            // same wall's cells, and clamping it punishes the beam for
+            // hitting the very wall it measured (the measured false-LOST
+            // of field test four).
             let mj = ((px + ex * 0.5 - x_min) / cell).floor() as i32;
             let mi = ((py + ey * 0.5 - y_min) / cell).floor() as i32;
             if mi >= 0
                 && mj >= 0
                 && (mi as usize) < h
                 && (mj as usize) < w
-                && log[(mi as usize) * w + (mj as usize)] > wall_fp
+                && ((mi - i).abs() > 1 || (mj - j).abs() > 1)
+                && log[(mi as usize) * w + (mj as usize)] > see_through_fp
             {
                 return clamp;
             }
@@ -667,7 +685,11 @@ impl Localizer {
             let k = ((p.2 + std::f32::consts::PI) * inv_yaw).floor() as i32;
             *counts.entry((i, j, k)).or_insert(0) += 1;
         }
-        let ((bi, bj, bk), _) = counts.iter().max_by_key(|entry| *entry.1).unwrap();
+        // Deterministic tie-break — same reasoning as `densest_xy_bin_center`.
+        let ((bi, bj, bk), _) = counts
+            .iter()
+            .max_by_key(|(bin, count)| (**count, std::cmp::Reverse(**bin)))
+            .unwrap();
         let bx = (*bi as f32 + 0.5) * cell_m;
         let by = (*bj as f32 + 0.5) * cell_m;
         let byaw = (*bk as f32 + 0.5) * yaw_bin_rad - std::f32::consts::PI;
@@ -813,17 +835,6 @@ impl Localizer {
         self.particles = new_particles;
         self.reset_weights();
     }
-}
-
-#[inline]
-fn wrap_pi(a: f32) -> f32 {
-    use std::f32::consts::PI;
-    let two_pi = 2.0 * PI;
-    let mut y = (a + PI).rem_euclid(two_pi) - PI;
-    if y == PI {
-        y = -PI;
-    }
-    y
 }
 
 #[cfg(test)]

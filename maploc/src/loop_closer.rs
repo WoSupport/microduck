@@ -22,7 +22,7 @@
 //!     optimizer, which shows up as wavy walls when submaps freeze
 //!     every few seconds in a small room.
 
-use crate::pose_graph::{between, compose, inverse};
+use crate::pose_graph::{between, compose, inverse, wrap_pi};
 use crate::scan_matcher::{ScanMatchConfig, match_scan};
 use crate::submap::{Pose2, Submap};
 
@@ -72,6 +72,9 @@ pub struct LoopCloserConfig {
     pub verify_max_spread_rad: f32,
     /// Minimum `n_beams_used / n_beams_valid` at the final matched pose.
     pub min_coverage: f32,
+    /// Witness scans are decimated to at most this many beams before
+    /// matching — cost is O(search cells × beams) per witness per freeze.
+    pub max_probe_beams: usize,
     /// Drop closures whose correction relative to the current graph
     /// estimate is below this (translation AND yaw) — nothing to fix.
     pub min_correction_m: f32,
@@ -121,6 +124,7 @@ impl Default for LoopCloserConfig {
             verify_max_spread_m: 0.06,
             verify_max_spread_rad: 0.05, // ~3°
             min_coverage: 0.40,
+            max_probe_beams: 512,
             min_correction_m: 0.04,
             min_correction_rad: 0.03,
             max_correction_base_m: 0.06,
@@ -191,12 +195,26 @@ pub fn detect_loops(
         // residual gate below, because nobody cross-examines it.
         let mut by_size: Vec<&crate::submap::RawScan> = scans.iter().collect();
         by_size.sort_by_key(|s| std::cmp::Reverse(s.scan.n_valid()));
-        let picked: Vec<&crate::submap::RawScan> = by_size
-            .iter()
-            .copied()
-            .filter(|s| s.scan.n_valid() >= cfg.min_witness_beams)
-            .take(cfg.verify_scans.max(1))
-            .collect();
+        let mut picked: Vec<&crate::submap::RawScan> = Vec::new();
+        for s in by_size {
+            if s.scan.n_valid() < cfg.min_witness_beams {
+                continue;
+            }
+            // Two witnesses must be two OBSERVATIONS: sessions written
+            // before scans were stored once per window carry byte-identical
+            // duplicates, and a duplicate in the second slot cross-examines
+            // a scan against itself.
+            if picked
+                .iter()
+                .any(|p| p.pose_in_submap == s.pose_in_submap && p.scan.beams == s.scan.beams)
+            {
+                continue;
+            }
+            picked.push(s);
+            if picked.len() >= cfg.verify_scans.max(1) {
+                break;
+            }
+        }
         if picked.len() < 2 {
             // A closure warps every anchor in the graph; one witness —
             // however large — is not enough to swear that in. Measured on
@@ -216,21 +234,23 @@ pub fn detect_loops(
         for scan in &picked {
             let pose_world = compose(new_anchor, scan.pose_in_submap);
             let pose_in_older = between(older_anchor, pose_world);
-            let seed = coarse_search(
-                submaps[older_idx].grid_mut(),
-                &scan.scan,
-                pose_in_older,
-                cfg,
-            );
+            // A window composite can carry thousands of beams; both the
+            // coarse grid search and the refinement position just as well
+            // on a few hundred, at a tenth of the lookups per freeze.
+            let probe = scan.scan.decimated(cfg.max_probe_beams);
+            let seed = coarse_search(submaps[older_idx].grid_mut(), &probe, pose_in_older, cfg);
             let result = match_scan(
                 submaps[older_idx].grid_mut(),
-                &scan.scan,
+                &probe,
                 seed,
                 Some(seed),
                 &cfg.sm,
             );
+            // Coverage judges by beams landing where the TARGET has an
+            // opinion — n_beams_observed, not n_beams_used: the used count
+            // includes near-wall beams in never-swept cells.
             let coverage = if result.n_beams_valid > 0 {
-                result.n_beams_used as f32 / result.n_beams_valid as f32
+                result.n_beams_observed as f32 / result.n_beams_valid as f32
             } else {
                 0.0
             };
@@ -337,17 +357,6 @@ pub fn detect_loops(
         });
     }
     out
-}
-
-#[inline]
-fn wrap_pi(a: f32) -> f32 {
-    use std::f32::consts::PI;
-    let two_pi = 2.0 * PI;
-    let mut y = (a + PI).rem_euclid(two_pi) - PI;
-    if y == PI {
-        y = -PI;
-    }
-    y
 }
 
 /// Correlative pre-search: score a small (dx, dy, dyaw) window around

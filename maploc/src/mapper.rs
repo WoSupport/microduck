@@ -26,7 +26,7 @@
 use crate::accumulator::{AccumulatorConfig, WindowAccumulator};
 use crate::grid::OccupancyGrid;
 use crate::pipeline::Slam;
-use crate::pose_graph::{between, compose};
+use crate::pose_graph::{between, compose, wrap_pi};
 use crate::relocalize::{RelocalizeConfig, relocalize_against_grid, score_pose};
 use crate::submap::{Pose2, Scan};
 
@@ -260,11 +260,15 @@ pub enum Note {
 /// One confirmation attempt's outcome: a candidate pose checked against a
 /// fresh window. Confirmed = the window agrees at the implied pose;
 /// refuted = the map judged it and said no (real evidence of
-/// displacement); unjudgeable = the view lands where the map has no
-/// opinion.
+/// displacement); ambiguous = the map judged some beams and the verdict
+/// fell between agreement and contradiction — keep searching, but this is
+/// NOT a window the map had no opinion about; unjudgeable = the view
+/// lands where the map truly has no opinion, the only kind of window the
+/// give-up escape may consume.
 enum Verdict {
     Confirmed(Pose2, f32),
     Refuted,
+    Ambiguous,
     Unjudgeable,
 }
 
@@ -410,7 +414,7 @@ impl Mapper {
         if (stand_ended || ripe) && !self.acc.is_empty() {
             self.window_opened = None;
             if let Some((pose, composite)) = self.acc.finish() {
-                self.absorb_window(pose, &composite, notes);
+                self.absorb_window(pose, &composite, t_s, notes);
             }
         }
         if stand_ended {
@@ -456,9 +460,16 @@ impl Mapper {
                 });
                 // The closure moved every anchor; a snapshot in the old
                 // frame would mis-judge the stand's remaining windows by
-                // exactly the correction.
+                // exactly the correction — and the frames already pushed
+                // carry PRE-correction poses: a composite mixing both
+                // frames would ink smeared and displaced. Drop them; the
+                // stand refills the window in a couple of seconds.
                 if self.was_still {
                     self.stand_grid = self.slam.render();
+                }
+                if !self.acc.is_empty() {
+                    self.acc = WindowAccumulator::new(self.cfg.accumulator);
+                    self.window_opened = None;
                 }
             }
         }
@@ -467,12 +478,13 @@ impl Mapper {
     /// One reprojected depth frame, already in the body frame. Returns
     /// true when the frame was kept (accumulated or inked).
     pub fn frame(&mut self, t_s: f32, scan: Scan) -> bool {
-        if self.cfg.continuous {
-            if !self.lost {
-                self.slam.integrate(self.slam.tracked(), &scan);
-            }
-            return !self.lost;
+        if self.cfg.continuous && !self.lost {
+            self.slam.integrate(self.slam.tracked(), &scan);
+            return true;
         }
+        // Continuous mode falls through here while LOST: recovery is the
+        // still-window machinery in both modes, or a continuous mapper
+        // that sat once would sweep its head forever with no path back.
         if !self.was_still {
             return false;
         }
@@ -483,7 +495,7 @@ impl Mapper {
         true
     }
 
-    fn absorb_window(&mut self, pose: Pose2, composite: &Scan, notes: &mut Vec<Note>) {
+    fn absorb_window(&mut self, pose: Pose2, composite: &Scan, t_s: f32, notes: &mut Vec<Note>) {
         self.last_window = Some((pose, composite.clone()));
         let beams = composite.n_valid();
         if beams < self.cfg.min_window_beams {
@@ -509,7 +521,7 @@ impl Mapper {
                     (implied, Verdict::Confirmed(pose, resid)) => {
                         self.seed_agreed += 1;
                         if self.seed_agreed >= 2 {
-                            self.resume_at(pose, composite);
+                            self.resume_at(pose, composite, t_s);
                             notes.push(Note::Relocalized {
                                 pose,
                                 mean_residual_m: resid,
@@ -528,11 +540,18 @@ impl Mapper {
                         // give-up escape is off the table.
                         self.seed_agreed = 0;
                     }
+                    (implied, Verdict::Ambiguous) => {
+                        // Keep the hypothesis alive and keep looking, but
+                        // spend none of the give-up budget on a window the
+                        // map DID judge.
+                        self.seed_agreed = 0;
+                        self.soft_seed = Some((implied, now));
+                    }
                     (implied, Verdict::Unjudgeable) => {
                         self.seed_agreed = 0;
                         self.unjudged += 1;
                         if self.unjudged >= self.cfg.suspect_give_up_windows {
-                            self.resume_at(implied, composite);
+                            self.resume_at(implied, composite, t_s);
                             notes.push(Note::ResumedUnverified { pose: implied });
                             return;
                         }
@@ -547,7 +566,7 @@ impl Mapper {
                 && let (_, Verdict::Confirmed(pose, resid)) =
                     self.check_candidate(&mut grid, composite, cand, then, now)
             {
-                self.resume_at(pose, composite);
+                self.resume_at(pose, composite, t_s);
                 notes.push(Note::Relocalized {
                     pose,
                     mean_residual_m: resid,
@@ -556,7 +575,7 @@ impl Mapper {
             }
 
             // No confirmation: search this window for a fresh candidate.
-            let probe = decimate(composite, self.cfg.relocalize_max_beams);
+            let probe = composite.decimated(self.cfg.relocalize_max_beams);
             match relocalize_against_grid(&mut grid, &probe, &self.cfg.relocalize) {
                 Some(r) if r.accepted => {
                     self.pending_reloc = Some((r.pose, now));
@@ -626,8 +645,14 @@ impl Mapper {
     }
 
     /// Tracking resumes at `pose`; the window that earned it inks there.
-    fn resume_at(&mut self, pose: Pose2, composite: &Scan) {
+    fn resume_at(&mut self, pose: Pose2, composite: &Scan, t_s: f32) {
         self.slam.set_tracked(pose);
+        // Let the submap manager see the jump BEFORE inking: after a
+        // cross-room carry the current submap's grid is still anchored at
+        // the pre-carry pose, and a composite integrated there is silently
+        // clipped to nothing — the travel rule opens (or re-anchors to) a
+        // submap that actually covers where the robot now stands.
+        self.slam.tick(t_s);
         self.ink(pose, composite);
         self.lost = false;
         self.suspect = 0;
@@ -659,47 +684,39 @@ impl Mapper {
             wd.wall_threshold_fp,
             wd.observed_fp,
         );
-        let judgeable = a.n_observed >= wd.min_observed_beams
+        // Two coverage floors on purpose. CONFIRMING needs the strict one
+        // (relocalize_confirm_min_fraction): through the ToF keyhole a thin
+        // wedge aliases, so agreement on an eighth of the beams is a
+        // coincidence. REFUTING only needs the watchdog's floor: the
+        // measured kidnap judged 12 % of its beams and contradicted on all
+        // of them — a verdict of "cannot judge" there let the give-up
+        // escape resume tracking at the kidnapped pose.
+        let strong = a.n_observed >= wd.min_observed_beams
             && a.n_observed as f32 >= self.cfg.relocalize_confirm_min_fraction * a.n_beams as f32;
-        let verdict =
-            if judgeable && a.mean_residual_m <= self.cfg.relocalize_confirm_max_residual_m {
-                Verdict::Confirmed(implied, a.mean_residual_m)
-            } else if judgeable {
-                Verdict::Refuted
-            } else {
-                Verdict::Unjudgeable
-            };
+        let weak = a.n_observed >= wd.min_observed_beams
+            && a.n_observed as f32 >= wd.min_observed_fraction * a.n_beams as f32;
+        let verdict = if strong && a.mean_residual_m <= self.cfg.relocalize_confirm_max_residual_m {
+            Verdict::Confirmed(implied, a.mean_residual_m)
+        } else if strong || (weak && a.mean_residual_m > wd.max_mean_residual_m) {
+            Verdict::Refuted
+        } else if weak {
+            // Judged, and the judgement fell between agreement and
+            // contradiction: evidence exists but is ambiguous. Keep the
+            // candidate and keep searching — but this window must not
+            // count toward the give-up escape, whose premise is that the
+            // map could not judge the pose AT ALL.
+            Verdict::Ambiguous
+        } else {
+            Verdict::Unjudgeable
+        };
         (implied, verdict)
     }
 
     fn ink(&mut self, pose: Pose2, composite: &Scan) {
-        for _ in 0..self.cfg.window_ink_passes {
-            self.slam.integrate(pose, composite);
-        }
+        self.slam
+            .integrate_weighted(pose, composite, self.cfg.window_ink_passes.max(1));
         self.windows += 1;
     }
-}
-
-/// Every k-th beam, sized to land at or under `max_beams`.
-fn decimate(scan: &Scan, max_beams: usize) -> Scan {
-    let n = scan.beams.len();
-    if n <= max_beams.max(1) {
-        return scan.clone();
-    }
-    let step = n.div_ceil(max_beams.max(1));
-    Scan {
-        beams: scan.beams.iter().copied().step_by(step).collect(),
-    }
-}
-
-fn wrap_pi(a: f32) -> f32 {
-    use std::f32::consts::PI;
-    let two_pi = 2.0 * PI;
-    let mut y = (a + PI).rem_euclid(two_pi) - PI;
-    if y == PI {
-        y = -PI;
-    }
-    y
 }
 
 #[cfg(test)]
@@ -1020,6 +1037,134 @@ mod tests {
         assert!(mapper.tracking());
         // The odometry carried the pose to (5, 5) relative to the seed.
         assert!((pose.0 - 5.0).abs() < 0.1 && (pose.1 - 5.0).abs() < 0.1);
+    }
+
+    /// Continuous mode must recover from suspicion the same way
+    /// stop-and-scan does: a continuous mapper that sat once used to sweep
+    /// its head forever — `lost` was armed on the sit and nothing on the
+    /// continuous path could ever clear it.
+    #[test]
+    fn continuous_mode_recovers_from_suspicion() {
+        let mut mapper = Mapper::new(
+            MapperConfig {
+                continuous: true,
+                ..MapperConfig::default()
+            },
+            Slam::new(SlamConfig::default()),
+        );
+        let mut notes = Vec::new();
+        let mut t = drive(&mut mapper, 0.0, (0.0, 0.0, 0.0), 8.0, &mut notes);
+        assert!(mapper.tracking());
+        for _ in 0..50 {
+            mapper.observe(
+                t,
+                MapperSample {
+                    odom: (0.0, 0.0, 0.0),
+                    moving: false,
+                    sitting: true,
+                    fallen: false,
+                },
+                &mut notes,
+            );
+            t += 0.02;
+        }
+        assert!(!mapper.tracking(), "a sit must suspend continuous mapping");
+        drive(&mut mapper, t, (0.0, 0.0, 0.0), 10.0, &mut notes);
+        assert!(
+            mapper.tracking(),
+            "an unmoved continuous mapper must confirm its pose and resume"
+        );
+    }
+
+    /// A displaced robot whose windows the map can judge — even on a
+    /// minority of beams — must never exhaust soft suspicion into
+    /// ResumedUnverified: refutation lives in the judged beams, and the
+    /// give-up escape is only for views the map cannot judge at all.
+    #[test]
+    fn a_contradicted_seed_never_resumes_unverified() {
+        let mut mapper = Mapper::new(MapperConfig::default(), Slam::new(SlamConfig::default()));
+        let mut notes = Vec::new();
+        let mut t = drive(&mut mapper, 0.0, (0.0, 0.0, 0.0), 8.0, &mut notes);
+        for _ in 0..50 {
+            mapper.observe(
+                t,
+                MapperSample {
+                    odom: (0.0, 0.0, 0.0),
+                    moving: false,
+                    sitting: true,
+                    fallen: false,
+                },
+                &mut notes,
+            );
+            t += 0.02;
+        }
+        assert!(!mapper.tracking());
+
+        // The kidnapped view: ~85 % of beams land beyond the mapped walls
+        // (unknown cells — unjudgeable), ~15 % land mid-room in carved
+        // free space, far from every wall — judgeable, and contradicting.
+        let mut angles = Vec::new();
+        let mut ranges = Vec::new();
+        for k in 0..1000 {
+            let a = -std::f32::consts::PI + k as f32 * (2.0 * std::f32::consts::PI / 1000.0);
+            angles.push(a);
+            ranges.push(if k % 7 == 0 { 0.9 } else { 1.9 });
+        }
+        let scan = || Scan::from_polar(&angles, &ranges, (0.0, 0.0), 1e-3);
+
+        let mut next_frame = t;
+        let mut debug_once = true;
+        let end = t + 90.0; // far past 10 windows' worth of give-up budget
+        while t < end {
+            mapper.observe(
+                t,
+                MapperSample {
+                    odom: (0.0, 0.0, 0.0),
+                    moving: false,
+                    sitting: false,
+                    fallen: false,
+                },
+                &mut notes,
+            );
+            if t >= next_frame {
+                mapper.frame(t, scan());
+                next_frame += 1.0 / 15.0;
+            }
+            if let (Some(mut g), Some((p, sc))) =
+                (mapper.slam().render(), mapper.last_window().cloned())
+            {
+                let wd = mapper.cfg.watchdog;
+                let a = crate::relocalize::score_pose(
+                    &mut g,
+                    &sc,
+                    p,
+                    wd.clamp_m,
+                    wd.wall_threshold_fp,
+                    wd.observed_fp,
+                );
+                if debug_once {
+                    println!(
+                        "window agreement: mean {:.3} over {}/{} ({:.0}%)",
+                        a.mean_residual_m,
+                        a.n_observed,
+                        a.n_beams,
+                        100.0 * a.n_observed as f32 / a.n_beams as f32
+                    );
+                    debug_once = false;
+                }
+            }
+            for n in notes.drain(..) {
+                assert!(
+                    !matches!(n, Note::ResumedUnverified { .. }),
+                    "a judged-and-contradicted pose must never resume unverified"
+                );
+                if let Note::Relocalized { pose, .. } = n {
+                    panic!("nothing should confirm here, got {pose:?}");
+                }
+            }
+            t += 0.02;
+        }
+        assert!(!mapper.tracking(), "the mapper must still be searching");
     }
 
     /// Beams into unexplored territory must never read as "lost".

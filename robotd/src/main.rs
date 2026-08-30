@@ -751,6 +751,12 @@ async fn main() -> ExitCode {
     // mid-transaction and leaving a half-written packet on the bus.
     state.shutdown.store(true, Ordering::Relaxed);
     let _ = control.join();
+    // The mapping worker's channel never closes on its own (the tofd feed
+    // and the IPC handle keep senders alive), so tell it to save and stop —
+    // this is what makes the session's save-on-shutdown real.
+    if let Some(host) = state.maploc.get() {
+        host.shutdown();
+    }
     let _ = std::fs::remove_file(&args.socket);
     code
 }

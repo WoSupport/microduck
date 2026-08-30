@@ -79,6 +79,11 @@ enum Event {
     /// Reset everything: map, graph, tracked pose, suspicion — and delete
     /// the saved session. `robotctl robot map-wipe`.
     Wipe,
+    /// Save and stop; the ack says the session is on disk. Sent by robotd's
+    /// shutdown path — the channel never closes on its own, because the
+    /// tofd feed thread and the IPC side hold Host clones for the life of
+    /// the process, so "every sender dropped" is a signal that never fires.
+    Shutdown(mpsc::SyncSender<()>),
 }
 
 /// Handle the rest of robotd holds. Dropping every clone (robotd shutting
@@ -106,6 +111,17 @@ impl Host {
     /// operator's one keystroke).
     pub fn wipe(&self) -> bool {
         self.tx.try_send(Event::Wipe).is_ok()
+    }
+
+    /// Save the session and stop the worker, waiting briefly for the disk
+    /// write. Called from robotd's shutdown path: without it the final
+    /// save documented below never runs, and a `systemctl restart` costs
+    /// up to a full autosave interval of mapping.
+    pub fn shutdown(&self) {
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        if self.tx.send(Event::Shutdown(ack_tx)).is_ok() {
+            let _ = ack_rx.recv_timeout(Duration::from_secs(3));
+        }
     }
 
     /// Is the mapper's pose suspect or lost right now? The control loop
@@ -232,6 +248,8 @@ fn worker(
     let mut last_save = Instant::now();
     let mut seq = 0u64;
     let mut unsaved = false;
+    let mut rendered: Option<RenderedGrid> = None;
+    let mut render_stale = true;
     // Field diagnostics: one line every 5 s says what mapping is actually
     // doing, because "the map shows nothing" has half a dozen distinct
     // causes and a journal that names the live one beats guessing.
@@ -273,6 +291,21 @@ fn worker(
                 latest = Some(sample);
                 n_odom += 1;
             }
+            Event::Shutdown(ack) => {
+                if unsaved {
+                    match mapper.slam().save(&params.map_path) {
+                        Ok(()) => {
+                            tracing::info!(path = %params.map_path.display(), "maploc: session saved");
+                        }
+                        Err(e) => tracing::warn!(error = %e, "maploc: final save failed"),
+                    }
+                }
+                if let Some(rec) = recorder.as_mut() {
+                    let _ = rec.flush();
+                }
+                let _ = ack.send(());
+                return;
+            }
             Event::Wipe => {
                 mapper = Mapper::new(
                     MapperConfig {
@@ -287,6 +320,8 @@ fn worker(
                     tracing::warn!(error = %e, "maploc: wipe could not delete the session file");
                 }
                 unsaved = false;
+                rendered = None;
+                render_stale = true;
                 tracing::info!("maploc: session wiped by request");
             }
             Event::Frame(frame) => {
@@ -429,6 +464,7 @@ fn worker(
         }
         if mapper.slam_mut().take_dirty() {
             unsaved = true;
+            render_stale = true;
         }
         searching.store(!mapper.tracking(), Ordering::Relaxed);
 
@@ -458,9 +494,18 @@ fn worker(
 
         if map_tx.receiver_count() > 0 && last_publish.elapsed() >= PUBLISH_EVERY {
             last_publish = Instant::now();
-            let seated = latest.as_ref().is_some_and(|s| s.sitting || s.fallen);
-            if let Some(frame) = render_frame(&mapper, &mut seq, seated) {
-                let _ = map_tx.send(frame);
+            // The grid re-renders only when the map changed: compositing
+            // every submap once a second for a robot that is just walking
+            // (pose changes, ink does not) grows with the map for nothing.
+            // The pose, tracking and posture fields ride every frame.
+            if render_stale || rendered.is_none() {
+                rendered = render_grid(&mapper);
+                render_stale = false;
+            }
+            if let Some(grid) = &rendered {
+                seq += 1;
+                let seated = latest.as_ref().is_some_and(|s| s.sitting || s.fallen);
+                let _ = map_tx.send(frame_from(&mapper, grid, seq, seated));
             }
         }
 
@@ -473,8 +518,8 @@ fn worker(
         }
     }
 
-    // Shutdown: the session is the product; losing the last minute of a
-    // mapping walk to a restart would be a sour note to end on.
+    // Every sender dropped — robotd is tearing down without having sent
+    // Shutdown (a panic path). Save anyway; the session is the product.
     if unsaved {
         if let Err(e) = mapper.slam().save(&params.map_path) {
             tracing::warn!(error = %e, "maploc: final save failed");
@@ -508,8 +553,18 @@ fn decode_ranges(
     Some(out)
 }
 
-/// The composite map as a wire frame: trinary cells, base64.
-fn render_frame(mapper: &Mapper, seq: &mut u64, seated: bool) -> Option<proto::MapFrame> {
+/// A rendered composite, already trinarized and base64'd — everything in a
+/// [`proto::MapFrame`] that only changes when the map's ink does.
+struct RenderedGrid {
+    x_min: f32,
+    y_min: f32,
+    cell_m: f32,
+    rows: u32,
+    cols: u32,
+    cells: String,
+}
+
+fn render_grid(mapper: &Mapper) -> Option<RenderedGrid> {
     let grid = mapper.slam().render()?;
     let mut cells = Vec::with_capacity(grid.width() * grid.height());
     for i in 0..grid.height() {
@@ -524,26 +579,37 @@ fn render_frame(mapper: &Mapper, seq: &mut u64, seated: bool) -> Option<proto::M
             });
         }
     }
-    let (x, y, yaw) = mapper.slam().tracked();
-    *seq += 1;
-    Some(proto::MapFrame {
-        seq: *seq,
-        x: f64::from(x),
-        y: f64::from(y),
-        yaw: f64::from(yaw),
-        tracking: mapper.tracking() && mapper.slam().n_submaps() > 0,
+    Some(RenderedGrid {
         x_min: grid.cfg().x_range.0,
         y_min: grid.cfg().y_range.0,
         cell_m: grid.cell(),
         rows: grid.height() as u32,
         cols: grid.width() as u32,
         cells: proto::b64::encode(&cells),
+    })
+}
+
+/// The wire frame: the cached grid plus everything that moves every second.
+fn frame_from(mapper: &Mapper, grid: &RenderedGrid, seq: u64, seated: bool) -> proto::MapFrame {
+    let (x, y, yaw) = mapper.slam().tracked();
+    proto::MapFrame {
+        seq,
+        x: f64::from(x),
+        y: f64::from(y),
+        yaw: f64::from(yaw),
+        tracking: mapper.tracking() && mapper.slam().n_submaps() > 0,
+        x_min: grid.x_min,
+        y_min: grid.y_min,
+        cell_m: grid.cell_m,
+        rows: grid.rows,
+        cols: grid.cols,
+        cells: grid.cells.clone(),
         n_submaps: mapper.slam().n_submaps() as u32,
         n_loops: mapper.slam().n_loops() as u32,
         windows: mapper.windows(),
         still: mapper.still(),
         seated,
-    })
+    }
 }
 
 /// Subscribe to `tofd`'s depth stream and pump frames into the host.

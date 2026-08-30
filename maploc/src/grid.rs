@@ -201,19 +201,31 @@ impl OccupancyGrid {
     /// Integrate one ray from `(x0,y0)` (sensor origin) to `(x1,y1)` (hit).
     /// Cells along the ray are marked free; the endpoint is marked occupied
     /// iff `hit_is_occupied` (e.g. ray hit a wall, not the floor).
-    pub fn integrate_ray(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, hit_is_occupied: bool) {
+    /// Returns whether the ray wrote at least one cell — a caller deciding
+    /// whether a scan is worth remembering must not count rays the grid
+    /// silently clipped away.
+    pub fn integrate_ray(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        hit_is_occupied: bool,
+    ) -> bool {
         // A non-finite coordinate would alias to a garbage cell (NaN
         // casts to 0) and silently paint phantom walls — skip the ray.
         if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
-            return;
+            return false;
         }
         self.field_dirty = true;
         let (i0, j0) = self.world_to_cell(x0, y0);
         let (i1, j1) = self.world_to_cell(x1, y1);
+        let mut touched = false;
         bresenham(i0, j0, i1, j1, |i, j, at_end| {
             if !self.in_bounds(i, j) {
                 return;
             }
+            touched = true;
             let (i, j) = (i as usize, j as usize);
             let delta = if at_end && hit_is_occupied {
                 LO_HIT
@@ -222,6 +234,7 @@ impl OccupancyGrid {
             };
             self.bump(i, j, delta);
         });
+        touched
     }
 
     /// Cast a ray in the grid; return distance until the first occupied
