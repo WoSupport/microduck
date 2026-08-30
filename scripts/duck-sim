@@ -50,7 +50,10 @@ stop_one() {
     # The group, not the process: each half is started with `setsid`, so this reaches a viewer
     # thread or a child that outlived its parent. The bare pid is the fallback for a pidfile
     # written before that was true.
-    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    # `sudo -n` first: the ether runs as root in container mode, and a stop that cannot reach it
+    # leaves a radio talking to containers that are gone.
+    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null \
+        || sudo -n kill -TERM "-$pid" 2>/dev/null || true
     i=0
     while [ $i -lt 25 ] && kill -0 "$pid" 2>/dev/null; do i=$((i + 1)); sleep 0.2; done
     kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
@@ -493,13 +496,35 @@ boot() {
         # rootfs — and sets it back. A duck should not think it is a laptop.
         printf '%s\n' "$name" | sudo tee "$upper/merged/etc/hostname" >/dev/null
         # This duck's own body, in this duck's own filesystem — which is what the overlay is for.
-        sudo mkdir -p "$upper/merged/etc/systemd/system/robotd.service.d"
-        printf '[Service]\nExecStart=\nExecStart=/opt/robot/daemon/current/bin/robotd --sim 127.0.0.1:%s\n' \
-            "$(duck_port "$i")" | sudo tee "$upper/merged/etc/systemd/system/robotd.service.d/sim.conf" >/dev/null
+        #
+        # **And its socket somewhere the ether can reach.** A container's `/run` is its own, so
+        # `/run/robotd.sock` inside it is invisible from here — and the radio has to hold one
+        # connection per duck, from outside all of them. So a host directory is bound in at
+        # `/run/duck`, robotd is told to listen there, and a symlink puts it back at the path every
+        # client in the container expects. The socket is then the same object on both sides.
+        sudo mkdir -p "$upper/merged/etc/systemd/system/robotd.service.d" "$upper/run"
+        sudo tee "$upper/merged/etc/systemd/system/robotd.service.d/sim.conf" >/dev/null <<CONF
+[Service]
+ExecStart=
+ExecStart=/opt/robot/daemon/current/bin/robotd --sim 127.0.0.1:$(duck_port "$i") --socket /run/duck/robotd.sock
+ExecStartPost=/bin/ln -sf /run/duck/robotd.sock /run/robotd.sock
+CONF
+        # Singing is opt-in. Only this key: everything else resolves from the release, which is
+        # the reason to boot a container in the first place.
+        sudo mkdir -p "$upper/merged/etc/robot"
+        printf '[chorale]\naccept = true\n' | sudo tee "$upper/merged/etc/robot/robotd.toml" >/dev/null
+        # A voice of its own — the chorale id comes from the bank seed, so ducks sharing a bank
+        # share an id and drop each other as their own reflection.
+        if [ ! -d "$upper/merged/var/lib/robot/sounds" ]; then
+            say "rendering $name a voice"
+            sudo env DUCK_IDENTITY="$name" "$REPO/target/debug/sounds" ensure-bank \
+                --dir "$upper/merged/var/lib/robot/sounds" >/dev/null 2>&1 || say "$name has no voice"
+        fi
         say "booting $name (body on port $(duck_port "$i"))"
         sudo systemd-run --collect --unit="$name" --quiet \
             systemd-nspawn -D "$upper/merged" --machine="$name" --boot \
-            --hostname="$name" --resolv-conf=copy-host
+            --hostname="$name" --resolv-conf=copy-host \
+            --bind="$upper/run:/run/duck"
         i=$((i + 1))
     done
 
@@ -536,6 +561,25 @@ boot() {
         PORT_I="$(duck_port "$i")" upright_at "$(duck_port "$i")" "$(duck_name "$i")" || true
         i=$((i + 1))
     done
+
+    # The radio, reaching each duck through the socket bound out of its container.
+    if [ "$DUCKS" -gt 1 ]; then
+        [ -x "$REPO/target/debug/duck-ether" ] || (cd "$REPO" && cargo build --quiet -p duck-ether)
+        args=""
+        i=0
+        while [ "$i" -lt "$DUCKS" ]; do
+            name="$(duck_name "$i")"
+            args="$args --duck $name=$STATE/ducks/$name/run/robotd.sock@$(duck_port "$i")"
+            i=$((i + 1))
+        done
+        # Under sudo, because robotd creates its socket 0660 root:robot and the person running
+        # this script is not in that group — nor would being in the *host* group help, since the
+        # container has its own. The radio is the one part of this that must reach every duck.
+        # shellcheck disable=SC2086
+        sudo setsid nohup "$REPO/target/debug/duck-ether" $args > "$STATE/ether.log" 2>&1 &
+        echo $! > "$STATE/ether.pid"
+        say "the ether is open — $DUCKS ducks can hear each other"
+    fi
 
     realtime
 
