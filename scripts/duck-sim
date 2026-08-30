@@ -382,11 +382,11 @@ stage() {
         cp "$REPO"/updater/systemd/sysusers.d/robot.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
         # The body is on the host, and this container shares the host network namespace, so
         # localhost is the same localhost.
-        cat > "$ROOTFS/etc/systemd/system/robotd.service.d/sim.conf" <<CONF
-[Service]
-ExecStart=
-ExecStart=/bin/sh -c "exec /opt/robot/daemon/current/bin/robotd --sim 127.0.0.1:\${DUCK_SIM_PORT:-$PORT}"
-CONF
+        # Which body this duck drives is written per duck, into its own overlay, by `boot`. Not
+        # here and not through the environment: `systemd-nspawn --setenv` reaches the container's
+        # PID 1, and systemd does not pass its own environment on to services — so every duck fell
+        # through to the default port and four daemons drove the same body.
+        rm -f "$ROOTFS/etc/systemd/system/robotd.service.d/sim.conf"
         # No params file at all: inside the container `RELEASE_DIR` is real, so every policy
         # resolves the way it does on a robot. That is the whole point of booting one.
         rm -f "$ROOTFS/etc/robot/robotd.toml"
@@ -412,11 +412,14 @@ boot() {
         sudo mkdir -p "$upper/upper" "$upper/work" "$upper/merged"
         sudo mount -t overlay overlay \
             -o "lowerdir=$ROOTFS,upperdir=$upper/upper,workdir=$upper/work" "$upper/merged"
+        # This duck's own body, in this duck's own filesystem — which is what the overlay is for.
+        sudo mkdir -p "$upper/merged/etc/systemd/system/robotd.service.d"
+        printf '[Service]\nExecStart=\nExecStart=/opt/robot/daemon/current/bin/robotd --sim 127.0.0.1:%s\n' \
+            "$(duck_port "$i")" | sudo tee "$upper/merged/etc/systemd/system/robotd.service.d/sim.conf" >/dev/null
         say "booting $name (body on port $(duck_port "$i"))"
         sudo systemd-run --collect --unit="$name" --quiet \
             systemd-nspawn -D "$upper/merged" --machine="$name" --boot \
-            --hostname="$name" --resolv-conf=copy-host \
-            --setenv=DUCK_SIM_PORT="$(duck_port "$i")"
+            --hostname="$name" --resolv-conf=copy-host
         i=$((i + 1))
     done
 
