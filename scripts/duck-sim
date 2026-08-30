@@ -32,6 +32,7 @@ set -eu
 STATE="${DUCK_SIM_STATE:-$HOME/.cache/duck-sim}"
 RL="${DUCK_SIM_RL:-$HOME/Pollen/microduck_rl}"
 PORT="${DUCK_SIM_PORT:-7801}"
+DUCKS="${DUCK_SIM_DUCKS:-1}"
 SOCK="$STATE/duck.sock"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -156,8 +157,10 @@ PY
 # gravity [0, 0, -1] as surely as a standing one does, so it reported a seated duck as standing
 # while the window showed it sitting. `STAND` is 0.12 and `SIT` is 0.07; halfway is the line.
 # Orientation still matters, for the duck that stood up and then fell over.
-upright() {
-    read_z="$(python3 - "$PORT" <<'PY'
+upright() { upright_at "$PORT" "the duck"; }
+
+upright_at() {
+    read_z="$(python3 - "$1" <<'PY'
 import json, socket, sys
 s = socket.socket(); s.settimeout(2); s.connect(("127.0.0.1", int(sys.argv[1])))
 f = s.makefile("rw")
@@ -172,12 +175,12 @@ PY
     standing="$(python3 -c "print(1 if $trunk > 0.095 else 0)" 2>/dev/null || echo 0)"
     if [ "$standing" = 1 ]; then
         case "$z" in
-            -0.9*|-1*) say "standing (trunk $trunk m, gravity z $z)"; return 0 ;;
+            -0.9*|-1*) say "$2: standing (trunk $trunk m, gravity z $z)"; return 0 ;;
         esac
     fi
 
     printf '\n'
-    say "the duck did not stand up (trunk ${trunk}m, standing is about 0.12; gravity z $z)"
+    say "$2 did not stand up (trunk ${trunk}m, standing is about 0.12; gravity z $z)"
     if grep -q "behind real time" "$STATE/body.log" 2>/dev/null; then
         cat <<'WHY'
   The simulator could not keep real time, and that is almost certainly why. The daemon's loop is
@@ -212,7 +215,7 @@ start_body() {
     # wrapper and left MuJoCo running as an orphan. `setsid` puts the simulator in its own process
     # group, which is what makes stopping it one signal rather than a hunt.
     setsid nohup "$RL/.venv/bin/python" -m mjlab_microduck.sim.body_server \
-        --port "$PORT" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS \
+        --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS \
         > "$STATE/body.log" 2>&1 &
     echo $! > "$STATE/body.pid"
     wait_for_port || die "the simulator did not come up. $STATE/body.log has why."
@@ -263,8 +266,28 @@ PY
 
 # ── the container ─────────────────────────────────────────────────────────────
 
+# Every duck this script could have started, stopped and unmounted. By name from the same list that
+# starts them, so a duck left behind by an interrupted boot is still cleaned up.
+down_containers() {
+    i=0
+    while [ "$i" -lt 16 ]; do
+        name="$(duck_name "$i")"
+        if sudo systemctl is-active --quiet "$name" 2>/dev/null; then
+            sudo systemctl stop "$name" 2>/dev/null || true
+        fi
+        merged="$STATE/ducks/$name/merged"
+        mountpoint -q "$merged" 2>/dev/null && sudo umount "$merged" 2>/dev/null || true
+        i=$((i + 1))
+    done
+}
+
+
 ROOTFS="$STATE/rootfs"
-MACHINE="${DUCK_SIM_MACHINE:-duck-a}"
+
+# duck-a, duck-b, … — one container each, one body port each, all in one world.
+LETTERS=abcdefghijklmnop
+duck_name() { echo "duck-$(printf %s "$LETTERS" | cut -c$(($1 + 1)))"; }
+duck_port() { echo $((PORT + $1)); }
 
 # Debian 13 Trixie, the board's own userland, built unprivileged. Two things an Ubuntu host needs
 # and does not have: Debian's archive keyring, and apt not dropping to a `_apt` uid that the user
@@ -339,7 +362,7 @@ stage() {
         cat > "$ROOTFS/etc/systemd/system/robotd.service.d/sim.conf" <<CONF
 [Service]
 ExecStart=
-ExecStart=/opt/robot/daemon/current/bin/robotd --sim 127.0.0.1:$PORT
+ExecStart=/bin/sh -c "exec /opt/robot/daemon/current/bin/robotd --sim 127.0.0.1:\${DUCK_SIM_PORT:-$PORT}"
 CONF
         # No params file at all: inside the container `RELEASE_DIR` is real, so every policy
         # resolves the way it does on a robot. That is the whole point of booting one.
@@ -355,29 +378,59 @@ boot() {
     [ -x "$REPO/target/debug/robotd" ] || (cd "$REPO" && cargo build --quiet -p robotd -p robotctl)
     stage
     start_body
-    say "booting $MACHINE"
-    sudo systemd-run --collect --unit="$MACHINE" --quiet \
-        systemd-nspawn -D "$ROOTFS" --machine="$MACHINE" --boot \
-        --hostname="$MACHINE" --resolv-conf=copy-host
+
+    # **One rootfs, one overlay per duck.** The base is read-only and each duck gets its own upper,
+    # so duck four costs megabytes rather than 213 of them — and `robotctl configure` on one duck
+    # does not edit another's config.
     i=0
-    while [ $i -lt 60 ]; do
-        sudo machinectl show "$MACHINE" >/dev/null 2>&1 && break
-        i=$((i + 1)); sleep 0.5
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        upper="$STATE/ducks/$name"
+        sudo mkdir -p "$upper/upper" "$upper/work" "$upper/merged"
+        sudo mount -t overlay overlay \
+            -o "lowerdir=$ROOTFS,upperdir=$upper/upper,workdir=$upper/work" "$upper/merged"
+        say "booting $name (body on port $(duck_port "$i"))"
+        sudo systemd-run --collect --unit="$name" --quiet \
+            systemd-nspawn -D "$upper/merged" --machine="$name" --boot \
+            --hostname="$name" --resolv-conf=copy-host \
+            --setenv=DUCK_SIM_PORT="$(duck_port "$i")"
+        i=$((i + 1))
+    done
+
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        j=0
+        while [ $j -lt 60 ]; do
+            sudo machinectl show "$name" >/dev/null 2>&1 && break
+            j=$((j + 1)); sleep 0.5
+        done
+        i=$((i + 1))
     done
     sleep 5
-    # Hand it to the policy, from inside — the socket lives in the container's own /run, which is
+
+    # Hand each to its policy, from inside — the socket lives in that container's own /run, which is
     # the point. `enable` rather than `init`: see `robotctl robot enable`.
-    say "standing up"
-    sudo machinectl shell "$MACHINE" /usr/local/bin/robotctl robot enable >/dev/null 2>&1 || \
-        say "could not enable from here — try: scripts/duck-sim shell, then robotctl robot enable"
+    say "standing them up"
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        sudo machinectl shell "$name" /usr/local/bin/robotctl robot enable >/dev/null 2>&1 || \
+            say "$name would not enable — shell in and try \`robotctl robot enable\`"
+        i=$((i + 1))
+    done
     sleep 5
-    upright || true
-    say "$MACHINE is up"
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        PORT_I="$(duck_port "$i")" upright_at "$(duck_port "$i")" "$(duck_name "$i")" || true
+        i=$((i + 1))
+    done
+
     cat <<NEXT
 
-  scripts/duck-sim shell        you are on the duck
+  scripts/duck-sim shell           you are on $(duck_name 0)
+  scripts/duck-sim shell duck-b    or any other
   duck-a # robotctl health
-  duck-a # systemctl status robotd
 
   scripts/duck-sim down
 
@@ -385,15 +438,15 @@ NEXT
 }
 
 shell() {
-    sudo machinectl shell "$MACHINE"
+    sudo machinectl shell "${1:-$(duck_name 0)}"
 }
 
 case "${1:-up}" in
     up|"")   up ;;
     rootfs)  rootfs ;;
-    boot)    boot ;;
-    shell)   shell ;;
-    down)    sudo systemctl stop "$MACHINE" 2>/dev/null || true; down ;;
+    boot)    shift; DUCKS="${1:-$DUCKS}"; boot ;;
+    shell)   shift; shell "$@" ;;
+    down)    down_containers; down ;;
     drive)   shift; drive "$@" ;;
     ctl)     shift; ctl "$@" ;;
     stand)   stand && sleep 6 && upright ;;
