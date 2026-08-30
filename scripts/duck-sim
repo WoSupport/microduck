@@ -35,7 +35,13 @@ ctl() { "$REPO/target/debug/robotctl" --robot-socket "$SOCK" "$@"; }
 stop_one() {
     [ -f "$STATE/$1.pid" ] || return 0
     pid="$(cat "$STATE/$1.pid")"
-    kill "$pid" 2>/dev/null || true
+    # The group, not the process: each half is started with `setsid`, so this reaches a viewer
+    # thread or a child that outlived its parent. The bare pid is the fallback for a pidfile
+    # written before that was true.
+    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    i=0
+    while [ $i -lt 25 ] && kill -0 "$pid" 2>/dev/null; do i=$((i + 1)); sleep 0.2; done
+    kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
     rm -f "$STATE/$1.pid"
 }
 
@@ -43,6 +49,13 @@ down() {
     stop_one robotd
     stop_one body
     rm -f "$SOCK"
+    # Verified, not assumed: `down` reporting success while a MuJoCo window is still open is worse
+    # than saying nothing, and is exactly what the subshell bug above produced.
+    if python3 -c "import socket,sys;s=socket.socket();s.settimeout(.3);sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT))==0 else 1)" 2>/dev/null; then
+        say "something is still listening on $PORT — not started by this script?"
+        say "  pkill -f 'body_serve[r]'   # brackets: do not match your own command line"
+        return 1
+    fi
     say "down"
 }
 
@@ -80,22 +93,34 @@ TOML
     # and stands it up with the sitstand policy. `STAND` starts upright and topples in about a
     # second, because a position hold at the real servos' 0.75 N·m cannot balance a biped.
     say "starting the body — a MuJoCo window should open"
-    ( cd "$RL" && nohup .venv/bin/python -m mjlab_microduck.sim.body_server \
-        --port "$PORT" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" \
-        > "$STATE/body.log" 2>&1 & echo $! > "$STATE/body.pid" )
+    # `DUCK_SIM_VIEWER=0` for a window-less run: watching costs frames, and the daemon's loop is
+    # wall-clock, so a simulator that cannot keep up is a robot that cannot balance.
+    [ "${DUCK_SIM_VIEWER:-1}" = 0 ] && HEADLESS=--headless || HEADLESS=
+    # **Backgrounded directly, and in its own session.** `( cd X && nohup cmd & echo $! )` records
+    # the *subshell's* pid, because `A && B & C` parses as `(A && B) & C` — so `down` killed a
+    # wrapper and left MuJoCo running as an orphan. `setsid` puts the simulator in its own process
+    # group, which is what makes stopping it one signal rather than a hunt.
+    setsid nohup "$RL/.venv/bin/python" -m mjlab_microduck.sim.body_server \
+        --port "$PORT" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS \
+        > "$STATE/body.log" 2>&1 &
+    echo $! > "$STATE/body.pid"
     wait_for_port || die "the simulator did not come up. $STATE/body.log has why."
 
     say "starting robotd"
     DUCK_RUNTIME_DIR="$STATE" ORT_DYLIB_PATH="$ORT" RUST_LOG="${RUST_LOG:-info}" \
-        nohup "$REPO/target/debug/robotd" --sim "127.0.0.1:$PORT" \
+        setsid nohup "$REPO/target/debug/robotd" --sim "127.0.0.1:$PORT" \
         --params "$STATE/robotd.toml" --socket "$SOCK" \
-        > "$STATE/robotd.log" 2>&1 & echo $! > "$STATE/robotd.pid"
+        > "$STATE/robotd.log" 2>&1 &
+    echo $! > "$STATE/robotd.pid"
     wait_for_socket || die "robotd did not come up. $STATE/robotd.log has why."
 
     say "standing up"
-    ctl robot init >/dev/null 2>&1 || true
-    sleep 4
+    # Never quietly: this is the one command whose failure explains a duck that sits there, and an
+    # earlier version of this script threw its output away.
+    ctl robot init || die "robot init failed. $STATE/robotd.log has why."
+    sleep 5
     ctl health | head -3
+    upright || return 0
 
     cat <<'NEXT'
 
@@ -108,6 +133,43 @@ TOML
     scripts/duck-sim down
 
 NEXT
+}
+
+# Did it actually stand? The daemon reporting healthy only means the loop is turning — a duck that
+# never rose is healthy and sitting. Gravity in the trunk frame is the answer: -1 is upright.
+upright() {
+    z="$(python3 - "$PORT" <<'PY'
+import json, socket, sys
+s = socket.socket(); s.settimeout(2); s.connect(("127.0.0.1", int(sys.argv[1])))
+f = s.makefile("rw")
+f.write(json.dumps({"op": "hello", "protocol": 1, "joints": 15}) + "\n"); f.flush(); f.readline()
+f.write('{"op":"read"}\n'); f.flush()
+print("%.3f" % json.loads(f.readline())["imu"]["gravity"][2])
+PY
+)" || return 0
+    case "$z" in
+        -0.9*|-1*) say "upright (gravity z $z)"; return 0 ;;
+    esac
+
+    printf '\n'
+    say "the duck did not stand up (gravity z $z, upright is about -1.0)"
+    if grep -q "behind real time" "$STATE/body.log" 2>/dev/null; then
+        cat <<'WHY'
+  The simulator could not keep real time, and that is almost certainly why. The daemon's loop is
+  wall-clock: if MuJoCo runs at half speed the policy is effectively driving a robot that moves half
+  as fast as it expects, and it cannot balance one. The viewer is the usual cause.
+
+    scripts/duck-sim down && DUCK_SIM_VIEWER=0 scripts/duck-sim
+WHY
+    else
+        cat <<'WHY'
+  The simulator kept up, so this is the policy rather than the pacing. Worth a look:
+
+    scripts/duck-sim log                 what the daemon decided
+    scripts/duck-sim ctl robot init      try again
+WHY
+    fi
+    return 1
 }
 
 wait_for_port() {
@@ -158,6 +220,8 @@ case "${1:-up}" in
     down)    down ;;
     drive)   shift; drive "$@" ;;
     ctl)     shift; ctl "$@" ;;
+    init)    ctl robot init; sleep 5; upright ;;
+    status)  ctl health | head -4; upright ;;
     log)     tail -f "$STATE/robotd.log" ;;
     *)       die "unknown command '$1'. Try: up, down, drive, ctl, log" ;;
 esac
