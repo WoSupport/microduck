@@ -417,6 +417,10 @@ boot() {
         sudo mkdir -p "$upper/upper" "$upper/work" "$upper/merged"
         sudo mount -t overlay overlay \
             -o "lowerdir=$ROOTFS,upperdir=$upper/upper,workdir=$upper/work" "$upper/merged"
+        # Its own name. `--hostname` below sets the kernel one, and then systemd inside reads
+        # /etc/hostname — which mmdebstrap filled in with the name of the machine that built the
+        # rootfs — and sets it back. A duck should not think it is a laptop.
+        printf '%s\n' "$name" | sudo tee "$upper/merged/etc/hostname" >/dev/null
         # This duck's own body, in this duck's own filesystem — which is what the overlay is for.
         sudo mkdir -p "$upper/merged/etc/systemd/system/robotd.service.d"
         printf '[Service]\nExecStart=\nExecStart=/opt/robot/daemon/current/bin/robotd --sim 127.0.0.1:%s\n' \
