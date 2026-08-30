@@ -115,10 +115,8 @@ TOML
     wait_for_socket || die "robotd did not come up. $STATE/robotd.log has why."
 
     say "standing up"
-    # Never quietly: this is the one command whose failure explains a duck that sits there, and an
-    # earlier version of this script threw its output away.
-    ctl robot init || die "robot init failed. $STATE/robotd.log has why."
-    sleep 5
+    stand || die "could not enable the policy. $STATE/robotd.log has why."
+    sleep 6
     ctl health | head -3
     upright || return 0
 
@@ -133,6 +131,26 @@ TOML
     scripts/duck-sim down
 
 NEXT
+}
+
+# **`robot.enable`, not `robot init`.** `init` enables torque and then position-ramps to the home
+# pose over two seconds with nothing balancing — and this duck cannot hold any pose without a policy
+# driving it, at any timestep, from any placement. So the ramp tipped it flat every time: gravity in
+# the trunk frame went from -1.000 to +0.016 inside those two seconds, and it lay there. `enable`
+# hands the robot to the policy directly, and from a seated start it stands itself up: trunk 0.063
+# to 0.116 m, upright and steady.
+#
+# There is no `robotctl` subcommand for it — the console has the button — so this is the call.
+stand() {
+    python3 - "$SOCK" <<'PY'
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1])
+f = s.makefile("rw")
+f.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "robot.enable",
+                    "params": {"on": True}}) + "\n"); f.flush()
+answer = json.loads(f.readline())
+sys.exit(0 if answer.get("result", {}).get("accepted") else 1)
+PY
 }
 
 # Did it actually stand? Two numbers, because one of them is not enough.
@@ -177,7 +195,7 @@ WHY
   The simulator kept up, so this is the policy rather than the pacing. Worth a look:
 
     scripts/duck-sim log                 what the daemon decided
-    scripts/duck-sim ctl robot init      try again
+    scripts/duck-sim stand               try again
 WHY
     fi
     return 1
@@ -231,8 +249,8 @@ case "${1:-up}" in
     down)    down ;;
     drive)   shift; drive "$@" ;;
     ctl)     shift; ctl "$@" ;;
-    init)    ctl robot init; sleep 5; upright ;;
+    stand)   stand && sleep 6 && upright ;;
     status)  ctl health | head -4; upright ;;
     log)     tail -f "$STATE/robotd.log" ;;
-    *)       die "unknown command '$1'. Try: up, down, drive, ctl, log" ;;
+    *)       die "unknown command '$1'. Try: up, down, stand, drive, ctl, log, status" ;;
 esac
