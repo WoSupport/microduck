@@ -14,6 +14,15 @@
 //!    its loop and writes the end segment into a pipe that is still open. Only the second
 //!    one ever plays `wheee_end_*`, which is why [`Ride`] is a state and not a bool.
 //!
+//!  - **The theremin is synthesized, not played.** Every other sound here is a wav the
+//!    bank rendered in advance, which works because their shape is known in advance. A
+//!    theremin's pitch is a hand's distance — 15 new values a second, none of them known
+//!    until they arrive — so there is no file to pick. Its writer thread pulls blocks from
+//!    a live [`sounds::Stream`] instead, reading the parameters the control loop last
+//!    stored, and stays much closer behind playback than the ride does: a ride's 250 ms
+//!    lead only delays its release, while the same lead on an instrument is the gap between
+//!    moving your hand and hearing it.
+//!
 //! Playing is spawning: nothing here blocks the 50 Hz tick except the deliberately blocking
 //! goodbye peck right before power-off, when there is no tick left to miss — and that one is
 //! bounded, because a wedged PCM must not be able to hold up the power-off.
@@ -21,8 +30,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use sounds::{Personality, Stream};
 
 use crate::intents::WheeeHold;
 
@@ -30,8 +41,51 @@ use crate::intents::WheeeHold;
 /// well under a second; this is a ceiling on a wedged PCM, not a playback budget.
 const BLOCKING_PLAY_MAX: Duration = Duration::from_millis(1500);
 
-/// What the wheee ride is doing. `Landing` exists because the end segment takes real time
-/// to play and the trigger keeps asking during it.
+/// Audio block the theremin writer renders at a time: 10 ms.
+///
+/// Short, because it bounds how stale the parameters can be by the time they are heard, and
+/// the stream is deliberately indifferent to block size (`sounds::stream`) so this is a
+/// latency choice and nothing else.
+const SYNTH_BLOCK: usize = sounds::SR as usize / 100;
+
+/// How far ahead of playback the theremin writer stays. An instrument's whole quality is
+/// this number — see the module docs for why it is not the ride's 250 ms.
+const SYNTH_LEAD_S: f64 = 0.03;
+
+/// How loud one voice of an ensemble sings.
+///
+/// Under full scale, and not for headroom: **four ducks in a room sum acoustically.** The offline
+/// preview divides its mix by the square root of the voice count for exactly this reason; on real
+/// hardware nothing divides anything, so each duck has to arrive already knowing it is one of
+/// several. A single duck singing alone is therefore a little quiet, which is the right way round —
+/// the alternative was a quartet that saturated, which is what the first run on the robot sounded
+/// like.
+const CHORALE_LEVEL: f64 = 0.55;
+
+/// Where the duck's own speaker gives up, hertz.
+///
+/// Measured by ear rather than from a datasheet: the chorale's 130 Hz bass line did not come
+/// through the driver, and this is where it starts to. `sounds::Stream::set_speaker_rolloff` uses it
+/// to carry a low note on harmonics the driver can make instead of a fundamental it cannot.
+const SPEAKER_ROLLOFF_HZ: f64 = 300.0;
+
+/// Keep `SIGPIPE` off a writer thread.
+///
+/// `robotd` restores its default disposition at startup — so that piping its stdout behaves — which
+/// would make a write into a dead `aplay` kill the whole daemon. Blocked here, every such write is
+/// merely a failed write, which every writer below already treats as "this voice is over".
+fn block_sigpipe() {
+    // SAFETY: masking one signal on the calling thread; nothing else observes the mask.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGPIPE);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// What owns the single-client PCM. Not a bool and not two: every one of these is a state that a
+/// one-shot, a trigger press and a power-off have to tell apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ride {
     /// No ride. The PCM is free for one-shots.
@@ -41,6 +95,77 @@ enum Ride {
     /// The writer is on the end segment, or `aplay` is draining it. Reaped when the child
     /// exits; a fresh press supersedes it.
     Landing,
+    /// The theremin holds the PCM: a writer thread is synthesizing from live parameters,
+    /// and will keep doing so until the loop takes the instrument away.
+    Theremin,
+    /// The chorale holds the PCM: a writer thread is rendering one part of a score at whatever
+    /// position the loop last published.
+    Singing,
+}
+
+/// The theremin's parameters, as the control loop hands them to the writer thread.
+///
+/// Atomics rather than a channel: the loop must never block on audio, the writer must never
+/// block the loop, and a parameter is a *level* — a writer that missed one update wants the
+/// newest value, not a queue of every value it slept through.
+#[derive(Debug)]
+struct Live {
+    /// Carrier frequency, hertz, as `f64` bits.
+    hz: AtomicU64,
+    /// 0 silent, 1 full, as `f64` bits. The note's key.
+    level: AtomicU64,
+    /// Mouth opening, 0..1, as `f64` bits — the same value the servo is being sent, so
+    /// what is heard and what is seen are one gesture.
+    open: AtomicU64,
+    /// Cleared to tell the writer to fade out and let go of the pipe.
+    playing: AtomicBool,
+}
+
+impl Live {
+    fn new() -> Self {
+        Self {
+            hz: AtomicU64::new(0.0f64.to_bits()),
+            level: AtomicU64::new(0.0f64.to_bits()),
+            open: AtomicU64::new(0.0f64.to_bits()),
+            playing: AtomicBool::new(true),
+        }
+    }
+
+    /// Where in the score to sing, in beats, and whether to sing at all.
+    ///
+    /// The position is published rather than the audio being driven: the control loop knows where
+    /// the ensemble is (from the conductor or the phase lock) and the writer thread knows how to
+    /// turn a score position into samples. A duck whose audio stalls therefore resumes *in the
+    /// right place* instead of a bar behind, because position is a function of time and not a
+    /// count of samples played.
+    fn set_position(&self, beats: f64, singing: bool) {
+        self.hz.store(beats.to_bits(), Ordering::Relaxed);
+        self.level.store(
+            if singing { 1.0f64 } else { 0.0 }.to_bits(),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn position(&self) -> (f64, bool) {
+        (
+            f64::from_bits(self.hz.load(Ordering::Relaxed)),
+            f64::from_bits(self.level.load(Ordering::Relaxed)) > 0.5,
+        )
+    }
+
+    fn set(&self, hz: f64, level: f64, open: f64) {
+        self.hz.store(hz.to_bits(), Ordering::Relaxed);
+        self.level.store(level.to_bits(), Ordering::Relaxed);
+        self.open.store(open.to_bits(), Ordering::Relaxed);
+    }
+
+    fn read(&self) -> (f64, f64, f64) {
+        (
+            f64::from_bits(self.hz.load(Ordering::Relaxed)),
+            f64::from_bits(self.level.load(Ordering::Relaxed)),
+            f64::from_bits(self.open.load(Ordering::Relaxed)),
+        )
+    }
 }
 
 /// The player. Constructed once by the control loop; `None`-like when the bank is missing —
@@ -59,6 +184,16 @@ pub struct Sound {
     ride: Ride,
     /// Bank missing is logged once, not per press.
     warned_missing: bool,
+    /// The live parameters of whatever the writer thread is rendering — a theremin's pitch, or a
+    /// chorale's score position.
+    live: Option<Arc<Live>>,
+    /// The piece and part being sung, so a tick that asks for the same one does not restart the
+    /// voice mid-phrase.
+    singing: Option<(String, sounds::chorale::Part)>,
+    /// This robot's voice, read once from the bank's own seed marker so the synthesized
+    /// theremin and the rendered wavs are the same duck. `None` until first asked for;
+    /// `Some(None)` once it has been asked for and there is no seed to be had.
+    personality: Option<Option<Personality>>,
 }
 
 impl Sound {
@@ -70,6 +205,9 @@ impl Sound {
             wheee_held: Arc::new(AtomicBool::new(false)),
             ride: Ride::Off,
             warned_missing: false,
+            live: None,
+            singing: None,
+            personality: None,
         }
     }
 
@@ -97,6 +235,13 @@ impl Sound {
     /// does to its predecessor.
     fn stop_child(&mut self) {
         self.wheee_held.store(false, Ordering::Relaxed);
+        // A theremin writer blocked in `write_all` on a pipe whose reader is about to die
+        // needs telling as well: clearing this is what gets it out of its loop, and the
+        // `EPIPE` its next write returns is what gets it out if it was already inside one.
+        if let Some(live) = self.live.take() {
+            live.playing.store(false, Ordering::Relaxed);
+        }
+        self.singing = None;
         self.ride = Ride::Off;
         if let Some(mut child) = self.child.take()
             && let Ok(None) = child.try_wait()
@@ -171,10 +316,369 @@ impl Sound {
         }
     }
 
+    /// Take the PCM for a live theremin, if this robot has a voice to play it in.
+    ///
+    /// Idempotent: called on the rising edge, and safe to call again — an instrument already
+    /// in hand is left playing rather than restarted, because restarting it would drop the
+    /// note the player is in the middle of.
+    pub fn theremin_start(&mut self) -> bool {
+        if self.ride == Ride::Theremin && self.live.is_some() {
+            return true;
+        }
+        let Some(personality) = self.voice() else {
+            if !self.warned_missing {
+                self.warned_missing = true;
+                tracing::warn!(
+                    bank = %self.bank.display(),
+                    "no voice seed — the theremin has no voice to play in \
+                     (run `sounds ensure-bank`)"
+                );
+            }
+            return false;
+        };
+        self.stop_child();
+
+        // A short ALSA buffer for the same reason as the short lead: this is an instrument,
+        // and every millisecond queued here is a millisecond between the hand and the note.
+        let child = Command::new("aplay")
+            .args([
+                "-q",
+                "-D",
+                &self.device,
+                "-t",
+                "raw",
+                "-f",
+                "S16_LE",
+                "-c",
+                "1",
+            ])
+            .args(["-r", &sounds::SR.to_string()])
+            .args(["--buffer-time=40000", "--period-time=10000"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            tracing::debug!("aplay failed; no theremin");
+            return false;
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            return false;
+        };
+        self.child = Some(child);
+        self.ride = Ride::Theremin;
+
+        let live = Arc::new(Live::new());
+        self.live = Some(live.clone());
+        // The variant is fixed rather than picked per performance: an instrument that
+        // re-rolled its own wobble rate every time it was picked up would be a different
+        // instrument every time, which is the one kind of variety a duck does not want.
+        let mut stream = Stream::wheee(&personality, 0);
+
+        let spawned = std::thread::Builder::new()
+            .name("theremin".into())
+            .spawn(move || {
+                use std::io::Write;
+                block_sigpipe();
+                let bytes_per_sec = f64::from(sounds::SR) * 2.0;
+                let t0 = Instant::now();
+                let mut sent = 0usize;
+                let mut block = vec![0.0f32; SYNTH_BLOCK];
+                let mut bytes = Vec::with_capacity(SYNTH_BLOCK * 2);
+
+                loop {
+                    let playing = live.playing.load(Ordering::Relaxed);
+                    let (hz, level, open) = live.read();
+                    // Letting go is a fade, not a cut: the level target goes to zero and the
+                    // stream is rendered until it has actually reached silence, which is the
+                    // difference between an instrument being put down and one being unplugged.
+                    stream.set(hz, if playing { level } else { 0.0 }, open);
+                    if !playing && stream.is_silent() {
+                        return;
+                    }
+
+                    stream.block(&mut block);
+                    bytes.clear();
+                    for sample in &block {
+                        let scaled = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                        bytes.extend_from_slice(&scaled.to_le_bytes());
+                    }
+
+                    // Stay just behind playback. Without this the pipe would take every
+                    // block the moment it is rendered and the instrument would run at the
+                    // speed of the CPU rather than of the sound card.
+                    let ahead = sent as f64 / bytes_per_sec - t0.elapsed().as_secs_f64();
+                    if ahead > SYNTH_LEAD_S {
+                        std::thread::sleep(Duration::from_secs_f64(ahead - SYNTH_LEAD_S));
+                    }
+                    sent += bytes.len();
+                    if stdin.write_all(&bytes).is_err() {
+                        return; // `aplay` is gone; so is the instrument
+                    }
+                }
+            });
+        if spawned.is_err() {
+            tracing::warn!("cannot spawn the theremin writer");
+            self.stop_child();
+            return false;
+        }
+        tracing::warn!(
+            seed = personality.seed,
+            "theremin: the PCM is an instrument"
+        );
+        true
+    }
+
+    /// Take the PCM to sing one part of a score, at whatever position the loop publishes.
+    ///
+    /// Idempotent for the same piece and part: called on every tick while a chorale runs, and a
+    /// second call does not restart the voice. A *different* part does restart it, which is what
+    /// happens when a duck is reseated between pieces.
+    pub fn sing_start(
+        &mut self,
+        score: &sounds::chorale::Score,
+        part: sounds::chorale::Part,
+    ) -> bool {
+        if self.ride == Ride::Singing
+            && self.singing.as_ref() == Some(&(score.name.clone(), part))
+            && self.live.is_some()
+        {
+            return true;
+        }
+        let Some(personality) = self.voice() else {
+            if !self.warned_missing {
+                self.warned_missing = true;
+                tracing::warn!(
+                    bank = %self.bank.display(),
+                    "no voice seed — this robot cannot sing (run `sounds ensure-bank`)"
+                );
+            }
+            return false;
+        };
+        self.stop_child();
+        let Some(mut stdin) = self.open_synth_pcm() else {
+            return false;
+        };
+        self.ride = Ride::Singing;
+        self.singing = Some((score.name.clone(), part));
+
+        let live = Arc::new(Live::new());
+        self.live = Some(live.clone());
+        // The part, flattened once: the writer must not walk a score on the audio thread.
+        let line: Vec<sounds::chorale::Note> = score.line(part).copied().collect();
+        let beat_s = score.beat_s();
+        let seat = sounds::chorale::seat_for(&personality, part);
+        let detune = 2.0f64.powf(seat.detune_cents / 1200.0);
+        let mut voice = Stream::choral(&personality, part as u32);
+        // The duck's own speaker, not a full-range one: a bass line's fundamental is not quiet
+        // here, it is absent, so the note is carried by harmonics the driver can actually make.
+        voice.set_speaker_rolloff(Some(SPEAKER_ROLLOFF_HZ));
+
+        let spawned = std::thread::Builder::new()
+            .name("chorale".into())
+            .spawn(move || {
+                use std::io::Write;
+                block_sigpipe();
+                let bytes_per_sec = f64::from(sounds::SR) * 2.0;
+                let t0 = Instant::now();
+                let mut sent = 0usize;
+                let mut block = vec![0.0f32; SYNTH_BLOCK];
+                let mut bytes = Vec::with_capacity(SYNTH_BLOCK * 2);
+
+                loop {
+                    let playing = live.playing.load(Ordering::Relaxed);
+                    let (beats, singing) = live.position();
+                    // Where the playhead is for *this* duck: the ensemble's position, offset by the
+                    // few milliseconds of onset spread that make a choir a choir.
+                    let at = beats * beat_s - seat.onset_offset_s;
+                    let note = line.iter().find(|note| {
+                        at >= note.start_beat * beat_s && at < note.end_beat() * beat_s
+                    });
+                    match note.filter(|_| playing && singing) {
+                        Some(note) => {
+                            // Release a little early so a change of chord re-articulates rather
+                            // than sliding, exactly as the offline render does.
+                            let sustain = note.beats * beat_s * 0.92;
+                            let held = at - note.start_beat * beat_s < sustain;
+                            voice.set_formant_shift(note.vowel.formant_shift());
+                            voice.set(
+                                sounds::chorale::midi_hz(f64::from(note.midi)) * detune,
+                                if held {
+                                    note.level * note.vowel.level_scale() * CHORALE_LEVEL
+                                } else {
+                                    0.0
+                                },
+                                note.vowel.open(),
+                            );
+                        }
+                        // Between notes, or asked to stop: silence at the pitch it was on, which is
+                        // a release rather than a slide out of the chord.
+                        None => voice.set_level(0.0),
+                    }
+                    if !playing && voice.is_silent() {
+                        return;
+                    }
+
+                    voice.block(&mut block);
+                    bytes.clear();
+                    for sample in &block {
+                        let scaled = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                        bytes.extend_from_slice(&scaled.to_le_bytes());
+                    }
+                    let ahead = sent as f64 / bytes_per_sec - t0.elapsed().as_secs_f64();
+                    if ahead > SYNTH_LEAD_S {
+                        std::thread::sleep(Duration::from_secs_f64(ahead - SYNTH_LEAD_S));
+                    }
+                    sent += bytes.len();
+                    if stdin.write_all(&bytes).is_err() {
+                        return; // `aplay` is gone
+                    }
+                }
+            });
+        if spawned.is_err() {
+            tracing::warn!("cannot spawn the chorale writer");
+            self.stop_child();
+            return false;
+        }
+        tracing::warn!(part = part.as_str(), piece = %score.name, "chorale: singing");
+        true
+    }
+
+    /// Where in the score to sing. Cheap enough for every tick.
+    pub fn sing_at(&self, beats: f64, singing: bool) {
+        if let Some(live) = self.live.as_ref() {
+            live.set_position(beats, singing);
+        }
+    }
+
+    /// Stop singing: fade out and let the PCM go.
+    pub fn sing_stop(&mut self) {
+        if self.ride != Ride::Singing {
+            return;
+        }
+        if let Some(live) = self.live.take() {
+            live.playing.store(false, Ordering::Relaxed);
+        }
+        self.singing = None;
+        self.ride = Ride::Landing;
+    }
+
+    /// The note a 0..1 closeness plays in this robot's voice, hertz.
+    ///
+    /// The mapping lives with the voice (`sounds::stream::hz_at`) rather than in the
+    /// theremin, because it is a fact about *this duck's register*: a low duck plays low,
+    /// and the playable span is the one its own joy-ride recipe uses.
+    pub fn theremin_hz_at(&mut self, closeness: f64) -> Option<f64> {
+        let personality = self.voice()?;
+        Some(sounds::stream::hz_at(&personality, closeness))
+    }
+
+    /// Open the PCM for a synthesized voice, and keep the child.
+    ///
+    /// A short ALSA buffer, for the same reason as the short lead: everything queued here is time
+    /// between a gesture and its sound, whether the gesture is a hand in front of the beak or a
+    /// beat heard from another duck.
+    fn open_synth_pcm(&mut self) -> Option<std::process::ChildStdin> {
+        let child = Command::new("aplay")
+            .args([
+                "-q",
+                "-D",
+                &self.device,
+                "-t",
+                "raw",
+                "-f",
+                "S16_LE",
+                "-c",
+                "1",
+            ])
+            .args(["-r", &sounds::SR.to_string()])
+            .args(["--buffer-time=40000", "--period-time=10000"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            tracing::debug!("aplay failed; no synthesized voice");
+            return None;
+        };
+        let stdin = child.stdin.take()?;
+        self.child = Some(child);
+        Some(stdin)
+    }
+
+    /// Hand the writer the parameters it should be rendering. Cheap enough for every tick.
+    ///
+    /// Silently ignored when no instrument is in hand, so the loop can call it
+    /// unconditionally rather than mirroring this module's state.
+    pub fn theremin_set(&self, hz: f64, level: f64, open: f64) {
+        if let Some(live) = self.live.as_ref() {
+            live.set(hz, level, open);
+        }
+    }
+
+    /// Put the instrument down: fade the note out, then let the PCM go.
+    ///
+    /// The writer owns the fade, so this returns at once and the child is reaped on a later
+    /// tick by [`Self::theremin_settle`] — the loop has no time to wait for audio.
+    ///
+    pub fn theremin_stop(&mut self) {
+        if self.ride != Ride::Theremin {
+            return;
+        }
+        if let Some(live) = self.live.take() {
+            live.playing.store(false, Ordering::Relaxed);
+        }
+        self.ride = Ride::Landing;
+    }
+
+    /// Reap a faded-out instrument, freeing the PCM for one-shots again.
+    ///
+    /// Called once per tick, which is the only cadence available: the fade happens in the
+    /// writer thread and the loop cannot wait for it. Until this reaps, the PCM is still
+    /// held — which is correct, and is why a quack right after letting go is dropped rather
+    /// than talking over the tail of the note.
+    pub fn theremin_settle(&mut self) {
+        if self.ride == Ride::Landing && self.live.is_none() {
+            self.reap_landing();
+        }
+    }
+
+    /// This robot's voice, for anyone that needs its register or its seed — the chorale casts from
+    /// the first and identifies itself with a byte of the second.
+    pub fn personality(&mut self) -> Option<Personality> {
+        self.voice()
+    }
+
+    /// This robot's voice, from the seed its own bank was rendered with.
+    ///
+    /// The bank's marker rather than the hardware id, and deliberately: the marker is the
+    /// seed the wavs on this disk were made from, so a robot whose bank predates a re-seed
+    /// still has a theremin that matches the quacks it is sitting next to. Falling back to
+    /// the hardware id covers a robot that has a codec but no bank yet.
+    fn voice(&mut self) -> Option<Personality> {
+        if let Some(cached) = self.personality {
+            return cached;
+        }
+        let seed = std::fs::read_to_string(self.bank.join(".seed"))
+            .ok()
+            .and_then(|marker| marker.trim().split(':').next()?.parse::<u32>().ok())
+            .or_else(|| sounds::hardware_seed().ok());
+        let personality = seed.map(Personality::from_seed);
+        self.personality = Some(personality);
+        personality
+    }
+
     /// The ride, level-driven: the loop calls this every tick with what the wheee hold
     /// currently says. The rising edge starts it; the two ways of stopping are different
     /// sounds, which is the whole point of [`WheeeHold`] carrying three states.
     pub fn wheee(&mut self, hold: WheeeHold) {
+        // The theremin is played *with* the trigger held in practice (the same hand is on
+        // the pad), and a ride restarting under a theremin would be an instrument that
+        // stops whenever the player touches anything. The instrument keeps the PCM until
+        // the loop takes it away; the trigger is simply inaudible while it does.
+        if matches!(self.ride, Ride::Theremin | Ride::Singing) {
+            return;
+        }
         match hold {
             // A press during a landing ride supersedes it — `start_wheee` takes the PCM.
             WheeeHold::Held if self.ride != Ride::Riding => self.start_wheee(),

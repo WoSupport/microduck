@@ -82,6 +82,19 @@ const FLOOR_MTU: usize = 20;
 const ADV_INTERVAL_MIN: Duration = Duration::from_millis(100);
 const ADV_INTERVAL_MAX: Duration = Duration::from_millis(150);
 
+/// A task that does not outlive the bring-up that started it.
+///
+/// The advertisement, the GATT application and the agent all deregister on drop, and the chorale's
+/// radio task has to follow the same rule — a task left running against an adapter that is gone
+/// would reconnect to `robotd` forever and advertise on nothing.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// How long to wait between attempts to find a usable adapter.
 ///
 /// Measured on the board: `hci0` does not exist until roughly 73 seconds after power-on —
@@ -261,6 +274,26 @@ async fn serve_on_an_adapter(
     };
     let handle = Some(advertise(&adapter, &advertised).await?);
 
+    // The chorale's radio, on its own connection to `robotd` and its own advertising instance. A
+    // task rather than part of the session loop: it is not serving a client, and it must not be
+    // able to hold up the one thing this daemon exists for. Its failures are its own — a `robotd`
+    // that is not up yet is the ordinary case at boot.
+    let chorale = {
+        let adapter = adapter.clone();
+        let robot_socket = sockets.robot.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = crate::chorale::run(&adapter, &robot_socket).await {
+                    tracing::debug!(error = %e, "chorale: robotd is not answering");
+                }
+                tokio::time::sleep(ADAPTER_RETRY).await;
+            }
+        })
+    };
+    // Aborted when this bring-up ends, so a new adapter gets a new connection rather than one
+    // pointing at a radio that has gone.
+    let _chorale = AbortOnDrop(chorale);
+
     // **One session per subscription**, not one per daemon.
     //
     // The first version kept a single session alive for the whole service, which is simpler and
@@ -318,7 +351,7 @@ async fn serve_on_an_adapter(
                     write: true,
                     // Write-without-response as well: a chunked request needs no ATT
                     // acknowledgement per chunk. A client that wants a *refusal* to be visible
-                    // must use the acknowledged form, which is why `duck-btctl` does.
+                    // must use the acknowledged form, which is why `duckctl` does.
                     write_without_response: true,
                     encrypt_write: require_pairing,
                     // No `.await` between receiving a chunk and enqueueing it. BlueZ dispatches
@@ -534,7 +567,7 @@ impl std::fmt::Display for Advertised {
 ///
 /// - **BlueZ caches it over the advertised name.** `Device1.Name` is what `btleplug` reports, so
 ///   on Linux a robot is `duck-5b21` until the first connection and `radxa-zero3` after it, and
-///   `duck-btctl --name duck-5b21` then finds nothing. Two scans a minute apart disagreed;
+///   `duckctl --name duck-5b21` then finds nothing. Two scans a minute apart disagreed;
 /// - **CoreBluetooth keeps both**, and `btleplug` joins them as `radxa-zero3 [duck-5b21]`;
 /// - **a phone's Bluetooth settings shows the GAP name**, which is the case that matters most and
 ///   the one nothing in this repo could see.
@@ -583,7 +616,7 @@ async fn advertise(
             tracing::warn!(
                 error = %e,
                 "BlueZ refused the advertisement carrying the address; retrying without it, so \
-                 `duck-btctl scan` will show this robot with no address at all"
+                 `duckctl scan` will show this robot with no address at all"
             );
             adapter.advertise(advertisement(None)).await
         }

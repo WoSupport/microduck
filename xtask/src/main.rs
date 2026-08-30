@@ -921,6 +921,206 @@ mod tests {
         }
     }
 
+    /// Every script a hook runs out of the release must be packaged.
+    ///
+    /// The pre-install hook installs what the release needs and cannot have — ONNX Runtime, and the
+    /// GStreamer stack — and for the second it runs `scripts/setup-gstreamer.sh` from the release
+    /// rather than carrying a second copy of the package list, the pinned plugins version and the
+    /// udev rule. A script that is referenced and not packaged makes that step a no-op that says so
+    /// in a log nobody reads, on exactly the boards it exists for: the hook skips it and `mediad`
+    /// then fails to start with a missing plugin.
+    ///
+    /// The same drift `every_unit_install_sh_expects_is_packaged` guards, one directory over.
+    #[test]
+    fn every_script_the_hooks_run_is_packaged() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+
+        let mut scripts: Vec<String> = Vec::new();
+        for hook in ["hooks/preinstall.in", "hooks/postinstall"] {
+            let text =
+                std::fs::read_to_string(root.join(hook)).unwrap_or_else(|e| panic!("{hook}: {e}"));
+            // `script=scripts/<name>` — an assignment, which is how a hook names a path it runs,
+            // rather than every mention of the word in a comment.
+            for line in text.lines() {
+                let Some((_, rest)) = line.split_once("=scripts/") else {
+                    continue;
+                };
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || "._-".contains(*c))
+                    .collect();
+                if !name.is_empty() {
+                    scripts.push(format!("scripts/{name}"));
+                }
+            }
+        }
+        scripts.sort();
+        scripts.dedup();
+        assert!(
+            !scripts.is_empty(),
+            "no scripts/… path found in the hooks; this test is watching nothing"
+        );
+
+        for script in &scripts {
+            assert!(
+                root.join(script).exists(),
+                "a hook runs {script}, which does not exist"
+            );
+            for workflow in PACKAGING_SITES {
+                let text = std::fs::read_to_string(root.join(workflow))
+                    .unwrap_or_else(|e| panic!("{workflow}: {e}"));
+                let expected = format!("={script}");
+                assert!(
+                    text.contains(&expected),
+                    "{workflow} does not package {script}, but a hook runs it. \
+                     Add:  --include \"{script}={script}\""
+                );
+            }
+        }
+    }
+
+    /// `install_*` steps a hook performs too, and where it does it.
+    const ALSO_ON_UPDATE: [(&str, &str); 1] = [(
+        "install_units",
+        "hooks/postinstall installs, enables and starts every unit the release ships. Not the \
+         journald drop-in and not the robotctl symlink, which the hook deliberately leaves alone \
+         — board-test.sh pins that asymmetry, and it is the one thing here §9.1 does not cover",
+    )];
+
+    /// `install_*` steps only a fresh install performs, and why a board that only updates does
+    /// not need them. Each of these is a decision belonging to the board rather than to a
+    /// release, which is the only reason a release may leave it alone.
+    const FIRST_INSTALL_ONLY: [(&str, &str); 3] = [
+        (
+            "install_config",
+            "/etc/robot/*.toml belongs to the board: install.sh will not overwrite an existing \
+             updater.toml, and an update must not either",
+        ),
+        (
+            "install_dev_key",
+            "a trust anchor is the operator's decision. A release that installed trusted keys \
+             would be granting itself trust",
+        ),
+        (
+            "install_token_dropin",
+            "the fetch credential is supplied by whoever runs the install and is never in an \
+             artifact; a customer robot never has one at all",
+        ),
+    ];
+
+    /// Every step `install.sh` performs on a board is performed on an updated board too.
+    ///
+    /// This is the direction `docs/design/updater-design.md` §9.1 is about, and the one nothing
+    /// watched. `every_script_the_hooks_run_is_packaged` above checks that a script a hook
+    /// *already names* ships; it cannot notice a step no hook names at all. That is the mistake,
+    /// four times: units left where systemd never looks, a GStreamer stack only provisioning
+    /// installed, a `setup-npu.sh` packaged beside its model and never called, and a
+    /// `/etc/profile.d` snippet that sat in `install.sh` alone while every board in the fleet
+    /// updated past it. The fourth went unnoticed for a month because it is cosmetic — the
+    /// robot works, the prompt is just wrong — which is the argument for a test rather than for
+    /// a rule people are supposed to remember.
+    ///
+    /// Two halves, because the step can be missing in two shapes: a function `install.sh` runs
+    /// and no hook does, and a shared `setup-*.sh` only `install.sh` calls.
+    ///
+    /// This is a forcing function, not a proof. An author can satisfy it by adding a name to
+    /// `FIRST_INSTALL_ONLY` — but they have to write down why an already-provisioned board does
+    /// not need the thing they just added, and every one of the four would have failed at that
+    /// sentence.
+    #[test]
+    fn every_install_sh_step_reaches_an_updated_board() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        let install = std::fs::read_to_string(root.join("scripts/install.sh"))
+            .expect("scripts/install.sh must exist");
+
+        // ── half one: every `install_*` step is accounted for ──
+        //
+        // Call sites, not definitions: a function that is defined and never called does nothing
+        // to a board. `    install_foo` on a line of its own is how this script calls one.
+        let mut called: Vec<&str> = install
+            .lines()
+            .filter_map(|line| {
+                let name = line.trim();
+                let indented = line.starts_with(' ') || line.starts_with('\t');
+                (indented
+                    && name.starts_with("install_")
+                    && !name.contains(|c: char| !(c.is_ascii_lowercase() || c == '_')))
+                .then_some(name)
+            })
+            .collect();
+        called.sort();
+        called.dedup();
+        assert!(
+            !called.is_empty(),
+            "no install_* call sites found in install.sh; this test is watching nothing"
+        );
+
+        let mut accounted: Vec<&str> = ALSO_ON_UPDATE
+            .iter()
+            .chain(FIRST_INSTALL_ONLY.iter())
+            .map(|(name, _)| *name)
+            .collect();
+        accounted.sort();
+
+        for name in &called {
+            assert!(
+                accounted.contains(name),
+                "install.sh calls {name}, and nothing says whether an already-provisioned board \
+                 ever gets it.\n\
+                 Read docs/design/updater-design.md §9.1. Then either move the step into a \
+                 scripts/setup-*.sh that hooks/postinstall runs too — which is what \
+                 setup-login.sh is — or add {name} to FIRST_INSTALL_ONLY here with the reason a \
+                 board that only updates does not need it."
+            );
+        }
+        for name in &accounted {
+            assert!(
+                called.contains(name),
+                "{name} is listed here but install.sh no longer calls it; drop the entry"
+            );
+        }
+
+        // ── half two: a shared setup script both paths run ──
+        //
+        // `install.sh` runs one out of the installed release, as `current/scripts/setup-x.sh`.
+        // Matching that exact form and not the bare name on purpose: the script also *names*
+        // setup-board.sh in a message telling an operator to go run it, which is not the same
+        // thing as running it.
+        let mut shared: Vec<String> = Vec::new();
+        for (_, rest) in install
+            .split("current/scripts/setup-")
+            .skip(1)
+            .map(|r| ("", r))
+        {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || "._-".contains(*c))
+                .collect();
+            if name.ends_with(".sh") {
+                shared.push(format!("scripts/setup-{name}"));
+            }
+        }
+        shared.sort();
+        shared.dedup();
+
+        let hooks: String = ["hooks/preinstall.in", "hooks/postinstall"]
+            .iter()
+            .map(|h| std::fs::read_to_string(root.join(h)).unwrap_or_else(|e| panic!("{h}: {e}")))
+            .collect();
+        for script in &shared {
+            assert!(
+                hooks.contains(&format!("script={script}")),
+                "install.sh runs {script} out of the release and no hook does. A board that only \
+                 updates never gets it — see docs/design/updater-design.md §9.1. Add \
+                 `script={script}` to hooks/postinstall."
+            );
+        }
+    }
+
     /// Every policy file in `policies/` must be packaged, at every packaging site.
     ///
     /// The `--include` list exists in three copies (the two workflows and `dev-push.sh`), and
@@ -1210,6 +1410,120 @@ mod tests {
         );
     }
 
+    /// `setup-rkaiq.sh` builds an LD_PRELOAD shim from a C file beside it, so the C file has to
+    /// be packaged too.
+    ///
+    /// Not covered by `every_script_the_hooks_run_is_packaged`, which watches `script=scripts/…`
+    /// assignments in the hooks: the shim is not a script anything runs, it is a source file the
+    /// script compiles. Packaged without it, the engine is installed and then segfaults on this
+    /// kernel — which looks like a broken camera rather than a missing file, and the script says
+    /// so and stops rather than guessing.
+    #[test]
+    fn the_rkaiq_shim_travels_with_its_script() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+
+        const SHIM: &str = "scripts/rkaiq-modinfo-shim.c";
+        assert!(root.join(SHIM).exists(), "{SHIM} is missing");
+
+        let script = std::fs::read_to_string(root.join("scripts/setup-rkaiq.sh")).unwrap();
+        assert!(
+            script.contains("rkaiq-modinfo-shim.c"),
+            "setup-rkaiq.sh must name the shim source it builds"
+        );
+
+        for workflow in PACKAGING_SITES {
+            let text = std::fs::read_to_string(root.join(workflow))
+                .unwrap_or_else(|e| panic!("{workflow}: {e}"));
+            assert!(
+                text.contains(&format!("={SHIM}")),
+                "{workflow} packages setup-rkaiq.sh but not {SHIM}, which it cannot run without"
+            );
+        }
+    }
+
+    /// `setup-npu.sh` compiles a device-tree overlay from a .dts beside it, so the .dts has to be
+    /// packaged too.
+    ///
+    /// The same shape as `the_rkaiq_shim_travels_with_its_script`, and not covered by
+    /// `every_script_the_hooks_run_is_packaged` for the same reason: the overlay is not a script
+    /// anything runs, it is a source the script compiles. Packaged without it, the hook installs
+    /// the runtime, cannot find the .dts, and leaves the NPU node disabled — so the detector runs
+    /// on the CPU for ever and the log line saying why is one warning in an update that succeeded.
+    #[test]
+    fn the_npu_overlay_travels_with_its_script() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+
+        const OVERLAY: &str = "deploy/overlays/rk3568-npu-enable.dts";
+        assert!(root.join(OVERLAY).exists(), "{OVERLAY} is missing");
+
+        let script = std::fs::read_to_string(root.join("scripts/setup-npu.sh")).unwrap();
+        assert!(
+            script.contains("rk3568-npu-enable.dts"),
+            "setup-npu.sh must name the overlay source it compiles"
+        );
+
+        for workflow in PACKAGING_SITES {
+            let text = std::fs::read_to_string(root.join(workflow))
+                .unwrap_or_else(|e| panic!("{workflow}: {e}"));
+            assert!(
+                text.contains(&format!("={OVERLAY}")),
+                "{workflow} packages setup-npu.sh but not {OVERLAY}, which it cannot run without"
+            );
+        }
+    }
+
+    /// `setup-npu.sh` pins the NPU runtime, and Cargo.toml pins it too.
+    ///
+    /// Third instance of the same trap — after ONNX Runtime and the GStreamer plugins — and the
+    /// same fix: the script is fetched standalone with `curl` and cannot read Cargo.toml, so it
+    /// carries a literal and this asserts the two agree. A runtime older than the model it is asked
+    /// to load fails at `rknn_init` with a number, which is not a diagnosis.
+    #[test]
+    fn setup_npu_pins_the_same_runtime() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+        let pinned = manifest["workspace"]["metadata"]["rknpu"]["runtime"]
+            .as_str()
+            .unwrap();
+
+        let script = std::fs::read_to_string(root.join("scripts/setup-npu.sh")).unwrap();
+        let expected = format!("RUNTIME=\"{pinned}\"");
+        assert!(
+            script.contains(&expected),
+            "setup-npu.sh must carry the line {expected:?}"
+        );
+    }
+
+    /// Same trap, same shape: `scripts/setup-gstreamer.sh` is fetched standalone with `curl`, so
+    /// it carries a literal plugin version and cannot read Cargo.toml. A drift here is a board
+    /// running plugins nobody can name — which is exactly what building them ourselves, from
+    /// pinned sources, was for.
+    #[test]
+    fn setup_gstreamer_pins_the_same_plugin_version() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+        let meta = &manifest["workspace"]["metadata"]["gst-plugins"];
+        let version = meta["version"].as_str().unwrap();
+        let repo = meta["repo"].as_str().unwrap();
+
+        let script = std::fs::read_to_string(root.join("scripts/setup-gstreamer.sh")).unwrap();
+        for expected in [
+            format!("PLUGINS_VERSION=\"${{PLUGINS_VERSION:-{version}}}\""),
+            format!("PLUGINS_REPO=\"${{PLUGINS_REPO:-{repo}}}\""),
+        ] {
+            assert!(
+                script.contains(&expected),
+                "setup-gstreamer.sh must carry the line {expected:?}"
+            );
+        }
+    }
+
     /// The shipped hook must be fully substituted. A placeholder reaching a board would be
     /// compared against a version number and silently fail every board the same way.
     #[test]
@@ -1292,6 +1606,8 @@ mod tests {
         for name in [
             "setup-board.sh",
             "migrate-network.sh",
+            "setup-gstreamer.sh",
+            "setup-rkaiq.sh",
             "install.sh",
             "provision.sh",
             "provision-board.sh",

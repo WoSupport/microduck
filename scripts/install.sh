@@ -2,7 +2,7 @@
 #
 # Install the robot daemon on a fresh board, from nothing.
 #
-#   curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh | sudo sh
+#   curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck/main/scripts/install.sh | sudo sh
 #
 # Target: 64-bit Debian userland on aarch64 — Armbian 26.2.x on the Radxa Zero 3, and
 # whatever else Debian 12/13 arm64 you point it at. Needs `curl` and coreutils and
@@ -49,7 +49,7 @@ set -eu
 # ── knobs ────────────────────────────────────────────────────────────────────
 
 # The repository releases are published from. Override for a fork or a test repo.
-REPO="${DUCK_REPO:-pollen-robotics/microduck_daemon}"
+REPO="${DUCK_REPO:-pollen-robotics/microduck}"
 
 # Branch the trusted keys are read from. Pin to a tag for a reproducible provisioning run.
 #
@@ -721,8 +721,22 @@ install_units() {
         fi
     done
 
-    install_completions
-    install_login_banner
+    # The login-shell files: the `robotctl` completions, the motd banner, and the robot's name in
+    # the prompt.
+    #
+    # Run from the installed release rather than written here, like the sysusers files above: it is
+    # the copy a signature was checked against, and it is the same file `hooks/postinstall` runs on
+    # every update. That second caller is the point — a step only this script performs reaches no
+    # board that was provisioned before it was written (`docs/design/updater-design.md` §9.1), and
+    # anything added here must go in that script rather than in a function beside this call.
+    setup_login="${INSTALL_DIR}/current/scripts/setup-login.sh"
+    if [ -f "$setup_login" ]; then
+        sh "$setup_login" || warn "the login-shell files did not install; the prompt, the banner
+  and the completions are all cosmetic and the robot is unaffected."
+    else
+        warn "the release carries no scripts/setup-login.sh, so the prompt will not name this
+  robot. The next update installs it."
+    fi
 
     systemctl daemon-reload
     enable_unit updaterd.service
@@ -758,6 +772,23 @@ install_units() {
   The robot works without it — only the gamepad is unavailable."
     fi
 
+    # mediad last of the daemons, since it forwards calls to three of the ones above and its unit
+    # says `After=` them. It is safe to have running with nobody connected — `webrtcsink` listens
+    # and the pipeline sits at PLAYING.
+    #
+    # Allowed to fail like btd and padd, and for a sharper reason than either: it streams the
+    # camera by default (`[media] camera` in robotd.toml) and it needs the GStreamer stack
+    # `setup-gstreamer.sh` installs. A board missing either has no WebRTC gateway and is still a
+    # robot that updates, walks and pairs.
+    if [ -f "${UNIT_DIR}/mediad.service" ]; then
+        enable_unit mediad.service || warn "mediad did not start; check:
+    journalctl -u mediad -b
+  A board with no camera, or provisioned before the GStreamer stack existed, is the usual cause:
+    sudo /usr/local/sbin/robot-setup-gstreamer          # the stack
+    sudo robotctl configure                             # [media] camera off, for no camera
+  The robot works without it — only the camera and the WebRTC console are unavailable."
+    fi
+
     # The boot-time recovery net: three minutes into each boot, ask whether this release brought
     # its daemons up, and fall back to golden if it did not.
     #
@@ -780,6 +811,13 @@ install_units() {
     for unit in $shipped; do
         case "$unit" in
             updaterd.service|robotd.service|configd.service|btd.service|padd.service) ;;
+            mediad.service) ;;
+            # No `enable_unit` of its own, unlike the three above: `postinstall` enabled every
+            # unit carrying an `[Install]` section a step earlier, and nothing depends on this
+            # one — `robotd` does not read depth and `monitor` says "no depth stream" and
+            # carries on. Naming it here is what stops that being reported as a daemon this
+            # script forgot, which is how it read on every fresh install.
+            tofd.service) ;;
             robot-boot-check.timer) ;;
             # Started by its timer, never enabled. See above.
             robot-boot-check.service) ;;
@@ -789,84 +827,6 @@ install_units() {
     done
 }
 
-# Tab-completion for `robotctl`, so an operator on a board they are debugging over a flaky
-# ssh link types `update apply` rather than remembering it.
-#
-# A *loader* rather than a generated snapshot: it asks the live binary for its completions
-# at shell start, so after an update adds a subcommand the completions describe the release
-# now installed, with no reinstall step and nothing for a rollback to leave behind. The cost
-# is one process per interactive bash — the same shape `bash-completion` itself uses for
-# dynamic completers.
-#
-# Written by hand rather than shipped in the artifact for the same reason: the artifact
-# would then have to carry a file whose only content is this indirection.
-# What the robot is running, and whether it is working, printed at every ssh login.
-#
-# This exists because of a specific failure that cost an afternoon: a dev board silently reverted a
-# branch build to the stable release — `updaterd`'s cross-boot health gate, correctly, since a bench
-# board with no servo power can never report healthy — and nothing said so. Every command afterwards
-# ran against code nobody had asked for, and the symptom was a feature that "did not work".
-#
-# So the two facts worth having before typing anything are on screen at login: the release actually
-# live, and whether the last update stuck.
-#
-# An motd drop-in rather than /etc/profile.d: it runs once per ssh login rather than per shell, it is
-# the mechanism the image already uses for this kind of thing, and a slow or broken robotctl there
-# cannot wedge an interactive shell.
-#
-# Exits 0 on every path, always. A banner that fails must never be the reason a login is noisy or
-# slow — that is how people start disabling motd.
-install_login_banner() {
-    if [ ! -d /etc/update-motd.d ]; then
-        # No motd machinery on this image. Not worth building one for a banner.
-        return 0
-    fi
-
-    cat > /etc/update-motd.d/40-robot <<'BANNER'
-#!/bin/sh
-# What this robot is running, and whether it is working. Installed by scripts/install.sh.
-command -v robotctl >/dev/null 2>&1 || exit 0
-
-live="$(readlink /opt/robot/daemon/current 2>/dev/null | sed 's|releases/||')"
-[ -n "$live" ] || exit 0
-
-# First line only: `robotctl health` leads with the whole-robot verdict, and the detail below it
-# belongs to someone who has decided to look.
-verdict="$(robotctl health 2>/dev/null | head -1 | sed 's/^robot *//')"
-[ -n "$verdict" ] || verdict="not answering"
-
-printf '\nrobot   %s — %s\n' "$live" "$verdict"
-
-# The rollback that prompted this banner. Grepped rather than parsed: there is no jq on this image,
-# and the only question is whether the last attempt ended that way.
-if robotctl update status 2>/dev/null | grep -q rolled_back; then
-    printf '        the last update was ROLLED BACK — robotctl update status\n'
-fi
-exit 0
-BANNER
-    chmod 755 /etc/update-motd.d/40-robot
-    say "wrote /etc/update-motd.d/40-robot, so a login says what is running"
-}
-
-install_completions() {
-    if [ ! -d /etc/bash_completion.d ]; then
-        # No bash-completion on this image. Not worth installing a directory nothing reads.
-        return 0
-    fi
-    cat > /etc/bash_completion.d/robotctl <<'EOF'
-# Generated by the robot daemon installer. Asks robotctl for its own completions, so this
-# file never needs regenerating when an update changes the command tree.
-#
-# `eval` rather than `source <(robotctl …)`: process substitution is not reliable in bash
-# 3.2, and stderr is discarded so a rolled-back release that predates `robotctl
-# completions` leaves the shell with no completions rather than a usage error on every
-# login.
-if command -v robotctl >/dev/null 2>&1; then
-    eval "$(robotctl completions bash 2>/dev/null)"
-fi
-EOF
-    chmod 644 /etc/bash_completion.d/robotctl
-}
 
 verify_install() {
     say "verifying"

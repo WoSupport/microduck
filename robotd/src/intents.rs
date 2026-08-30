@@ -15,9 +15,23 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+/// "No mode switch pending" in [`Intents::mode_switch`].
+///
+/// 255 rather than 0, because 0 is a real mode code and a sentinel that collides with a value is
+/// how a "switch to walking" request becomes a no-op.
+pub const MODE_NONE: u8 = u8::MAX;
+
 /// Encodings for [`Intents::power`]. An `AtomicU8` rather than two bools, so "init" and "relax"
 /// cannot both be pending — they are alternatives, and the last one asked for wins.
 const POWER_NONE: u8 = 0;
+
+/// Encodings for [`Intents::theremin`]. An edge rather than a level, and for a concrete
+/// reason: the loop puts the instrument down by itself when the robot starts walking, and a
+/// level slot still reading "up" would pick it straight back up with a background of
+/// somewhere the duck no longer is.
+const THEREMIN_NONE: u8 = 0;
+const THEREMIN_UP: u8 = 1;
+const THEREMIN_DOWN: u8 = 2;
 const POWER_INIT: u8 = 1;
 const POWER_RELAX: u8 = 2;
 use std::time::{Duration, Instant};
@@ -123,11 +137,32 @@ pub struct Intents {
     /// It lives with the intents because this is where the loop reads what clients asked for, and
     /// because the loop is the only thing that may touch the bus — the IPC task cannot do it itself.
     power: AtomicU8,
+    /// A pending pick-up or put-down for the ToF theremin. See [`THEREMIN_NONE`].
+    theremin: AtomicU8,
+    /// The same, for the chorale.
+    chorale: AtomicU8,
+    /// The piece pinned by the pending chorale request, 0 for none. Written before the
+    /// request flag, read after — the flag's swap is the synchronisation point.
+    chorale_piece: AtomicU8,
+    /// Beacons `btd` has heard, waiting for the loop.
+    ///
+    /// A queue behind a mutex rather than an `ArcSwap` slot, unlike every other intent here, and
+    /// for a specific reason: the other intents are *levels*, where a value missed is a value
+    /// superseded. A beacon is an *event* carrying an arrival time, and a beat dropped by
+    /// last-writer-wins is a beat the phase lock never gets to average.
+    chorale_heard: std::sync::Mutex<Vec<duck_ipc_proto::ChoraleHeard>>,
     /// Pending skill requests, a bitmask taken (swapped to zero) once per tick. A mask
     /// rather than one slot so two different buttons in the same tick both arrive.
     skills: std::sync::atomic::AtomicU32,
     /// A shutdown was requested. A level, not an edge: once asked, the sequence runs.
     shutdown: AtomicBool,
+    /// A drive-mode switch was requested, and which mode to switch to.
+    ///
+    /// An `AtomicU8` holding [`MODE_NONE`] or a mode's code, for the same reason `shutdown` is a
+    /// flag: the IPC thread writes and the control loop takes, with nothing to lock. The last
+    /// request wins — two arriving in the same tick means somebody pressed twice, and the second
+    /// answer is the one they are waiting for.
+    mode_switch: AtomicU8,
     /// Pending one-shot sound tags, a bitmask taken once per tick like the skills.
     sounds: std::sync::atomic::AtomicU32,
     /// The wheee hold, as a stamped level: `padd` re-notifies while the trigger is down,
@@ -185,8 +220,13 @@ impl Intents {
             mouth: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
             enabled: AtomicBool::new(false),
             power: AtomicU8::new(POWER_NONE),
+            theremin: AtomicU8::new(THEREMIN_NONE),
+            chorale: AtomicU8::new(THEREMIN_NONE),
+            chorale_piece: AtomicU8::new(0),
+            chorale_heard: std::sync::Mutex::new(Vec::new()),
             skills: std::sync::atomic::AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
+            mode_switch: AtomicU8::new(MODE_NONE),
             sounds: std::sync::atomic::AtomicU32::new(0),
             wheee: ArcSwap::from_pointee(Stamped {
                 value: false,
@@ -301,6 +341,22 @@ impl Intents {
         }
     }
 
+    /// Ask for a drive-mode switch, by the code the caller and the loop agree on.
+    ///
+    /// The code rather than [`Mode`] itself, so this module does not have to know what modes
+    /// exist — `main.rs` owns that mapping and the loop reads it back.
+    pub fn request_mode_switch(&self, code: u8) {
+        self.mode_switch.store(code, Ordering::Relaxed);
+    }
+
+    /// Take a pending mode switch. Taken, so the sequence runs once per request.
+    pub fn take_mode_switch(&self) -> Option<u8> {
+        match self.mode_switch.swap(MODE_NONE, Ordering::Relaxed) {
+            MODE_NONE => None,
+            code => Some(code),
+        }
+    }
+
     /// Ask for the sit-then-power-off sequence.
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
@@ -340,6 +396,66 @@ impl Intents {
     /// Called once per tick by the loop. A later request replaces an unread earlier one, which is
     /// the right resolution: if someone asked to stand up and then to relax within 20 ms, the
     /// second is what they meant.
+    /// Ask for the chorale to start listening (`true`) or stop (`false`), optionally pinning
+    /// which piece this duck picks when it conducts.
+    pub fn request_chorale(&self, active: bool, piece: Option<u8>) {
+        // The pin first, so the loop that consumes the request on its next tick sees it. Piece
+        // ids start at 1, so zero is "no pin".
+        self.chorale_piece
+            .store(piece.unwrap_or(0), Ordering::Relaxed);
+        self.chorale.store(
+            if active { THEREMIN_UP } else { THEREMIN_DOWN },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The pending chorale request, cleared by the read.
+    pub fn take_chorale_request(&self) -> Option<(bool, Option<u8>)> {
+        let piece = match self.chorale_piece.load(Ordering::Relaxed) {
+            0 => None,
+            id => Some(id),
+        };
+        match self.chorale.swap(THEREMIN_NONE, Ordering::Relaxed) {
+            THEREMIN_UP => Some((true, piece)),
+            THEREMIN_DOWN => Some((false, None)),
+            _ => None,
+        }
+    }
+
+    /// A beacon `btd` heard. Queued rather than latched: two ducks' beacons in one tick are two
+    /// observations, and a beat lost to last-writer-wins is a beat the phase lock never sees.
+    pub fn heard_chorale(&self, heard: duck_ipc_proto::ChoraleHeard) {
+        let mut queue = self.chorale_heard.lock().expect("not poisoned");
+        // Bounded: the control loop drains this every tick, so a backlog means the loop is not
+        // running — in which case the newest beacons are the only ones worth having.
+        if queue.len() >= 64 {
+            queue.remove(0);
+        }
+        queue.push(heard);
+    }
+
+    /// Everything heard since the last tick.
+    pub fn take_chorale_heard(&self) -> Vec<duck_ipc_proto::ChoraleHeard> {
+        std::mem::take(&mut *self.chorale_heard.lock().expect("not poisoned"))
+    }
+
+    /// Ask for the theremin to be picked up (`true`) or put down (`false`).
+    pub fn request_theremin(&self, active: bool) {
+        self.theremin.store(
+            if active { THEREMIN_UP } else { THEREMIN_DOWN },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The pending theremin request, cleared by the read.
+    pub fn take_theremin_request(&self) -> Option<bool> {
+        match self.theremin.swap(THEREMIN_NONE, Ordering::Relaxed) {
+            THEREMIN_UP => Some(true),
+            THEREMIN_DOWN => Some(false),
+            _ => None,
+        }
+    }
+
     pub fn take_power_request(&self) -> Option<PowerRequest> {
         match self.power.swap(POWER_NONE, Ordering::Relaxed) {
             POWER_INIT => Some(PowerRequest::Init),

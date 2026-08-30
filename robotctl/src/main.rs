@@ -38,9 +38,11 @@ use std::process::ExitCode;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use duck_ipc_proto as proto;
 
+mod configure;
 mod duck;
 mod monitor;
 mod path_map;
+mod show;
 
 /// Exit codes. Stable — CI asserts on these.
 mod exit {
@@ -134,6 +136,57 @@ enum Namespace {
     /// is generated from its SoC serial, so the one that answers — in a voice that is only
     /// its own — is the one you're SSH'd into.
     Quack,
+
+    /// Sing with other ducks: two in a room start a piece between themselves, and more join.
+    ///
+    /// Starts *listening* — the robot goes on the air saying it is willing and watches for others.
+    /// Nobody is in charge: the lower id conducts, which both ducks work out from the same beacons,
+    /// so there is no election to lose. There is no shared clock either — the conductor's beat
+    /// counter is the timebase.
+    ///
+    /// Refused by a robot whose config has not opted in (`[chorale] accept` in robotd.toml, false
+    /// by default), because a chorale moves the mouth and the head.
+    Chorale {
+        /// Stop and fall silent instead of starting.
+        #[arg(long)]
+        off: bool,
+        /// Pin which piece this robot picks if it ends up conducting. A follower sings what
+        /// the conductor's beacon names regardless, so to guarantee a song set it on every
+        /// duck. Unknown ids are refused with the robot's catalogue.
+        #[arg(long)]
+        piece: Option<u8>,
+    },
+
+    /// Play the duck: the head's depth sensor becomes a theremin, and a hand in front of the
+    /// beak is the pitch — closer is higher, and the mouth opens with the note.
+    ///
+    /// Runs until Ctrl-C, printing what the instrument is doing, and puts it down on the way
+    /// out. An explicit mode with nothing clever inside it: while it is up, the nearest thing
+    /// in the playable band is the hand. Point the duck at open space and it is silent; point
+    /// it at a wall 40 cm away and it plays a steady note.
+    ///
+    /// The readout's last column is what the *sensor* said about the frame — how many zones
+    /// carry a status the robot believes, then the count per status code. That line is the
+    /// answer to every "why did it stop playing".
+    Theremin {
+        /// Put the instrument down instead of picking it up. For a theremin left up by a
+        /// client that went away.
+        #[arg(long)]
+        off: bool,
+    },
+
+    /// Edit robotd's config (/etc/robot/robotd.toml) without reading a wall of comments.
+    ///
+    /// Every key the daemon knows, feature switches first, current value against default, one
+    /// line of doc. SPACE toggles, ENTER edits, u reverts to default. Comments and anything
+    /// this build does not know survive untouched, and nothing is written that robotd's own
+    /// validation would reject. The config is read once at robotd's startup, so saving offers
+    /// a restart. The file is root-owned: run as `sudo robotctl configure` to write.
+    Configure {
+        /// The file to edit. The default is where a provisioned robot keeps it.
+        #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
+        file: PathBuf,
+    },
 
     /// The gamepad. Pair one, see what is paired, forget one.
     ///
@@ -303,8 +356,8 @@ enum RobotCommand {
     /// robot with no walking network can still stand — and it is what the gamepad's Start does on
     /// its way to driving, so running this by hand is for the bench rather than the everyday path.
     ///
-    /// Refused on a fallen robot only when `[safety] fall_limp` or `fall_recover` arms the
-    /// fall gate — by default it works whatever gravity says, as the prototype does.
+    /// Works whatever gravity says — a robot lying on the floor is exactly the one that
+    /// needs it, and being down never refuses anything.
     Init {
         #[arg(long)]
         json: bool,
@@ -392,6 +445,245 @@ fn run_quack(socket: &Path) -> Result<(), Failure> {
     }
     println!("🦆");
     Ok(())
+}
+
+/// Set by the `SIGINT` handler so the theremin is put down on the way out rather than left
+/// sounding. A bare `AtomicBool` store is the only thing a signal handler may safely do.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn note_interrupt(_signal: libc::c_int) {
+    INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `robotctl theremin` — pick the ToF theremin up, watch it, put it down.
+///
+/// A live view rather than a one-shot, because every question anyone has about this feature is
+/// a question about what it is doing *now*: is it seeing my hand, what note is that, and —
+/// the one that matters when it is not working — what is the sensor actually reporting. All
+/// three are in `robot.state`'s theremin block, so this is a subscription with a one-line
+/// renderer over it.
+fn run_theremin(socket: &Path, off: bool) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+
+    let ask = |client: &mut Client, active: bool| -> Result<proto::ThereminResult, Failure> {
+        let result = result_of(client.call(&proto::Call::RobotTheremin(
+            proto::ThereminParams { active },
+        ))?)?;
+        decode(&result)
+    };
+
+    if off {
+        let outcome = ask(&mut client, false)?;
+        if !outcome.accepted {
+            let reason = outcome.reason.unwrap_or_else(|| "refused".to_owned());
+            return Err(Failure::new(exit::REFUSED, reason));
+        }
+        println!("theremin put down");
+        return Ok(());
+    }
+
+    let outcome = ask(&mut client, true)?;
+    if !outcome.accepted {
+        let reason = outcome
+            .reason
+            .unwrap_or_else(|| "the robot refused the theremin".to_owned());
+        return Err(Failure::new(exit::REFUSED, reason));
+    }
+
+    // SAFETY: installing a handler whose whole body is one relaxed atomic store. Done after
+    // the instrument is up, so an interrupt before this point simply kills the process — and
+    // the theremin was not up yet to be left behind.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            note_interrupt as *const () as libc::sighandler_t,
+        );
+    }
+
+    println!("playing — a hand in front of the beak, closer is higher · Ctrl-C to stop");
+    // A second connection for the state stream: the first one is kept to put the instrument
+    // down with, and a subscription is a stream of notifications rather than a call/response,
+    // so sharing one would mean untangling the two.
+    let mut stream = Client::connect_to("robotd", socket)?;
+    stream.hello()?;
+    stream.send(&proto::Request::call(
+        proto::Id::Number(1),
+        &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(15) }),
+    ))?;
+
+    let mut line = String::new();
+    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        line.clear();
+        match stream.reader.read_line(&mut line) {
+            Err(e) => {
+                let _ = ask(&mut client, false);
+                return Err(Failure::new(
+                    exit::UNREACHABLE,
+                    format!("the state stream stopped: {e}"),
+                ));
+            }
+            Ok(0) => break,
+            Ok(_) => {}
+        }
+        let Some(state) = serde_json::from_str::<proto::Request>(&line)
+            .ok()
+            .and_then(|r| r.as_state())
+        else {
+            continue;
+        };
+        // The block is absent while the instrument is down, which after a successful pick-up
+        // means the robot put it down itself.
+        let Some(theremin) = state.theremin else {
+            println!("\rthe robot put the theremin down                                     ");
+            return Ok(());
+        };
+        // One rewritten line: this is a live readout, and a scrolling one would be unreadable
+        // at 15 Hz.
+        let sensor = theremin.sensor.as_deref().unwrap_or("");
+        match (theremin.hand_range_m, theremin.note_hz) {
+            (Some(range), Some(hz)) => print!(
+                "\r  {range:.2} m {:1} {hz:6.1} Hz  {:>3.0}% {:<10}  {sensor:<34}",
+                if theremin.held { "~" } else { " " },
+                theremin.mouth * 100.0,
+                bar(theremin.mouth),
+            ),
+            _ => print!("\r  {:<32}{sensor:<34}", "— no hand —"),
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    println!();
+    let outcome = ask(&mut client, false)?;
+    if outcome.accepted {
+        println!("theremin put down");
+    }
+    Ok(())
+}
+
+/// `robotctl chorale` — go looking for other ducks to sing with, and watch what happens.
+///
+/// A live view for the same reason the theremin's is: every question about this feature is about
+/// what it is doing *now* — has it found anyone, is it conducting or following, what part did it end
+/// up with. All of it is in `robot.state`'s chorale block.
+fn run_chorale(socket: &Path, off: bool, piece: Option<u8>) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+
+    let ask = |client: &mut Client, active: bool| -> Result<proto::ChoraleResult, Failure> {
+        let result = result_of(
+            client.call(&proto::Call::RobotChorale(proto::ChoraleParams {
+                active,
+                piece: piece.filter(|_| active),
+            }))?,
+        )?;
+        decode(&result)
+    };
+
+    if off {
+        let outcome = ask(&mut client, false)?;
+        if !outcome.accepted {
+            let reason = outcome.reason.unwrap_or_else(|| "refused".to_owned());
+            return Err(Failure::new(exit::REFUSED, reason));
+        }
+        println!("chorale stopped");
+        return Ok(());
+    }
+
+    let outcome = ask(&mut client, true)?;
+    if !outcome.accepted {
+        let reason = outcome
+            .reason
+            .unwrap_or_else(|| "the robot refused the chorale".to_owned());
+        return Err(Failure::new(exit::REFUSED, reason));
+    }
+
+    // SAFETY: installing a handler whose whole body is one relaxed atomic store.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            note_interrupt as *const () as libc::sighandler_t,
+        );
+    }
+    println!("listening for other ducks — Ctrl-C to stop");
+
+    let mut stream = Client::connect_to("robotd", socket)?;
+    stream.hello()?;
+    stream.send(&proto::Request::call(
+        proto::Id::Number(1),
+        &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
+    ))?;
+
+    let mut part = None;
+    let mut line = String::new();
+    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        line.clear();
+        match stream.reader.read_line(&mut line) {
+            Err(e) => {
+                let _ = ask(&mut client, false);
+                return Err(Failure::new(
+                    exit::UNREACHABLE,
+                    format!("the state stream stopped: {e}"),
+                ));
+            }
+            Ok(0) => break,
+            Ok(_) => {}
+        }
+        let Some(state) = serde_json::from_str::<proto::Request>(&line)
+            .ok()
+            .and_then(|r| r.as_state())
+        else {
+            continue;
+        };
+        let Some(chorale) = state.chorale else {
+            println!("\rthe robot stopped singing                                    ");
+            return Ok(());
+        };
+        // The part is the news: announce it once rather than in the live line, so "what did this
+        // duck end up singing" survives in the scrollback.
+        if chorale.part != part {
+            part = chorale.part.clone();
+            match &part {
+                Some(part) => println!(
+                    "\r  singing {part:<8} with {} voices          ",
+                    chorale.voices
+                ),
+                None => println!("\r  waiting for company                            "),
+            }
+        }
+        match (chorale.part.as_deref(), chorale.beats) {
+            (Some(part), Some(beats)) => print!(
+                "\r  {part:<8} bar {:>4.0}  beat {:>5.1}  {} voices    ",
+                beats / 4.0 + 1.0,
+                beats,
+                chorale.voices
+            ),
+            // Two different silences, and the difference is the whole diagnosis: "listening"
+            // means no conductor found, "joining" means found one and the phase lock is still
+            // filling — which stuck at "joining" points at beat delivery, not discovery.
+            _ if chorale.joining => {
+                print!(
+                    "\r  joining — locking onto the beat ({} voices)   ",
+                    chorale.voices
+                )
+            }
+            _ => print!("\r  listening — {} ducks in range      ", chorale.voices),
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    println!();
+    if ask(&mut client, false)?.accepted {
+        println!("chorale stopped");
+    }
+    Ok(())
+}
+
+/// A ten-cell meter for the mouth opening — the one part of the readout you can watch
+/// without reading it.
+fn bar(fraction: f64) -> String {
+    let filled = (fraction.clamp(0.0, 1.0) * 10.0).round() as usize;
+    "█".repeat(filled)
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -572,10 +864,35 @@ enum UpdateCommand {
     /// Per-component state.
     Status(StatusArgs),
 
-    /// Recent update attempts and outcomes.
+    /// Recent update attempts and outcomes, one line each, newest first.
+    ///
+    /// The first column is the run number — pass it to `update show` for what that attempt
+    /// actually did.
     Log {
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
+    },
+
+    /// Everything one update run did: phases, timings, the manifest, hook output, restarts.
+    ///
+    /// The question `update log` cannot answer. A log line says an update happened and how it
+    /// ended; this says what it *did*, from the record `updaterd` wrote to `/var/lib` as it went —
+    /// which survives the swap, the rollback, and the power cut a bad update can provoke, none of
+    /// which the journal on this board survives (`/var/log` is zram).
+    ///
+    /// The journal for the same window is appended, scoped to the units the run touched, so the
+    /// account covers the daemons that were restarted and not only `updaterd`'s side of it.
+    Show {
+        /// Which run. Omit for the most recent, which is nearly always the one meant.
+        run: Option<u64>,
+
+        /// Emit the transcript as JSON. No journal is spliced in — that half is a rendering.
+        #[arg(long)]
+        json: bool,
+
+        /// Skip the journal, and print the `journalctl` line instead of running it.
+        #[arg(long)]
+        no_journal: bool,
     },
 
     /// Follow progress until interrupted.
@@ -872,6 +1189,11 @@ struct HealthReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     robot_error: Option<String>,
     software: VersionReport,
+    /// What `mediad` last said about the camera, or `None` — not running, or built before it
+    /// published anything. Absence is not a fault on its own: a board with no camera or no
+    /// GStreamer stack runs no `mediad`, and the units block is where that is reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    camera: Option<proto::CameraStats>,
 }
 
 impl HealthReport {
@@ -906,6 +1228,7 @@ fn run_health(
         robot: None,
         robot_error: None,
         software: collect_version_report(socket, robot_socket, config_socket),
+        camera: proto::read_camera_stats(),
     };
 
     match Client::connect_to("robotd", robot_socket) {
@@ -1059,6 +1382,33 @@ fn render_health(report: &HealthReport) -> String {
         (None, None) => {
             let _ = writeln!(out, "robot     unavailable");
         }
+    }
+
+    // Between the robot verdict and the software block, because it is a fact about the hardware
+    // rather than about which release is installed. Omitted entirely when `mediad` has published
+    // nothing — "camera unknown" on a board with no camera is noise, and a `mediad` that is not
+    // running is already a line in the units block.
+    if let Some(camera) = &report.camera {
+        let rate = if camera.fps >= f64::from(camera.target_fps) * 0.9 {
+            format!("{:.1} fps", camera.fps)
+        } else {
+            // The target is only shown when it is being missed, which is when it matters.
+            format!("{:.1} fps (target {})", camera.fps, camera.target_fps)
+        };
+        let dropped = match camera.dropped {
+            0 => String::new(),
+            n => format!(", {n} dropped"),
+        };
+        let watching = match camera.consumers {
+            0 => "no viewer".to_owned(),
+            1 => "1 viewer".to_owned(),
+            n => format!("{n} viewers"),
+        };
+        let _ = writeln!(
+            out,
+            "camera    {rate}, {}x{} {}{dropped} — {watching}",
+            camera.width, camera.height, camera.format
+        );
     }
 
     let _ = writeln!(out, "\nsoftware");
@@ -2496,6 +2846,15 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);
         }
+        Namespace::Theremin { off } => {
+            return run_theremin(&cli.robot_socket, off);
+        }
+        Namespace::Chorale { off, piece } => {
+            return run_chorale(&cli.robot_socket, off, piece);
+        }
+        Namespace::Configure { file } => {
+            return configure::run(&file).map_err(|e| Failure::new(exit::FAILED, e));
+        }
         Namespace::Update { command } => command,
     };
 
@@ -2546,6 +2905,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }),
         UpdateCommand::Status(_) => proto::Call::Status,
         UpdateCommand::Log { limit } => proto::Call::Log(proto::LogParams { limit: *limit }),
+        UpdateCommand::Show { run, .. } => proto::Call::Show(proto::ShowParams { run: *run }),
         // Streams until interrupted, so it never reaches the single-response path below.
         UpdateCommand::Watch => return watch(&mut client),
     };
@@ -2623,14 +2983,95 @@ fn print_result(command: &UpdateCommand, result: serde_json::Value) {
             match serde_json::from_value::<Vec<proto::LogEntry>>(result.clone()) {
                 Err(_) => json(&result),
                 Ok(entries) => {
+                    // Was one compact JSON object per line, which is what a diagnostic command
+                    // prints when it cannot parse what it got — not what it should print when it
+                    // can. The same entries have rendered as prose in `robotctl health` for as
+                    // long as that command has existed.
                     for entry in entries {
-                        println!("{}", compact(&entry));
+                        println!("{}", show::log_line(&entry));
                     }
+                }
+            }
+        }
+        UpdateCommand::Show { json: true, .. } => json(&result),
+        UpdateCommand::Show { no_journal, .. } => {
+            match serde_json::from_value::<proto::RunTranscript>(result.clone()) {
+                Err(_) => json(&result),
+                Ok(transcript) => {
+                    print!("{}", show::render(&transcript));
+                    print!("{}", journal_for(&transcript, *no_journal));
                 }
             }
         }
         _ => json(&result),
     }
+}
+
+/// The journal for a run's window, spliced under its transcript.
+///
+/// **Run here rather than served by `updaterd`.** Reading the system journal is a privilege the
+/// daemon has and should not lend out over a socket whose read side is deliberately ungated, and
+/// `robotctl` is where every other shell-out in this binary already lives. The cost is that an
+/// operator who is not in `systemd-journal` gets nothing back — so that case prints the command
+/// rather than an empty heading, and `sudo` in front of it is the whole fix.
+fn journal_for(transcript: &proto::RunTranscript, skip: bool) -> String {
+    let Some((since, until)) = show::window(transcript) else {
+        return String::new();
+    };
+    let argv = show::journal_command(since, until, &show::units(transcript));
+    let printed = argv.join(" ");
+
+    let mut out = format!(
+        "\n  ── journal · {} to {} UTC ──\n",
+        show::full_stamp(since),
+        show::full_stamp(until)
+    );
+
+    if skip {
+        out.push_str(&format!("  {printed}\n"));
+        return out;
+    }
+
+    let captured = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .output();
+    let text = match captured {
+        Ok(done) if done.status.success() => String::from_utf8_lossy(&done.stdout).into_owned(),
+        // A journal that cannot be read is not an error worth failing the command over: the
+        // transcript above it is the durable half and is already printed. What this owes the
+        // reader is the command, so the missing half is one `sudo` away.
+        Ok(done) => {
+            let why = String::from_utf8_lossy(&done.stderr);
+            out.push_str(&format!("  could not be read: {}\n", why.trim()));
+            out.push_str(&format!("  {printed}\n"));
+            return out;
+        }
+        Err(e) => {
+            out.push_str(&format!("  could not run journalctl: {e}\n"));
+            out.push_str(&format!("  {printed}\n"));
+            return out;
+        }
+    };
+
+    // journalctl exits 0 and says "-- No entries --" both for a window with nothing in it and for
+    // a caller who may not read system logs, and those need different advice. Neither is an error.
+    // Hook output is dropped here because the transcript above carries it in full — see
+    // `show::ALREADY_IN_THE_TRANSCRIPT`.
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| show::worth_splicing(line))
+        .collect();
+    if lines.is_empty() {
+        out.push_str(
+            "  nothing, which on this board usually means no permission to read system logs \n               rather than an update that logged nothing. Try it directly:\n",
+        );
+        out.push_str(&format!("  sudo {printed}\n"));
+        return out;
+    }
+    for line in lines {
+        out.push_str(&format!("  {line}\n"));
+    }
+    out
 }
 
 fn compact(value: &impl serde::Serialize) -> String {
@@ -3046,7 +3487,65 @@ mod tests {
             robot,
             robot_error: robot_error.map(str::to_owned),
             software: report(vec![service("robotd", "0.2.0")], Some("0.2.0")),
+            camera: None,
         }
+    }
+
+    fn camera_stats(fps: f64, dropped: u64, consumers: u32) -> proto::CameraStats {
+        proto::CameraStats {
+            fps,
+            target_fps: 30,
+            width: 1280,
+            height: 720,
+            format: "UYVY".into(),
+            frames: 900,
+            dropped,
+            consumers,
+        }
+    }
+
+    /// A camera meeting its target says so without repeating the target back, and says how many
+    /// people are watching — zero being the normal answer, since nothing encodes until a peer
+    /// connects.
+    #[test]
+    fn health_renders_a_working_camera() {
+        let mut report = health_report(None, Some("robotd is down"));
+        report.camera = Some(camera_stats(29.3, 0, 0));
+        let out = render_health(&report);
+
+        assert!(
+            out.contains("camera    29.3 fps, 1280x720 UYVY — no viewer"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("target"),
+            "a healthy rate should not restate its target: {out}"
+        );
+        assert!(
+            !out.contains("dropped"),
+            "no drops should print no drop clause: {out}"
+        );
+    }
+
+    /// Below target, the target appears — that is the comparison a reader needs — and dropped
+    /// frames are named. Both were invisible for an afternoon of this project's history.
+    #[test]
+    fn health_renders_a_degraded_camera() {
+        let mut report = health_report(None, None);
+        report.camera = Some(camera_stats(19.6, 412, 2));
+        let out = render_health(&report);
+
+        assert!(
+            out.contains("camera    19.6 fps (target 30), 1280x720 UYVY, 412 dropped — 2 viewers"),
+            "{out}"
+        );
+    }
+
+    /// No `mediad`, no line. A robot that has never started it should not read as having a fault.
+    #[test]
+    fn health_omits_the_camera_when_mediad_published_nothing() {
+        let out = render_health(&health_report(None, Some("robotd is down")));
+        assert!(!out.contains("camera"), "{out}");
     }
 
     /// A working robot, rendered whole: every section present, one line each.
@@ -3348,6 +3847,7 @@ mod tests {
             from: Some(semver::Version::new(0, 1, 9)),
             to: Some(semver::Version::new(0, 2, 0)),
             outcome,
+            run: None,
         };
 
         assert_eq!(

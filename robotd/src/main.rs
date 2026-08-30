@@ -1,39 +1,41 @@
 //! `robotd` — the robot control daemon.
 //!
-//! **Slice 1** (`docs/design/robotd-design.md` §4): a control loop that drives the real bus at the
-//! real rate and holds the pose it started in. No observations, no policy, no intents.
+//! The 50 Hz control loop, the `robot.*` socket, and the health the updater gates on
+//! (`docs/design/robotd-design.md` §1.4, §3.4).
 //!
-//! It is not walking yet because that is not what it is for yet. The update engine is
-//! finished and has never run on hardware, and its auto-rollback is only meaningful if
-//! `robot.health` means something — today it means "the loop ticked once", so every
-//! rollback tested so far tested a placeholder. Slice 1 makes health honest: **the loop is
-//! meeting its deadline**. A loop running at 60% of target is alive, answers every request,
-//! and is badly broken.
+//! **Health is why the daemon has the shape it does.** The updater's auto-rollback is only
+//! meaningful if `robot.health` means something, and it used to mean "the loop ticked once" —
+//! so every rollback was tested against a placeholder. It now means **the loop is meeting its
+//! deadline**: a loop running at 60% of target is alive, answers every request, and is badly
+//! broken.
 //!
-//! Holding a pose is also the right thing to be doing while someone deliberately breaks
-//! releases at a bench: the bus sees the real load at the real rate, and nothing falls over
-//! when a bad build lands.
+//! Holding the pose with no policy (`policy.enabled = false`) stays the right thing to be doing
+//! while someone deliberately breaks releases at a bench: the bus sees the real load at the
+//! real rate, and nothing falls over when a bad build lands.
 //!
-//! Every one of the four methods must be answerable *while the robot is in a bad state*,
+//! Every method must be answerable *while the robot is in a bad state*,
 //! since that is exactly when it is asked. So the IPC side reads atomics the control loop
 //! publishes and never calls into the loop — a wedged loop reports itself unhealthy rather
 //! than hanging the caller.
 
+mod chorale;
 mod control;
 mod intents;
 mod maploc;
 mod params;
 mod soc;
 mod sound;
+mod theremin;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use clap::{Parser, Subcommand};
+use duck_control::fall::{FallPredictor, FallPredictorConfig};
 use duck_control::io::RobotIo;
 use duck_control::obs::{BodyPose, Command as PolicyCommand};
 use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy, PolicyPaths};
@@ -65,6 +67,12 @@ const MAX_LINE: usize = 64 * 1024;
 /// Per-tick logging would be ~4.3M lines a day at 50 Hz. That is not merely noise: under a
 /// journal size cap it is what *evicts* the logs support needs.
 const LOOP_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// How fast the beak follows the vowel being sung, as a time constant.
+///
+/// A vowel is a step — `ah` opens the mouth to 0.90 and `mm` to 0.02 — and a servo asked to jump
+/// between them on a 20 ms tick twitches rather than sings. This is roughly how fast a jaw moves.
+const CHORALE_MOUTH_TAU_S: f64 = 0.09;
 
 /// How far a subscriber may fall behind before it starts losing frames.
 ///
@@ -117,29 +125,81 @@ const COAST_TICKS: u32 = 3;
 /// the very jolt it exists to prevent.
 const RESET_AFTER_PAUSE: Duration = Duration::from_millis(200);
 
-/// Fall recovery (`[safety] fall_recover`): the limp settle before the standing network
-/// engages, the stricter gravity threshold that counts as solidly upright, and how long it
-/// must hold. All three are the prototype's numbers.
-const RECOVERY_LIMP: Duration = Duration::from_millis(300);
-const RECOVERY_UPRIGHT_Z: f64 = -0.85;
-const RECOVERY_UPRIGHT_HOLD: Duration = Duration::from_secs(1);
-
 /// Mean leg-joint deviation from the home pose above which a boot counts as seated —
 /// hips and knees folded far from standing. The prototype's threshold.
 const SEATED_BOOT_RAD: f64 = 0.30;
 
-/// Where fall recovery is in its limp-then-stand sequence.
+/// Where the limp-fall sequence is (`[safety] limp_fall`).
+///
+/// The daemon's only answer to a fall, and it runs *during* one rather than after it: the
+/// trigger is [`duck_control::fall::FallPredictor`], not the `fallen` verdict, because a
+/// verdict that waits for the robot to be down cannot make it soft before it lands.
+///
+/// The verdict is still tracked and published throughout — it just does not gate anything.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Recovery {
+enum LimpFall {
     Idle,
-    /// Settling at limp gain before the stand-up engages.
+    /// Gains at `gain_limp`, joints commanded to wherever they already are — the softest
+    /// thing the servos can do short of cutting torque, which would drop the head on the
+    /// floor and lose the pose the next phase ramps from.
     Limp {
         since: Instant,
+        landing: Landing,
     },
-    /// The standing network is driving a robot gravity may still call fallen.
-    Rising {
-        upright_for: Duration,
+    /// Ramping from where the robot landed back to the standing pose, so the standing
+    /// policy starts from the still, known posture it stands up from cleanly.
+    Posing {
+        from: [f64; NUM_JOINTS],
+        since: Instant,
     },
+}
+
+/// Watching a limping robot for the moment it stops moving.
+///
+/// The end of the limp is read from the gyro rather than timed, because the falls are not
+/// all the same length: a stumble is over in a few hundred milliseconds and a topple off a
+/// table takes most of a second, and ending the limp early is landing stiff after all.
+/// Debounced, because a tumbling robot passes through instants of near-zero rate on its
+/// way over — one quiet sample is not a landing.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct Landing {
+    still_for: Duration,
+}
+
+impl Landing {
+    /// One tick. `rate` is the gyro magnitude in rad/s, or `None` for a tick with no fresh
+    /// sample — which resets rather than accumulates: a robot nobody can read is not a
+    /// robot anybody has seen go still.
+    fn observe(&mut self, rate: Option<f64>, period: Duration, below: f64, held: Duration) -> bool {
+        self.still_for = match rate {
+            Some(rate) if rate < below => self.still_for.saturating_add(period),
+            _ => Duration::ZERO,
+        };
+        self.still_for >= held
+    }
+}
+
+impl LimpFall {
+    /// The interpolated pose target for this tick, or `None` once the ramp is done.
+    ///
+    /// The same linear shape as [`Bringup::homing_target`], and separate from it on
+    /// purpose: that ramp is bring-up from limp at the policy gain over a fixed two
+    /// seconds, this one is a landed robot being put back into shape, and both its
+    /// duration and its gain are tunable because both depend on how the robot lands.
+    fn pose_target(&self, now: Instant, over: Duration) -> Option<[f64; NUM_JOINTS]> {
+        let LimpFall::Posing { from, since } = self else {
+            return None;
+        };
+        let t = now.duration_since(*since).as_secs_f64() / over.as_secs_f64();
+        if t >= 1.0 {
+            return None;
+        }
+        let mut target = [0.0; NUM_JOINTS];
+        for (i, slot) in target.iter_mut().enumerate() {
+            *slot = from[i] + (DEFAULT_POSITION[i] - from[i]) * t;
+        }
+        Some(target)
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -218,6 +278,61 @@ fn parse_duration(raw: &str) -> Result<Duration, String> {
 /// control loop. A robot whose loop is wedged still has to be able to say "I am not
 /// healthy" — if answering required the loop's lock, the one situation where `updaterd`
 /// needs an answer is the situation it would hang in.
+/// [`Mode`] as the byte [`RobotState::mode`] holds, and back.
+///
+/// Two tiny functions rather than a numeric cast, so the mapping is written down once: a mode
+/// added later gets a code here and nowhere else, and an unknown byte reads as walking rather
+/// than panicking on the IPC thread.
+fn mode_code(mode: Mode) -> u8 {
+    match mode {
+        Mode::Walk => 0,
+        Mode::Roller => 1,
+    }
+}
+
+fn mode_of(code: u8) -> Mode {
+    match code {
+        1 => Mode::Roller,
+        _ => Mode::Walk,
+    }
+}
+
+/// The policy file names for one mode, as a set.
+///
+/// `None` in a skill slot doubles as "this robot cannot do that", which is what lets `dispatch`
+/// refuse a `robot.do` for a skill this mode has no network for instead of queueing a request the
+/// loop will drop — and roller mode is exactly that case: no standing network, a crouch where the
+/// ground pick was.
+#[derive(Debug, Clone, Default)]
+struct PolicyNames {
+    walk: Option<String>,
+    stand: Option<String>,
+    sitstand: Option<String>,
+    ground_pick: Option<String>,
+    kick_left: Option<String>,
+    kick_right: Option<String>,
+    roulade: Option<String>,
+}
+
+impl PolicyNames {
+    /// The names for `policy`, or all-`None` when no policy is wanted.
+    fn of(policy: &params::ResolvedPolicy) -> Self {
+        if !policy.enabled {
+            return Self::default();
+        }
+        let name = |path: &Option<std::path::PathBuf>| path.as_deref().and_then(file_name);
+        Self {
+            walk: file_name(&policy.walk),
+            stand: name(&policy.stand),
+            sitstand: name(&policy.sitstand),
+            ground_pick: name(&policy.ground_pick),
+            kick_left: name(&policy.kick_left),
+            kick_right: name(&policy.kick_right),
+            roulade: name(&policy.roulade),
+        }
+    }
+}
+
 struct RobotState {
     /// Epoch for every timestamp below. `Instant` so the clock cannot go backwards.
     started: Instant,
@@ -270,39 +385,51 @@ struct RobotState {
     /// What `robot.map`'s answer says about this robot's mapping.
     maploc_enabled: bool,
     maploc_mode: &'static str,
+    /// What `btd` should be advertising, published when it changes.
+    ///
+    /// A broadcast channel like the state stream, and for the same reason: `btd` subscribes, and a
+    /// `robotd` with nobody subscribed must not be blocked by that. Small buffer — a subscriber
+    /// that has fallen behind on beacons wants the newest one, not a backlog of beats that have
+    /// already passed.
+    chorale_tx: tokio::sync::broadcast::Sender<proto::ChoraleAdvertise>,
     /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
     /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
     policy_error: ArcSwapOption<String>,
-    /// Which policy files this process was configured with, as file names. `None` when the
-    /// policy is disabled.
+    /// Which policy files this process is running, as file names. `None` when the policy is
+    /// disabled.
     ///
     /// From the params rather than from the loaded network, and therefore known before the
     /// control thread has finished loading anything — a client that subscribes during startup
     /// gets the answer rather than a race. What *failed* to load is `policy_error`; this is
     /// what was asked for, and the pair is what distinguishes "no policy wanted" from "the
     /// policy this release ships would not load".
-    policy_walk: Option<String>,
-    policy_stand: Option<String>,
-    /// The skill networks, same provenance. `None` doubles as "this robot cannot do that",
-    /// which is what lets `dispatch` refuse a `robot.do` for a skill that was never
-    /// configured instead of queueing a request the loop will drop.
-    policy_sitstand: Option<String>,
-    policy_ground_pick: Option<String>,
-    policy_kick_left: Option<String>,
-    policy_kick_right: Option<String>,
-    policy_roulade: Option<String>,
+    ///
+    /// **One swap for the whole set rather than seven fields**, because a mode switch replaces
+    /// all of them at once: a reader that caught `walk` from roller beside `stand` from walking
+    /// would be told about a robot that does not exist. Swapped by the control loop, which is
+    /// the only thing that loads a policy.
+    policies: ArcSwap<PolicyNames>,
     /// Whether this robot can make a sound at all: audio enabled, and a bank with wavs in
     /// it. Same job as the `policy_*` fields above — false is "this robot cannot do that",
     /// which is what lets `dispatch` refuse a `robot.sound` with a reason instead of
     /// accepting it into silence. Read once at startup, like the policies: the postinstall
     /// renders the bank and restarts robotd, so a bank cannot appear under a running one.
     has_voice: bool,
-    /// `walk` or `roller` — constant for the life of the process; `robot.mode` reports it.
-    mode: &'static str,
-    /// Whether a fall preempts anything (`fall_limp` or `fall_recover`). When false —
-    /// the default, the prototype's behaviour — `fallen` is a report, not a wall, and
-    /// none of the `robot.*` calls refuse for it.
-    fall_gate: bool,
+    /// Whether a theremin can be picked up: the params allow one, and the depth stream is
+    /// actually delivering frames. Published by the loop rather than read once at startup,
+    /// because unlike a voice bank the sensor comes and goes — `tofd` restarts, the ToF
+    /// drops off the I²C bus — and an accepted theremin on a duck with no depth is a
+    /// feature that silently does nothing.
+    theremin_ready: AtomicBool,
+    /// Whether this robot's config allows it to sing with others. Read once at startup, like the
+    /// policies: `[chorale] accept`, false by default.
+    chorale_accepted: bool,
+    /// `walk` or `roller`, as `robot.mode` reports it.
+    ///
+    /// Not constant any more: `robot.setMode` switches it while the robot runs, so this is stored
+    /// rather than read from the params it started as. An `AtomicU8` over [`Mode`] because it is
+    /// read on the IPC side and written by the control loop, and there is nothing to allocate.
+    mode: AtomicU8,
     /// Published by the loop so the IPC side can answer without consulting it.
     fallen: AtomicBool,
     /// The policy is driving and has been asked for a non-zero velocity.
@@ -349,20 +476,13 @@ impl RobotState {
                 crate::params::MaplocMode::StopAndScan => "stop_and_scan",
                 crate::params::MaplocMode::Continuous => "continuous",
             },
+            chorale_tx: tokio::sync::broadcast::Sender::new(8),
             policy_error: ArcSwapOption::empty(),
-            policy_walk: {
-                let policy = params.policy.resolved();
-                policy.enabled.then(|| file_name(&policy.walk)).flatten()
-            },
-            policy_stand: named_policy(params, |p| p.stand.clone()),
-            policy_sitstand: named_policy(params, |p| p.sitstand.clone()),
-            policy_ground_pick: named_policy(params, |p| p.ground_pick.clone()),
-            policy_kick_left: named_policy(params, |p| p.kick_left.clone()),
-            policy_kick_right: named_policy(params, |p| p.kick_right.clone()),
-            policy_roulade: named_policy(params, |p| p.roulade.clone()),
+            policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
-            mode: params.policy.mode.as_str(),
-            fall_gate: params.safety.fall_limp || params.safety.fall_recover,
+            theremin_ready: AtomicBool::new(false),
+            chorale_accepted: params.chorale.accept,
+            mode: AtomicU8::new(mode_code(params.policy.mode)),
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
             homed: AtomicBool::new(false),
@@ -946,60 +1066,25 @@ async fn adopt_startup_pose<T: RobotIo>(
 /// back. The alternative — refusing to start — becomes a crashloop under
 /// `Restart=always` and reaches the health gate as `Unreachable`, which blames the wrong
 /// thing in the journal.
-async fn control_loop<T: RobotIo>(
-    io: T,
-    state: Arc<RobotState>,
-    intents: Arc<Intents>,
-    params: Params,
-    period: Duration,
-    poweroff: PowerOff,
-) {
-    let policy_cfg = params.policy.resolved();
-    // Whether a fall preempts anything. Mirrors `RobotState::fall_gate` for the loop's own
-    // gates — with it off, `fallen` is a report in the state stream and nothing more.
-    let fall_gate = params.safety.fall_limp || params.safety.fall_recover;
-    let mut safety = Safety::new(
-        io,
-        SafetyConfig {
-            fall_gravity_z: params.safety.fall_gravity_z,
-            fall_debounce: Duration::from_millis(params.safety.fall_debounce_ms),
-            deadman: Duration::from_millis(params.safety.deadman_ms),
-            gain_running: policy_cfg.gain,
-            gain_limp: params.safety.gain_limp,
-            // Recovery cannot work without the limp settle, so it implies the gate.
-            fall_limp: params.safety.fall_limp || params.safety.fall_recover,
-        },
-    );
-
-    let Some(mut hold) = adopt_startup_pose(&mut safety, &state, period).await else {
-        return;
-    };
-
-    // Was the robot powered on already sitting? A seated duck has hips and knees folded
-    // far from the standing pose. If so, the first bring-up rises via the sitstand network
-    // instead of dragging the legs through the linear ramp — the ramp is for a robot that
-    // is roughly standing.
-    const LEG_JOINTS: [usize; 10] = [0, 1, 2, 3, 4, 10, 11, 12, 13, 14];
-    let leg_deviation = LEG_JOINTS
-        .iter()
-        .map(|&j| (hold[j] - DEFAULT_POSITION[j]).abs())
-        .sum::<f64>()
-        / LEG_JOINTS.len() as f64;
-    let mut seated_boot = leg_deviation > SEATED_BOOT_RAD;
-    if seated_boot {
-        tracing::warn!(
-            deviation = format!("{leg_deviation:.2}"),
-            "seated boot detected — will stand up via the sitstand policy"
-        );
-    }
-
-    // A policy that was *not wanted* is healthy; one that was wanted and could not be
-    // loaded is not. Collapsing those two would either make a bench robot look broken or
-    // let a release with an unusable bundle pass the health gate.
-    let mut controller = if !policy_cfg.enabled {
+/// Load one mode's policy bundle, or `None` when there is nothing to load.
+///
+/// A function rather than a block inline in the loop's preamble, because it runs twice: once at
+/// startup, and again on every `robot.setMode` — which is a mode's whole difference, since the
+/// networks and the tuning are all a mode *is* by the time params are resolved.
+///
+/// A policy that was *not wanted* is healthy; one that was wanted and could not be loaded is not.
+/// Collapsing those two would either make a bench robot look broken or let a release with an
+/// unusable bundle pass the health gate.
+fn build_controller(
+    policy_cfg: &params::ResolvedPolicy,
+    limp_fall: bool,
+    state: &RobotState,
+) -> Option<Controller> {
+    if !policy_cfg.enabled {
         tracing::warn!("policy disabled; holding the startup pose");
-        None
-    } else {
+        return None;
+    }
+    {
         let tuning = Tuning {
             action_scale: policy_cfg.action_scale,
             standing_action_scale: policy_cfg.standing_action_scale,
@@ -1028,10 +1113,10 @@ async fn control_loop<T: RobotIo>(
         };
         match Policy::load(&paths, DEFAULT_STANDING_THRESHOLD) {
             Ok(mut policy) => {
-                // Roller mode has no standing network; fall recovery reserves it for
-                // getting up (and body pose). Either way, command magnitude stops
-                // selecting it.
-                if policy_cfg.mode == Mode::Roller || params.safety.fall_recover {
+                // Roller mode has no standing network — command magnitude stops selecting
+                // it. Nothing else reserves it: limp-fall hands back by *letting* the
+                // standing network be selected, which is what stands the robot up.
+                if policy_cfg.mode == Mode::Roller {
                     policy.set_standing_disabled(true);
                 }
                 tracing::warn!(
@@ -1042,7 +1127,7 @@ async fn control_loop<T: RobotIo>(
                     ground_pick = ?policy_cfg.ground_pick.as_ref().map(|p| p.display().to_string()),
                     kicks = policy_cfg.kick_left.is_some() || policy_cfg.kick_right.is_some(),
                     roulade = ?policy_cfg.roulade.as_ref().map(|p| p.display().to_string()),
-                    fall_recover = params.safety.fall_recover,
+                    limp_fall,
                     "policy loaded"
                 );
                 Some(Controller::new(policy, tuning, skills))
@@ -1053,7 +1138,55 @@ async fn control_loop<T: RobotIo>(
                 None
             }
         }
+    }
+}
+
+async fn control_loop<T: RobotIo>(
+    io: T,
+    state: Arc<RobotState>,
+    intents: Arc<Intents>,
+    params: Params,
+    period: Duration,
+    poweroff: PowerOff,
+) {
+    // `mut` because a mode switch replaces it: the resolved policy *is* the mode, once the
+    // per-mode defaults have been applied.
+    let mut policy_cfg = params.policy.resolved();
+    let mut safety = Safety::new(
+        io,
+        SafetyConfig {
+            fall_gravity_z: params.safety.fall_gravity_z,
+            fall_debounce: Duration::from_millis(params.safety.fall_debounce_ms),
+            deadman: Duration::from_millis(params.safety.deadman_ms),
+            gain_running: policy_cfg.gain,
+            gain_limp: params.safety.gain_limp,
+        },
+    );
+
+    let Some(mut hold) = adopt_startup_pose(&mut safety, &state, period).await else {
+        return;
     };
+
+    // Was the robot powered on already sitting? A seated duck has hips and knees folded
+    // far from the standing pose. If so, the first bring-up rises via the sitstand network
+    // instead of dragging the legs through the linear ramp — the ramp is for a robot that
+    // is roughly standing.
+    const LEG_JOINTS: [usize; 10] = [0, 1, 2, 3, 4, 10, 11, 12, 13, 14];
+    let leg_deviation = LEG_JOINTS
+        .iter()
+        .map(|&j| (hold[j] - DEFAULT_POSITION[j]).abs())
+        .sum::<f64>()
+        / LEG_JOINTS.len() as f64;
+    let mut seated_boot = leg_deviation > SEATED_BOOT_RAD;
+    if seated_boot {
+        tracing::warn!(
+            deviation = format!("{leg_deviation:.2}"),
+            "seated boot detected — will stand up via the sitstand policy"
+        );
+    }
+
+    // Loaded once here and again on a mode switch — see `build_controller`.
+    let mut controller = build_controller(&policy_cfg, params.safety.limp_fall, &state);
 
     tracing::warn!(
         joints = NUM_JOINTS,
@@ -1084,6 +1217,12 @@ async fn control_loop<T: RobotIo>(
     let mut last_summary = Instant::now();
     let mut was_driving = false;
     let mut bringup = Bringup::Limp;
+    // A mode switch in flight: the mode to end up in, once the robot is home. `None` the rest of
+    // the time, which is nearly always.
+    let mut mode_change: Option<Mode> = None;
+    // The policy params this loop is running, which a mode switch replaces. Owned rather than
+    // borrowed from `params` because the mode is no longer what the file said.
+    let mut policy_params = params.policy.clone();
 
     // Command smoothing, per the prototype: `cmd += α × (target − cmd)` at the tick rate.
     // A stick snap becomes a ramp the gait can follow; the state lives here because it is
@@ -1125,11 +1264,26 @@ async fn control_loop<T: RobotIo>(
         host
     });
 
-    // The sit-then-power-off sequence, and fall recovery.
+    // The sit-then-power-off sequence.
     let mut shutdown_sit: Option<Instant> = None;
     let mut powered_off = false;
-    let mut recovery = Recovery::Idle;
     let mut warned_imu_warming = false;
+
+    // Limp-fall (`[safety] limp_fall`): the predictor that sees a fall start, and where the
+    // sequence it drives has got to. Built whether or not the mode is on — it costs a
+    // multiply-subtract per tick, and having the numbers computed on every robot is what
+    // makes the thresholds tunable against a recording from a robot that was not running
+    // the mode.
+    let mut falling = FallPredictor::new(FallPredictorConfig {
+        tilt_z: params.safety.limp_fall_tilt_z,
+        predicted_z: params.safety.limp_fall_predict_z,
+        lookahead: Duration::from_millis(params.safety.limp_fall_lookahead_ms),
+        debounce: Duration::from_millis(params.safety.limp_fall_debounce_ms),
+    });
+    let limp_fall_still = Duration::from_millis(params.safety.limp_fall_still_ms);
+    let limp_fall_max = Duration::from_millis(params.safety.limp_fall_max_ms);
+    let limp_fall_pose = Duration::from_millis(params.safety.limp_fall_pose_ms);
+    let mut limp_fall = LimpFall::Idle;
 
     // The voice, and the ear. Both optional equipment: a robot without a codec or a bank
     // walks identically — the player degrades to a debug line, and the mic worker is only
@@ -1166,9 +1320,52 @@ async fn control_loop<T: RobotIo>(
         None
     };
 
+    // The theremin. Its depth reader starts now and parks on `tofd`'s socket whether or not
+    // anyone ever asks for an instrument: one blocked read costs nothing, and connecting
+    // lazily would make the first arming window wait for a connection as well as for
+    // frames — a second of silence that reads as a broken feature. Off entirely when the
+    // params say so, or when audio is off, since a theremin with no voice is a mouth
+    // opening for no reason.
+    let mut theremin = (params.theremin.enabled && params.audio.enabled)
+        .then(|| theremin::Theremin::spawn(params.theremin.socket.clone(), params.theremin.hand()));
+    // How far the beak is open for the chorale, slewed across ticks — see where it is written.
+    let mut chorale_mouth = 0.0f64;
+    // And how the head sways while singing, applied to the next tick's command.
+    let mut chorale_head = [0.0f64; 4];
+
+    // The note the theremin is holding, kept across ticks so a hand leaving the frame fades
+    // the note at its own pitch instead of gliding to the bottom of the range on its way out.
+    let mut theremin_hz = 0.0f64;
+
+    // The chorale. Off unless the config opted in — see `[chorale] accept`, and note that off
+    // means putting nothing on the air rather than declining politely.
+    let mut chorale = (params.chorale.accept && params.audio.enabled)
+        .then(|| {
+            let personality = voice.as_mut().and_then(|v| v.personality())?;
+            // `DUCK_CHORALE_PIECE=<id>` pins the conductor's pick — a bench lever for testing
+            // one piece, read once like everything else about this process's configuration.
+            let forced_piece = std::env::var("DUCK_CHORALE_PIECE")
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok());
+            Some(chorale::Chorale::new(
+                personality.pitch_center_hz,
+                personality.seed,
+                forced_piece,
+            ))
+        })
+        .flatten();
+    if chorale.is_some() {
+        tracing::warn!("chorale: this robot will sing with others");
+    }
+
     // Say hello in this robot's own voice as the control loop comes up, as the prototype
-    // does — the greet is also the audible "robotd is running" on a headless board.
-    if let Some(voice) = voice.as_mut() {
+    // does — the greet is also the audible "robotd is running" on a headless board. Its
+    // own switch, because the reason to want it gone (restarting the daemon all day) is
+    // not a reason to give up the triggers and the mic that `audio.enabled = false` takes
+    // with it.
+    if let Some(voice) = voice.as_mut()
+        && params.audio.greet
+    {
         voice.play("greet", false);
     }
 
@@ -1307,10 +1504,7 @@ async fn control_loop<T: RobotIo>(
         if requests.any() {
             match controller.as_mut() {
                 Some(controller)
-                    if snapshot.enabled
-                        && bringup == Bringup::Ready
-                        && !(fall_gate && safety.fallen())
-                        && shutdown_sit.is_none() =>
+                    if snapshot.enabled && bringup == Bringup::Ready && shutdown_sit.is_none() =>
                 {
                     let outcome = |what: &str, result: Result<(), &'static str>| match result {
                         Ok(()) => tracing::warn!(skill = what, "skill started"),
@@ -1358,6 +1552,7 @@ async fn control_loop<T: RobotIo>(
             } else {
                 intents.wheee_hold()
             };
+            voice.theremin_settle();
             voice.wheee(hold);
             for tag in intents.take_sounds() {
                 voice.play(tag.as_str(), false);
@@ -1386,6 +1581,47 @@ async fn control_loop<T: RobotIo>(
                 // surfaced at debug so mic tuning on a bench has data to look at.
                 while let Some(ev) = pet.try_recv_sound() {
                     tracing::debug!(event = ?ev, "ambient sound");
+                }
+            }
+        }
+
+        // A drive-mode switch: `robot.setMode`, which the pad's held D-pad up sends.
+        //
+        // The robot goes back to its home pose first and the policies load there, for the reason
+        // the prototype relaunched into pose 0: swapping the network under a moving gait means the
+        // next tick is a different policy's idea of what the legs were doing. Torque stays on
+        // throughout — the robot holds itself up across the swap rather than sitting down.
+        if let Some(code) = intents.take_mode_switch() {
+            let target = mode_of(code);
+            if target == policy_params.mode {
+                tracing::info!(
+                    mode = target.as_str(),
+                    "already in that mode; nothing to switch"
+                );
+            } else if mode_change.is_some() {
+                tracing::warn!(mode = target.as_str(), "a mode switch is already in flight");
+            } else {
+                tracing::warn!(
+                    from = policy_params.mode.as_str(),
+                    to = target.as_str(),
+                    "mode switch: going home before loading the other policies"
+                );
+                // The prototype's cue, and worth keeping: one quack for walking, two for roller,
+                // so the robot says which mode it is going to without anybody reading a log.
+                if let Some(voice) = voice.as_mut() {
+                    voice.play("chirp", false);
+                    if target == Mode::Roller {
+                        voice.play("chirp", false);
+                    }
+                }
+                mode_change = Some(target);
+                // Home the robot with the machinery `init` and a fall recovery already use: it
+                // ramps per tick, and `driving` is false until it reaches Ready.
+                if let Some(sensors) = sensors.as_ref() {
+                    bringup = Bringup::Homing {
+                        from: sensors.positions,
+                        since: tick_start,
+                    };
                 }
             }
         }
@@ -1442,73 +1678,132 @@ async fn control_loop<T: RobotIo>(
             poweroff();
         }
 
-        // Fall recovery (`[safety] fall_recover`): limp so the robot settles, then the
-        // standing network gets it up, then back to whatever was driving. The prototype's
-        // `--fall-detect`, minus its scripted-move opt-outs — a fall during a kick here
-        // waits for the kick window to lapse (they are half a second) rather than being
-        // ignored outright.
-        if params.safety.fall_recover && controller.is_some() && !powered_off {
-            match recovery {
-                Recovery::Idle => {
-                    if safety.fallen()
-                        && snapshot.enabled
-                        && bringup == Bringup::Ready
+        // Limp-fall (`[safety] limp_fall`): catch the fall on the way down.
+        //
+        // The standing policy is a good stand-up-er and a bad faller. It stands a still
+        // robot up cleanly from face-down or face-up; asked to do it out of a dynamic fall
+        // it tries, fails, tries again — at walking gain, against the floor — and the
+        // motors pay for every attempt. So take the fall away from it: go soft before the
+        // landing, let the robot arrive limp, put it back into the standing pose, and only
+        // then hand it over. What the policy then sees is the case it is good at.
+        //
+        // Everything here is off the policy's path by construction: `driving` is false for
+        // the whole sequence, so the controller is not stepped and the targets below come
+        // from this block. Nothing in `safety` needs telling: the fall verdict gates
+        // nothing, so the pose ramp moves a robot lying on the floor like any other tick.
+        if params.safety.limp_fall {
+            // Abandoned mid-sequence: someone cut the torque, disabled the policy, or the
+            // shutdown sit started. Whatever took over owns the robot now — drop out rather
+            // than finishing a pose ramp nobody asked for, and hold where the robot is
+            // rather than snapping back to a pose it collapsed out of a second ago.
+            if limp_fall != LimpFall::Idle
+                && !(snapshot.enabled
+                    && bringup == Bringup::Ready
+                    && shutdown_sit.is_none()
+                    && !powered_off)
+            {
+                tracing::warn!("limp-fall abandoned — something else took the robot");
+                limp_fall = LimpFall::Idle;
+                falling.reset();
+                hold = coast.known_positions(hold);
+            }
+            match limp_fall {
+                LimpFall::Idle => {
+                    // Only on a fresh sample: a coasted one is the same reading twice, and
+                    // feeding it to a debounce would let one bad tick count three times.
+                    let eligible = was_driving
+                        // Already down. There is no fall left to catch, and this is what
+                        // stops the sequence firing at a robot on the floor working its way
+                        // upright: a stand-up rocks, and a rock is a tilt with a rate on it.
+                        // Limping through that would be an endless limp-pose-retry loop.
+                        && !safety.fallen()
                         && shutdown_sit.is_none()
+                        && !powered_off
+                        // A roulade tips the robot over on purpose, a ground pick pitches it
+                        // forward, and a sit is not a fall. Limping through any of them would
+                        // break a move that was working.
                         && controller
                             .as_ref()
-                            .is_some_and(|c| !c.busy() && !c.is_sitting())
-                    {
-                        tracing::warn!("fallen — limp for 300 ms, then standing recovery");
-                        recovery = Recovery::Limp { since: tick_start };
+                            .is_some_and(|c| !c.busy() && !c.is_sitting());
+                    match fresh.as_ref() {
+                        Some(fresh) if eligible && safety.imu_ready() => {
+                            if falling.observe(&fresh.imu, period) {
+                                tracing::warn!(
+                                    gravity_z = format!("{:.2}", fresh.imu.gravity[2]),
+                                    rate =
+                                        format!("{:.2}", FallPredictor::gravity_z_rate(&fresh.imu)),
+                                    gain = params.safety.gain_limp,
+                                    "falling — going limp to land soft"
+                                );
+                                limp_fall = LimpFall::Limp {
+                                    since: tick_start,
+                                    landing: Landing::default(),
+                                };
+                            }
+                        }
+                        // Not eligible, or blind for this tick. Drop any debounce in
+                        // progress rather than resuming it later against a robot that has
+                        // moved on.
+                        _ => falling.reset(),
                     }
                 }
-                Recovery::Limp { since } => {
-                    if !safety.fallen() {
-                        // Someone righted it during the settle; nothing to recover from.
-                        recovery = Recovery::Idle;
-                    } else if tick_start.duration_since(since) >= RECOVERY_LIMP {
-                        tracing::warn!("limp done — standing policy engaged for recovery");
-                        safety.set_recovery(true);
+                LimpFall::Limp { since, mut landing } => {
+                    let rate = fresh
+                        .as_ref()
+                        .map(|s| s.imu.gyro.iter().map(|w| w * w).sum::<f64>().sqrt());
+                    let landed = landing.observe(
+                        rate,
+                        period,
+                        params.safety.limp_fall_still_rate,
+                        limp_fall_still,
+                    );
+                    // Whatever the gyro says: a robot held in someone's hands, or resting
+                    // against something that keeps nudging it, must not stay limp forever.
+                    let timed_out = tick_start.duration_since(since) >= limp_fall_max;
+                    if landed || timed_out {
+                        // From where the robot actually is. `hold` is where it was when
+                        // driving stopped, which is a pose it has since collapsed out of —
+                        // ramping from that would start with a jump.
+                        let from = coast.known_positions(hold);
+                        tracing::warn!(
+                            limp_ms = tick_start.duration_since(since).as_millis(),
+                            timed_out,
+                            pose_ms = limp_fall_pose.as_millis(),
+                            "landed — posing back to standing"
+                        );
+                        limp_fall = LimpFall::Posing {
+                            from,
+                            since: tick_start,
+                        };
+                    } else {
+                        limp_fall = LimpFall::Limp { since, landing };
+                    }
+                }
+                LimpFall::Posing { since, .. } => {
+                    if tick_start.duration_since(since) >= limp_fall_pose {
+                        tracing::warn!("posed — handing back to the standing policy");
+                        limp_fall = LimpFall::Idle;
+                        falling.reset();
+                        hold = DEFAULT_POSITION;
+                        // Hand back to the policy, and let it choose. The twist has been
+                        // held at zero through the whole sequence, so with nobody driving
+                        // the standing network is what command magnitude selects — which
+                        // is the stand-up. A client that *is* driving gets its walk back;
+                        // the humans stay in charge, here as everywhere else.
                         if let Some(controller) = controller.as_mut() {
-                            controller.force_standing = true;
                             controller.reset();
                         }
-                        recovery = Recovery::Rising {
-                            upright_for: Duration::ZERO,
-                        };
-                    }
-                }
-                Recovery::Rising { upright_for } => {
-                    // Hysteresis: solidly upright, stricter than the fall threshold, held
-                    // for a full second — so it does not bounce back to walking mid-standup.
-                    let upright = sensors
-                        .as_ref()
-                        .is_some_and(|s| s.imu.gravity[2] < RECOVERY_UPRIGHT_Z);
-                    let held = if upright {
-                        upright_for + period
-                    } else {
-                        Duration::ZERO
-                    };
-                    if held >= RECOVERY_UPRIGHT_HOLD {
-                        tracing::warn!("upright again — returning to the walking policy");
-                        safety.set_recovery(false);
-                        if let Some(controller) = controller.as_mut() {
-                            controller.force_standing = false;
-                        }
-                        recovery = Recovery::Idle;
-                    } else {
-                        recovery = Recovery::Rising { upright_for: held };
                     }
                 }
             }
         }
-        let in_recovery = matches!(recovery, Recovery::Limp { .. } | Recovery::Rising { .. });
+        let in_limp_fall = limp_fall != LimpFall::Idle;
 
-        // Smooth the command. The recovery sequence holds the twist at zero outright — the
-        // prototype does the same — and leaving body-pose mode snaps the body back to
-        // nominal rather than gliding, which is its B-button exit.
-        let twist_target = if in_recovery { [0.0; 3] } else { gated.twist };
-        if in_recovery {
+        // Smooth the command. The limp-fall sequence holds the twist at zero outright, so
+        // the robot is not handed back mid-command; and leaving body-pose mode snaps the
+        // body back to nominal rather than gliding, which is its B-button exit.
+        let twist_target = if in_limp_fall { [0.0; 3] } else { gated.twist };
+        if in_limp_fall {
             twist_ema = [0.0; 3];
         }
         for (ema, target) in twist_ema.iter_mut().zip(twist_target) {
@@ -1531,7 +1826,7 @@ async fn control_loop<T: RobotIo>(
                 host.searching() || params.maploc.mode == params::MaplocMode::StopAndScan
             })
             && !state.moving.load(Ordering::Relaxed)
-            && !in_recovery
+            && !in_limp_fall
             && controller.as_ref().is_some_and(|c| !c.is_sitting());
         if sweeping {
             sweep_t += dt;
@@ -1560,7 +1855,15 @@ async fn control_loop<T: RobotIo>(
         }
         let command = PolicyCommand {
             twist: twist_ema,
-            head: head_ema,
+            // The chorale's sway rides on top of whatever the head was asked to do, computed
+            // last tick (20 ms stale, invisible at sway speed) and slewed to zero when the
+            // singing stops so the head settles rather than snaps.
+            head: [
+                head_ema[0] + chorale_head[0],
+                head_ema[1] + chorale_head[1],
+                head_ema[2] + chorale_head[2],
+                head_ema[3] + chorale_head[3],
+            ],
             body: BodyPose {
                 z: body_ema[0],
                 roll: body_ema[1],
@@ -1570,10 +1873,8 @@ async fn control_loop<T: RobotIo>(
 
         // Bring the robot up when someone asks it to drive and it has no torque yet.
         //
-        // Gated on the fall only when the fall gate is armed, and there it is not
-        // belt-and-braces: a robot `apply` holds at limp gain is one a ramp cannot stand
-        // up. With the gate off (the default) a fallen robot ramps like any other, which
-        // is the prototype's behaviour.
+        // Not gated on the fall: a fallen robot ramps like any other, as the prototype
+        // does. Being down is a report, and the humans stay in charge.
         //
         // Needs a sample: `from` is where the joints actually are, and starting a ramp from a
         // position nobody read would be the lurch this exists to avoid.
@@ -1581,11 +1882,10 @@ async fn control_loop<T: RobotIo>(
         // joints to run a policy that is disabled or would not load is work towards nothing, and it
         // would make a release whose bundle is broken stand the robot up and then hold. A robot that
         // should stand without a policy is what `robotd init` is for.
-        if let (Bringup::Limp, true, true, false, Some(sensors)) = (
+        if let (Bringup::Limp, true, true, Some(sensors)) = (
             bringup,
             snapshot.enabled,
             controller.is_some(),
-            fall_gate && safety.fallen(),
             sensors.as_ref(),
         ) {
             match safety.set_torque(true) {
@@ -1622,6 +1922,27 @@ async fn control_loop<T: RobotIo>(
         if let Bringup::Homing { .. } = bringup
             && bringup.homing_target(tick_start).is_none()
         {
+            // Home, and a switch waiting: load the other mode's bundle here, where the robot is
+            // standing still at a known pose with torque on. `Policy::load` validates and warms
+            // up each network, so this blocks the loop for a moment — deliberately, and in the one
+            // place where a stalled command stream costs nothing, because the robot is holding a
+            // pose rather than mid-stride. Missed ticks in that window are expected.
+            if let Some(target) = mode_change.take() {
+                policy_params.mode = target;
+                let cfg = policy_params.resolved();
+                state.policy_error.store(None);
+                controller = build_controller(&cfg, params.safety.limp_fall, &state);
+                // Published together with the mode, and only after the load: a client that reads
+                // `robot.mode` and gets the new one must not then be told the old mode's networks.
+                state.policies.store(Arc::new(PolicyNames::of(&cfg)));
+                state.mode.store(mode_code(target), Ordering::Relaxed);
+                policy_cfg = cfg;
+                tracing::warn!(
+                    mode = target.as_str(),
+                    loaded = controller.is_some(),
+                    "mode switch complete"
+                );
+            }
             tracing::warn!("at the home pose; the policy has the robot");
             bringup = Bringup::Ready;
             hold = DEFAULT_POSITION;
@@ -1645,15 +1966,14 @@ async fn control_loop<T: RobotIo>(
         // observation to build, and inventing one would feed the policy a stale robot.
         //
         // And only once the ramp is done, or the policy's first step would come from wherever the
-        // robot was slumped. A fall stops the driving only when the fall gate is armed
-        // (`fall_limp`/`fall_recover`) — by default it does not, as the prototype does not:
-        // the policy keeps driving and the humans stay in charge. Recovery is the armed
-        // gate's one sanctioned exception, marked inside safety itself.
+        // robot was slumped. A fall does not stop the driving, as the prototype does not
+        // stop it: the policy keeps going and the humans stay in charge.
         let driving = snapshot.enabled
             && bringup == Bringup::Ready
             && controller.is_some()
-            && (!(fall_gate && safety.fallen()) || safety.recovering())
-            && !matches!(recovery, Recovery::Limp { .. })
+            // The limp-fall sequence owns the robot for its duration: the whole point is
+            // that the policy is *not* driving while the robot falls, lands and is posed.
+            && !in_limp_fall
             && sensors.is_some()
             && imu_warm
             && !powered_off;
@@ -1704,6 +2024,38 @@ async fn control_loop<T: RobotIo>(
         };
 
         let (mut targets, gain, moving, policy_label) = match (driving, sensors.as_ref()) {
+            // The limp-fall sequence, before anything else — `driving` is false throughout,
+            // so without this it would fall through to the hold branch and the robot would
+            // be commanded its pre-fall pose at walking gain, which is precisely the thing
+            // the mode exists to stop.
+            //
+            // `moving` stays true for the whole sequence: the joints are travelling (down,
+            // then back to the pose), and `safeToRestart` must not say yes in the middle of
+            // a fall.
+            _ if in_limp_fall => match limp_fall {
+                // Command the joints where they already are, at limp gain. Following the
+                // measurement rather than holding a fixed pose is what makes it soft: a
+                // fixed target grows an error as the robot collapses, and an error at any
+                // gain is a motor pushing back against the floor.
+                LimpFall::Limp { .. } => (
+                    coast.known_positions(hold),
+                    params.safety.gain_limp,
+                    true,
+                    "limp_fall",
+                ),
+                LimpFall::Posing { .. } => (
+                    // Past the end of the ramp the target is the pose itself — the state
+                    // machine above clears `Posing` on the same tick, so this is the one
+                    // frame where the two can disagree.
+                    limp_fall
+                        .pose_target(tick_start, limp_fall_pose)
+                        .unwrap_or(DEFAULT_POSITION),
+                    params.safety.limp_fall_pose_gain,
+                    true,
+                    "limp_pose",
+                ),
+                LimpFall::Idle => unreachable!("in_limp_fall excludes Idle"),
+            },
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
                 match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
@@ -1740,10 +2092,183 @@ async fn control_loop<T: RobotIo>(
         };
         state.moving.store(moving, Ordering::Relaxed);
 
+        // The theremin: a hand's distance in front of the beak, turned into a note and a
+        // mouth opening. Before the mouth is written, because while an instrument is up it
+        // *is* what the mouth is doing — the intent from a client is not competing with it.
+        let mut theremin_state = None;
+        if let Some(instrument) = theremin.as_mut() {
+            // Whether an instrument could be picked up right now, for the IPC side to
+            // refuse on. Republished every tick because the sensor can go away under a
+            // running daemon.
+            state.theremin_ready.store(
+                instrument.has_frames() && voice.is_some(),
+                Ordering::Relaxed,
+            );
+            if let Some(active) = intents.take_theremin_request() {
+                instrument.set_active(active);
+            }
+            // Nothing takes the instrument away but asking. Walking used to drop it, because
+            // a captured background is a picture of one spot — with no background there is
+            // nothing to invalidate, and a duck that plays while it walks is a feature.
+            let note = instrument.tick(tick_start);
+            match note {
+                Some(note) => {
+                    let mut block = note.state;
+                    // Silence keeps the last pitch rather than gliding to the bottom of the
+                    // range: a fade at the note you were playing is a note ending, and a fade
+                    // on the way down is a note falling over.
+                    let level = match note.closeness {
+                        Some(closeness) => {
+                            if let Some(voice) = voice.as_mut()
+                                && let Some(hz) = voice.theremin_hz_at(closeness)
+                            {
+                                theremin_hz = hz;
+                            }
+                            block.note_hz = Some(theremin_hz);
+                            1.0
+                        }
+                        None => 0.0,
+                    };
+                    if let Some(voice) = voice.as_mut() {
+                        // Idempotent, so this is also what picks the instrument up on the
+                        // first tick after the request — there is no separate start edge to
+                        // get wrong.
+                        if voice.theremin_start() {
+                            voice.theremin_set(theremin_hz, level, note.mouth);
+                        }
+                    }
+                    // Whatever the policy is doing, unlike the mouth *intent* below. The
+                    // mouth is not part of any policy, and a duck playing a theremin while
+                    // sitting — which is how anyone will first try this — has to be able to
+                    // open its beak: gating on `driving` made the visible half of the whole
+                    // gesture silently absent on a sitting robot.
+                    if snapshot.enabled && bringup == Bringup::Ready {
+                        targets[duck_control::model::MOUTH_INDEX] =
+                            duck_control::model::mouth_target(note.mouth);
+                    }
+                    theremin_state = Some(block);
+                }
+                // The instrument is down. Putting the voice down too is idempotent, so this
+                // covers both "it was just dropped" and "there has never been one".
+                None => {
+                    if let Some(voice) = voice.as_mut() {
+                        voice.theremin_stop();
+                    }
+                }
+            }
+        }
+
+        // The chorale: where in the piece the ensemble is, and this duck's line of it. Before the
+        // mouth, like the theremin, because while a duck is singing its beak is doing that.
+        let mut chorale_state = None;
+        if let Some(ensemble) = chorale.as_mut() {
+            if let Some((active, piece_pin)) = intents.take_chorale_request() {
+                ensemble.set_active(active, tick_start, piece_pin);
+            }
+            for heard in intents.take_chorale_heard() {
+                ensemble.heard(&heard, tick_start);
+            }
+            let tick = ensemble.tick(tick_start);
+            if let Some(advertise) = tick.advertise {
+                // Handed to whatever `btd` connection is subscribed. Only when it changes, which
+                // is about once a beat rather than fifty times a second.
+                let _ = state.chorale_tx.send(advertise);
+            }
+            // The mouth: a target from the vowel being sung, written on every tick **while a
+            // chorale is up** — which is the bug this replaced. Writing it only while a note
+            // actually sounded left the target at whatever the hold pose had put there between
+            // notes, so a beak could simply stay open.
+            //
+            // "While a chorale is up" and not "while this robot may sing", which was the *second*
+            // bug: owning the mouth whenever `[chorale] accept` was true meant the trigger could
+            // not open it any more, on a robot that was not singing and might never sing. Opting in
+            // grants the chorale nothing until it is actually running.
+            let mut head_target = [0.0f64; 4];
+            let mouth_target = match tick.singing {
+                Some((part, beats)) => {
+                    if let Some(voice) = voice.as_mut()
+                        && voice.sing_start(ensemble.score(), part)
+                    {
+                        voice.sing_at(beats, true);
+                    }
+                    let line = ensemble.score().line(part);
+                    let (mut low, mut high) = (127.0f64, 0.0f64);
+                    let mut current = None;
+                    for note in line {
+                        low = low.min(f64::from(note.midi));
+                        high = high.max(f64::from(note.midi));
+                        if beats >= note.start_beat && beats < note.end_beat() {
+                            current = Some(*note);
+                        }
+                    }
+                    match current {
+                        Some(note) => {
+                            // Where this note sits in the duck's own line, for the head lift.
+                            let reach = ((f64::from(note.midi) - low) / (high - low).max(1.0))
+                                .clamp(0.0, 1.0);
+                            head_target = chorale::head_expression(beats, reach);
+                            // The audio releases the last 8% of a note so a repeated pitch
+                            // re-articulates; the beak does the same, visibly — without this a
+                            // run of same-vowel notes reads as one long weird note.
+                            let sung = (beats - note.start_beat) / note.beats;
+                            if sung < 0.92 {
+                                note.vowel.open()
+                            } else {
+                                note.vowel.open() * 0.2
+                            }
+                        }
+                        // Between notes: beak closed, but keep swaying — a singer breathing is
+                        // still part of the choir.
+                        None => {
+                            head_target = chorale::head_expression(beats, 0.0);
+                            0.0
+                        }
+                    }
+                }
+                None => {
+                    if let Some(voice) = voice.as_mut() {
+                        voice.sing_stop();
+                    }
+                    0.0
+                }
+            };
+            if ensemble.active() {
+                // Slewed, not snapped. A vowel is a step — `ah` is 0.90 and `mm` is 0.05 — and a
+                // servo asked to jump between them on a 20 ms tick twitches rather than sings.
+                // The head rides the same slew: the sway targets are already smooth sinusoids,
+                // and the slew is what makes the *start and stop* of singing gentle.
+                let alpha = (period.as_secs_f64() / CHORALE_MOUTH_TAU_S).clamp(0.0, 1.0);
+                chorale_mouth += (mouth_target - chorale_mouth) * alpha;
+                for (offset, target) in chorale_head.iter_mut().zip(head_target) {
+                    *offset += (target - *offset) * alpha;
+                }
+                if snapshot.enabled && bringup == Bringup::Ready {
+                    targets[duck_control::model::MOUTH_INDEX] =
+                        duck_control::model::mouth_target(chorale_mouth);
+                }
+                chorale_state = Some(proto::ChoraleState {
+                    listening: true,
+                    part: tick.singing.map(|(part, _)| part.as_str().to_owned()),
+                    beats: tick.singing.map(|(_, beats)| beats),
+                    joining: tick.joining,
+                    voices: tick.voices as u32,
+                });
+            } else {
+                // Nothing on the wire and nothing on the servo: the mouth belongs to whoever else
+                // wants it, which is the trigger — and the head settles back to where it was
+                // asked to look, through the same slew rather than a snap.
+                chorale_mouth = 0.0;
+                let alpha = (period.as_secs_f64() / CHORALE_MOUTH_TAU_S).clamp(0.0, 1.0);
+                for offset in chorale_head.iter_mut() {
+                    *offset += (0.0 - *offset) * alpha;
+                }
+            }
+        }
+
         // The mouth is not part of any policy; the intent is the only thing that moves it.
         // Only while driving — a held or homing robot keeps whatever its hold pose says, so
         // a restart cannot snap a mouth.
-        if driving {
+        if driving && theremin_state.is_none() && chorale_state.is_none() {
             targets[duck_control::model::MOUTH_INDEX] =
                 duck_control::model::mouth_target(snapshot.mouth);
         }
@@ -1770,9 +2295,10 @@ async fn control_loop<T: RobotIo>(
                 policy: policy_label.to_owned(),
                 safety: proto::SafetyState {
                     fallen: safety.fallen(),
-                    // Limp means "safety is actually holding it at limp gain", which needs
-                    // the fall gate armed — a bare fall verdict is a report, not a state.
-                    limp: fall_gate && safety.fallen() && !safety.recovering(),
+                    // Limp means "the robot is actually at limp gain" — which now happens
+                    // in exactly one place, the limp-fall sequence riding a fall down. A
+                    // bare fall verdict is a report, not a state.
+                    limp: matches!(limp_fall, LimpFall::Limp { .. }),
                     gravity: sensors.imu.gravity,
                     gain: safety.gain(),
                 },
@@ -1786,6 +2312,8 @@ async fn control_loop<T: RobotIo>(
                     position: odometry.position(),
                     yaw: odometry.yaw(),
                 },
+                theremin: theremin_state.clone(),
+                chorale: chorale_state.clone(),
             });
         }
 
@@ -1845,19 +2373,6 @@ async fn control_loop<T: RobotIo>(
 /// which would read as "no policy".
 fn file_name(path: &std::path::Path) -> Option<String> {
     Some(path.file_name()?.to_string_lossy().into_owned())
-}
-
-/// One resolved optional policy slot as its reportable file name — `None` when the policy
-/// is disabled outright or the slot is not configured in this mode.
-fn named_policy(
-    params: &Params,
-    pick: impl Fn(&params::ResolvedPolicy) -> Option<std::path::PathBuf>,
-) -> Option<String> {
-    let policy = params.policy.resolved();
-    if !policy.enabled {
-        return None;
-    }
-    pick(&policy).as_deref().and_then(file_name)
 }
 
 /// The sample a tick steps from, and how stale it may get.
@@ -1934,7 +2449,6 @@ fn limit_name(limit: duck_control::safety::Limit) -> &'static str {
         Limit::Deadman => "deadman",
         Limit::Range => "joint_range",
         Limit::NotFinite => "not_finite",
-        Limit::Fallen => "fallen",
     }
 }
 
@@ -2052,13 +2566,16 @@ async fn handle(
     // `None` until the client subscribes. Once set, the connection is both a request
     // channel and a state stream, so the loop below waits on whichever speaks first.
     let mut states: Option<tokio::sync::broadcast::Receiver<proto::RobotState>> = None;
+    // What to advertise, once `btd` has subscribed. A second stream on the same connection, which
+    // is why the read loop selects over a pair of options rather than one receiver.
+    let mut beacons: Option<tokio::sync::broadcast::Receiver<proto::ChoraleAdvertise>> = None;
     let mut decimate = Duration::ZERO;
     let mut last_sent: Option<Instant> = None;
     let mut maps: Option<tokio::sync::broadcast::Receiver<proto::MapFrame>> = None;
 
     loop {
         // Absent subscriptions pend forever, so one select covers every
-        // combination of the two streams without a match ladder per case.
+        // combination of the three streams without a match ladder per case.
         async fn next_from<T: Clone>(
             rx: &mut Option<tokio::sync::broadcast::Receiver<T>>,
         ) -> Result<T, tokio::sync::broadcast::error::RecvError> {
@@ -2101,6 +2618,24 @@ async fn handle(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::debug!(dropped = n, "map subscriber fell behind");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+                continue;
+            }
+            received = next_from(&mut beacons) => {
+                match received {
+                    Ok(advertise) => {
+                        write_line(
+                            &mut write_half,
+                            &proto::Request::notify(&proto::Call::ChoraleBeaconSet(advertise)),
+                        )
+                        .await?;
+                    }
+                    // Lagged: `btd` fell behind on beats. The newest beacon is the
+                    // only one worth having — an old beat has already passed.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!(dropped = n, "chorale subscriber fell behind");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                 }
@@ -2149,6 +2684,12 @@ async fn handle(
             // Subscribing again just re-arms the stream.
             maps = Some(state.map_tx.subscribe());
         }
+        if let Ok(proto::Call::ChoraleSubscribe) = &call {
+            // `btd` asking what to put on the air. One connection carries both directions: this
+            // stream down, and `chorale.heard` notifications up.
+            beacons = Some(state.chorale_tx.subscribe());
+        }
+
         if let Ok(proto::Call::RobotSubscribe(params)) = &call {
             decimate = params
                 .hz
@@ -2194,6 +2735,12 @@ fn apply_intent(intents: &Intents, call: &proto::Call) -> bool {
         }
         proto::Call::RobotMouth(p) => {
             intents.set_mouth(p.open);
+            true
+        }
+        // A beacon `btd` heard. A notification because it is one-way and frequent, and because
+        // there is nothing to say back about a beat.
+        proto::Call::ChoraleHeard(p) => {
+            intents.heard_chorale(p.clone());
             true
         }
         // A skill as a notification: how a client spells "the button is held" — `padd`
@@ -2258,20 +2805,58 @@ fn dispatch(
         // down; the loop still arbitrates against whatever move is mid-flight, exactly as
         // the prototype's buttons did.
         proto::Call::RobotDo(p) => {
+            let policies = state.policies.load();
             let configured = match p.skill {
-                proto::Skill::GroundPick => state.policy_ground_pick.is_some(),
-                proto::Skill::KickLeft => state.policy_kick_left.is_some(),
-                proto::Skill::KickRight => state.policy_kick_right.is_some(),
-                proto::Skill::SitToggle => state.policy_sitstand.is_some(),
-                proto::Skill::Roulade => state.policy_roulade.is_some(),
+                // One load for the whole decision: these are the *current* mode's networks, and
+                // reading them field by field could straddle a mode switch.
+                proto::Skill::GroundPick => policies.ground_pick.is_some(),
+                proto::Skill::KickLeft => policies.kick_left.is_some(),
+                proto::Skill::KickRight => policies.kick_right.is_some(),
+                proto::Skill::SitToggle => policies.sitstand.is_some(),
+                proto::Skill::Roulade => policies.roulade.is_some(),
             };
+            // Not refused for being down. A skill on a fallen robot is the human's call,
+            // and refusing it is how a robot ends up unable to do the thing that would
+            // have righted it.
             let result = if !configured {
                 proto::IntentResult::refused("no policy configured for that skill")
-            } else if state.fall_gate && state.fallen.load(Ordering::Relaxed) {
-                proto::IntentResult::refused("the robot is down; stand it up first")
             } else {
                 intents.request_skill(p.skill);
                 proto::IntentResult::accepted()
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
+        // Picking the theremin up, or putting it down. Refused here for what this side can
+        // already know — no voice, no depth frames, the feature switched off — and *not* for
+        // circumstance: the loop puts the instrument down by itself when the robot starts
+        // walking or goes over, which is a thing that happens after the answer.
+        //
+        // Note what the answer does not promise: arming. That takes about half a second of
+        // depth frames, because the theremin's zero is whatever is in front of the duck at
+        // that moment, and one frame is not a background. Whether it took, and the one
+        // refusal a player will actually hit — a hand already in front of the beak — arrive
+        // in `robot.state`'s theremin block.
+        proto::Call::RobotTheremin(p) => {
+            let result = if !state.has_voice {
+                proto::ThereminResult {
+                    accepted: false,
+                    reason: Some("this robot has no voice to play a theremin in".to_owned()),
+                }
+            } else if p.active && !state.theremin_ready.load(Ordering::Relaxed) {
+                proto::ThereminResult {
+                    accepted: false,
+                    reason: Some(
+                        "no depth frames — the ToF sensor is not delivering (is tofd running?)"
+                            .to_owned(),
+                    ),
+                }
+            } else {
+                intents.request_theremin(p.active);
+                proto::ThereminResult {
+                    accepted: true,
+                    reason: None,
+                }
             };
             proto::Response::ok(Some(id), &result)
         }
@@ -2305,10 +2890,37 @@ fn dispatch(
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
+        // Switch drive mode. Refused here for the two things this side knows: a mode nobody has
+        // heard of, and a robot with no policy to switch between — the loop arbitrates the rest.
+        //
+        // "Already in that mode" is an acceptance rather than a refusal: the caller asked for a
+        // state and that state is what they get, and a pad held a beat too long should not report
+        // an error.
+        proto::Call::RobotSetMode(p) => {
+            let target = match p.mode.as_str() {
+                "walk" => Some(Mode::Walk),
+                "roller" => Some(Mode::Roller),
+                _ => None,
+            };
+            let result = match target {
+                None => proto::IntentResult::refused("mode must be \"walk\" or \"roller\""),
+                Some(_) if state.policies.load().walk.is_none() => proto::IntentResult::refused(
+                    "no policy on this robot, so there is nothing to switch between",
+                ),
+                Some(mode) => {
+                    intents.request_mode_switch(mode_code(mode));
+                    proto::IntentResult::accepted()
+                }
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
         proto::Call::RobotMode => proto::Response::ok(
             Some(id),
             &proto::ModeResult {
-                mode: state.mode.to_owned(),
+                mode: mode_of(state.mode.load(Ordering::Relaxed))
+                    .as_str()
+                    .to_owned(),
             },
         ),
 
@@ -2317,26 +2929,53 @@ fn dispatch(
         // The acknowledgement carries the policy identity: it is constant for the life of the
         // process, so sending it once here costs nothing, where putting it on every frame
         // would allocate two strings per tick on the control thread.
-        proto::Call::RobotSubscribe(_) => proto::Response::ok(
+        // Start or stop looking for other ducks. Refused for what this side can know: no voice to
+        // sing with, and — the one that matters — a robot whose config has not opted in. A chorale
+        // moves the mouth and the head, so an un-opted-in robot does not merely decline, it never
+        // goes on the air at all.
+        proto::Call::RobotChorale(p) => {
+            let result = if !state.chorale_accepted {
+                proto::ChoraleResult {
+                    accepted: false,
+                    reason: Some(
+                        "this robot has not opted in to singing with others (`[chorale] accept` \
+                         in robotd.toml)"
+                            .to_owned(),
+                    ),
+                }
+            } else if !state.has_voice {
+                proto::ChoraleResult {
+                    accepted: false,
+                    reason: Some("this robot has no voice to sing with".to_owned()),
+                }
+            } else if let Some(id) = p.piece.filter(|id| !chorale::known_piece(*id)) {
+                // Refused at the door with the catalogue, rather than accepted into the coin:
+                // a pin that silently did not pin is exactly the confusion it exists to end.
+                proto::ChoraleResult {
+                    accepted: false,
+                    reason: Some(format!(
+                        "piece {id} is not on this robot — it has {}",
+                        chorale::piece_catalogue()
+                    )),
+                }
+            } else {
+                intents.request_chorale(p.active, p.piece);
+                proto::ChoraleResult {
+                    accepted: true,
+                    reason: None,
+                }
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
+        // `btd` subscribing to what to advertise. The stream itself is set up by the caller; this
+        // only acknowledges, and is deliberately not refused for a robot that has not opted in —
+        // `btd` may subscribe at boot and the answer can change without it reconnecting.
+        proto::Call::ChoraleSubscribe => proto::Response::ok(
             Some(id),
-            &proto::SubscribeResult {
+            &proto::ChoraleResult {
                 accepted: true,
-                walk: state.policy_walk.clone(),
-                stand: state.policy_stand.clone(),
-                sitstand: state.policy_sitstand.clone(),
-                ground_pick: state.policy_ground_pick.clone(),
-                kick_left: state.policy_kick_left.clone(),
-                kick_right: state.policy_kick_right.clone(),
-                roulade: state.policy_roulade.clone(),
-                unavailable: state.policy_error.load_full().map_or_else(
-                    || {
-                        state
-                            .policy_walk
-                            .is_none()
-                            .then(|| "no policy configured; holding the startup pose".to_owned())
-                    },
-                    |e| Some(format!("policy would not load: {e}")),
-                ),
+                reason: None,
             },
         ),
 
@@ -2364,22 +3003,48 @@ fn dispatch(
                 &proto::IntentResult::refused("mapping is not enabled on this robot"),
             ),
         },
+        proto::Call::RobotSubscribe(_) => {
+            let policies = state.policies.load();
+            proto::Response::ok(
+                Some(id),
+                &proto::SubscribeResult {
+                    accepted: true,
+                    walk: policies.walk.clone(),
+                    stand: policies.stand.clone(),
+                    sitstand: policies.sitstand.clone(),
+                    ground_pick: policies.ground_pick.clone(),
+                    kick_left: policies.kick_left.clone(),
+                    kick_right: policies.kick_right.clone(),
+                    roulade: policies.roulade.clone(),
+                    unavailable: state.policy_error.load_full().map_or_else(
+                        || {
+                            policies.walk.is_none().then(|| {
+                                "no policy configured; holding the startup pose".to_owned()
+                            })
+                        },
+                        |e| Some(format!("policy would not load: {e}")),
+                    ),
+                },
+            )
+        }
 
         proto::Call::RobotStop => {
             intents.stop();
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
-        // Refusing to enable a fallen robot is a normal answer with a reason, not an
-        // error: the client asked something reasonable and safety declined.
+        // A refusal here is a normal answer with a reason, not an error: the client asked
+        // something reasonable and the daemon declined. Gravity is never one of those
+        // reasons — see below.
         proto::Call::RobotEnable(p) => {
             // `toggle` flips the robot's own state — the pad's Start. Evaluated here, not
             // in the client, because a client-side belief drifts (relax, shutdown, either
             // side restarting) and a stale one turns Start into a no-op every other press.
             let on = if p.toggle { !intents.enabled() } else { p.on };
-            let result = if on && state.fall_gate && state.fallen.load(Ordering::Relaxed) {
-                proto::IntentResult::refused("the robot is down; stand it up first")
-            } else {
+            // Never refused for being down. Start on a robot lying on the floor is exactly
+            // how someone asks it to stand back up, and it brings the robot up and hands it
+            // to the standing policy like any other enable.
+            let result = {
                 intents.set_enabled(on);
                 // No init here: stopping is what returns the robot to its home pose (the
                 // loop commands it directly on the disable — the prototype's "returning
@@ -2406,16 +3071,9 @@ fn dispatch(
         // Both only *ask*. The control loop owns the only `RobotIo` handle, so nothing here touches
         // the bus — which is also why `robotd init` needs the daemon stopped and these do not.
         proto::Call::RobotInit => {
-            // Refused only when the fall gate is armed (`fall_limp`/`fall_recover`): there,
-            // `Safety::apply` commands a fallen robot at limp gain and holds it, so a ramp
-            // would be writing a stand-up that cannot happen. With the gate off — the
-            // default — init works whatever gravity says, which is the prototype's
-            // behaviour and what a bench actually needs.
-            let result = if state.fall_gate && state.fallen.load(Ordering::Relaxed) {
-                proto::IntentResult::refused(
-                    "the robot is down and the fall gate is armed. Stand it up first, or drop `fall_limp`/`fall_recover` from robotd.toml",
-                )
-            } else {
+            // Never refused for gravity: init works whatever the robot is lying on, which
+            // is the prototype's behaviour and what a bench actually needs.
+            let result = {
                 intents.request_init();
                 proto::IntentResult::accepted()
             };
@@ -2498,6 +3156,134 @@ async fn shutdown() {
 mod tests {
     use super::*;
 
+    /// The limp-fall pose ramp: starts where the robot landed, ends at the standing pose,
+    /// and reports itself finished rather than pinning at the end — the state machine reads
+    /// `None` as "hand back to the policy".
+    #[test]
+    fn the_limp_fall_pose_ramp_ends_at_the_standing_pose() {
+        let landed = [0.7; NUM_JOINTS];
+        let over = Duration::from_secs(1);
+        let since = Instant::now();
+        let posing = LimpFall::Posing {
+            from: landed,
+            since,
+        };
+
+        let start = posing.pose_target(since, over).expect("t = 0");
+        assert_eq!(start, landed, "the ramp starts from where the robot landed");
+
+        let half = posing
+            .pose_target(since + over / 2, over)
+            .expect("mid-ramp");
+        for (i, value) in half.iter().enumerate() {
+            let expected = landed[i] + (DEFAULT_POSITION[i] - landed[i]) * 0.5;
+            assert!((value - expected).abs() < 1e-9);
+        }
+
+        assert!(
+            posing.pose_target(since + over, over).is_none(),
+            "a finished ramp is None, not the endpoint held forever"
+        );
+    }
+
+    /// Only the posing phase has a ramp. Asking the limp phase for one must not hand back
+    /// a target — that phase follows the joints down, it does not drive them anywhere.
+    #[test]
+    fn only_the_posing_phase_ramps() {
+        let over = Duration::from_secs(1);
+        let now = Instant::now();
+        assert!(LimpFall::Idle.pose_target(now, over).is_none());
+        assert!(
+            LimpFall::Limp {
+                since: now,
+                landing: Landing::default(),
+            }
+            .pose_target(now, over)
+            .is_none()
+        );
+    }
+
+    /// The landing detector. The limp ends when the robot has been still for the full hold,
+    /// not on the first quiet sample — a robot tumbling over passes through instants of
+    /// near-zero rate on the way, and ending the limp on one of those is landing stiff
+    /// after all.
+    #[test]
+    fn the_landing_needs_the_robot_to_stay_still() {
+        let period = Duration::from_millis(20);
+        let held = Duration::from_millis(60);
+        let mut landing = Landing::default();
+
+        // Still, but not for long enough yet.
+        assert!(!landing.observe(Some(0.1), period, 1.0, held));
+        assert!(!landing.observe(Some(0.1), period, 1.0, held));
+        // One tumbling sample restarts the count from zero.
+        assert!(!landing.observe(Some(4.0), period, 1.0, held));
+        assert!(!landing.observe(Some(0.1), period, 1.0, held));
+        assert!(!landing.observe(Some(0.1), period, 1.0, held));
+        assert!(
+            landing.observe(Some(0.1), period, 1.0, held),
+            "three ticks still"
+        );
+    }
+
+    /// A tick with no fresh sample is not evidence of stillness. A robot nobody can read is
+    /// not a robot anybody has seen stop moving, and a bad bus must not end the limp.
+    #[test]
+    fn a_blind_tick_is_not_a_landing() {
+        let period = Duration::from_millis(20);
+        let held = Duration::from_millis(60);
+        let mut landing = Landing::default();
+
+        assert!(!landing.observe(Some(0.1), period, 1.0, held));
+        assert!(!landing.observe(Some(0.1), period, 1.0, held));
+        assert!(
+            !landing.observe(None, period, 1.0, held),
+            "blind, not still"
+        );
+        assert!(
+            !landing.observe(Some(0.1), period, 1.0, held),
+            "counting again"
+        );
+    }
+
+    /// Limp-fall ships ON, and it must refuse a fallen robot nothing.
+    ///
+    /// This is the contract that answers "I booted it face-down and pressed Start": enable
+    /// and init are never refused for gravity, whatever the mode is set to. It matters more
+    /// now the mode is a default than it did when it was opt-in — every robot has it.
+    #[test]
+    fn limp_fall_ships_on_and_refuses_nothing() {
+        let params = Params::default();
+        assert!(params.safety.limp_fall, "on by default, fleet-wide");
+
+        let s = RobotState::new(&params, false, false);
+        let intents = Arc::new(Intents::new());
+        let id = || proto::Id::Number(1);
+        s.fallen.store(true, Ordering::Relaxed);
+
+        let enabled: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotEnable(proto::EnableParams {
+                on: true,
+                toggle: false,
+            }),
+        )
+        .result_as()
+        .unwrap();
+        assert!(
+            enabled.accepted,
+            "Start on a robot lying on the floor is how someone asks it to stand up"
+        );
+        assert!(intents.enabled());
+
+        let init: proto::IntentResult = dispatch(&s, &intents, id(), &proto::Call::RobotInit)
+            .result_as()
+            .unwrap();
+        assert!(init.accepted, "nor may init refuse for gravity");
+    }
+
     fn state() -> RobotState {
         RobotState::new(&Params::default(), false, false)
     }
@@ -2530,6 +3316,116 @@ mod tests {
     /// **The point of slice 1.** A loop that ticked once and then wedged must report
     /// unhealthy, not stay healthy forever on the strength of that one tick. This is what
     /// the updater's auto-rollback actually gates on.
+    /// `robot.setMode` is accepted, refused or a no-op — and never a parse error.
+    ///
+    /// The refusals are what this test is for. A robot with no policy has nothing to switch
+    /// between, and a mode nobody has heard of must come back naming the two that exist rather
+    /// than as a decode failure the caller cannot act on.
+    #[test]
+    fn setting_the_mode_accepts_refuses_and_says_which() {
+        let params = Params::default();
+        assert_eq!(params.policy.mode, Mode::Walk, "the shipped default");
+        let s = RobotState::new(&params, false, false);
+        let intents = Arc::new(Intents::new());
+        let id = || proto::Id::Number(1);
+        let set = |mode: &str| -> proto::IntentResult {
+            dispatch(
+                &s,
+                &intents,
+                id(),
+                &proto::Call::RobotSetMode(proto::SetModeParams {
+                    mode: mode.to_owned(),
+                }),
+            )
+            .result
+            .expect("a result")
+            .as_object()
+            .map(|o| serde_json::from_value(serde_json::Value::Object(o.clone())).expect("shape"))
+            .expect("an object")
+        };
+
+        // Default params name a walking bundle, so there is something to switch between.
+        assert!(set("roller").accepted, "a real mode is accepted");
+        assert_eq!(
+            intents.take_mode_switch(),
+            Some(mode_code(Mode::Roller)),
+            "the loop is the thing that switches; dispatch only queues it"
+        );
+
+        // The same mode is an acceptance, not a refusal: the caller asked for a state.
+        assert!(set("walk").accepted);
+        assert_eq!(intents.take_mode_switch(), Some(mode_code(Mode::Walk)));
+
+        let refused = set("hovercraft");
+        assert!(!refused.accepted);
+        let reason = refused.reason.unwrap_or_default();
+        assert!(
+            reason.contains("walk") && reason.contains("roller"),
+            "{reason}"
+        );
+        assert_eq!(
+            intents.take_mode_switch(),
+            None,
+            "a refused switch must not reach the loop"
+        );
+
+        // A robot with no policy at all: nothing to switch between, and saying so beats homing
+        // the robot for a swap that would load nothing.
+        let mut bare = Params::default();
+        bare.policy.enabled = false;
+        let s = RobotState::new(&bare, false, false);
+        let response = dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotSetMode(proto::SetModeParams {
+                mode: "roller".to_owned(),
+            }),
+        );
+        let result: proto::IntentResult =
+            serde_json::from_value(response.result.expect("a result")).expect("shape");
+        assert!(!result.accepted);
+        assert!(
+            result.reason.unwrap_or_default().contains("no policy"),
+            "the reason must name the cause"
+        );
+    }
+
+    /// Roller mode has no standing network, and the published set must say so.
+    ///
+    /// This is the reason the names are swapped as a set rather than left at what startup
+    /// resolved: `dispatch` refuses a `robot.do` for a skill whose slot is `None`, so a stale set
+    /// would have the robot accepting a kick in a mode with no kick network — or refusing the
+    /// crouch that roller mode does have.
+    #[test]
+    fn the_published_policy_names_are_one_modes_answer() {
+        let walk = PolicyNames::of(&Params::default().policy.resolved());
+        assert!(walk.stand.is_some(), "walking has a standing network");
+
+        let mut rolling = Params::default();
+        rolling.policy.mode = Mode::Roller;
+        let roller = PolicyNames::of(&rolling.policy.resolved());
+        assert!(
+            roller.stand.is_none(),
+            "roller mode loads no standing network"
+        );
+        assert_ne!(
+            walk.walk, roller.walk,
+            "the driving network differs by mode"
+        );
+        assert_ne!(
+            walk.ground_pick, roller.ground_pick,
+            "the ground-pick slot holds the crouch in roller mode"
+        );
+
+        // Disabled means every slot empty, which is what `robot.subscribe` reports as "no policy
+        // configured" rather than as a load failure.
+        let mut off = Params::default();
+        off.policy.enabled = false;
+        let none = PolicyNames::of(&off.policy.resolved());
+        assert!(none.walk.is_none() && none.roulade.is_none());
+    }
+
     #[test]
     fn a_stalled_loop_reports_unhealthy() {
         // A short window so the test does not sleep for the real 500 ms default. Two
@@ -2821,8 +3717,8 @@ mod tests {
         assert!(!refused.accepted);
         assert!(!intents.take_skills().kick_left, "a refusal must not queue");
 
-        // A fall refuses a skill only when the fall gate is armed. By default it is not —
-        // the prototype never limps on a fall — so `fallen` is a report, not a wall.
+        // A fall never refuses a skill: `fallen` is a report, not a wall. Refusing here is
+        // how a robot ends up unable to do the thing that would have righted it.
         s.fallen.store(true, Ordering::Relaxed);
         let down: proto::IntentResult = dispatch(
             &s,
@@ -2834,29 +3730,8 @@ mod tests {
         )
         .result_as()
         .unwrap();
-        assert!(down.accepted, "with the gate off, fallen must not refuse");
+        assert!(down.accepted, "fallen must not refuse a skill");
         assert!(intents.take_skills().sit_toggle);
-
-        // With `fall_limp` armed, the same call hits the wall — same as robot.enable.
-        let mut params = Params::default();
-        params.safety.fall_limp = true;
-        let gated = RobotState::new(&params, false, false);
-        gated.fallen.store(true, Ordering::Relaxed);
-        let down: proto::IntentResult = dispatch(
-            &gated,
-            &intents,
-            id(),
-            &proto::Call::RobotDo(proto::DoParams {
-                skill: proto::Skill::SitToggle,
-            }),
-        )
-        .result_as()
-        .unwrap();
-        assert!(!down.accepted);
-        assert!(
-            !intents.take_skills().sit_toggle,
-            "a refusal must not queue"
-        );
     }
 
     /// The pose and mouth intents land in their slots like move and head do — including via

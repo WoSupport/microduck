@@ -30,11 +30,14 @@ ssh-copy-id radxa@192.168.1.42
 ## What you need
 
 - The board's **IP address**. mDNS on this image is unreliable, so a `.local` name resolves when
-  it feels like it — use the address from your router's DHCP lease.
+  it feels like it. `duckctl ip` asks the robot over Bluetooth, which needs no network of your own
+  and no DHCP lease to read; your router's lease table is the fallback if the board is not
+  advertising yet.
 - **ssh key access**, from the step above. Provisioning reboots the board and reconnects by
   itself, and a password prompt cannot survive that.
-- A **GitHub token**. This repository is private, so its release assets are unreachable without
-  one.
+- A **GitHub token**, while this repository is private: its release assets are unreachable
+  without one. Once it is public the token is optional and buys only a higher API rate limit
+  (`docs/design/updater-design.md` §6.1).
 - A **clone of this repo**. The dev key it needs is committed at `deploy/dev-key/team.dev.pub`,
   so there is nothing to ask anyone for.
 
@@ -178,7 +181,7 @@ Nothing to do — the rest of the run is addressed there.
 
 Three things stop it working, and it says which:
 
-- It needs `cargo` and this clone, because `duck-btctl` is an example rather than an installed binary.
+- It needs `cargo` and this clone, because `duckctl` is an example rather than an installed binary.
 - It can only ask once `btd` is running, which on a board being provisioned for the first time is a
   few minutes into phase 2.
 - The robot reports its **wifi** address, so a board you reach over ethernet is not covered.
@@ -218,7 +221,8 @@ sudo systemctl restart updaterd
 ## The token, by hand
 
 `scripts/install.sh` writes this for you when given `DUCK_TOKEN`. These steps are for a board
-provisioned some other way.
+provisioned some other way — and they are only needed while this repository is private, or on a
+board that fetches often enough to want the higher rate limit a token buys.
 
 `updaterd` reads `GITHUB_TOKEN` from its own environment, so exporting it in your shell does not
 reach the daemon — it needs a systemd drop-in.
@@ -250,8 +254,10 @@ sudo systemctl daemon-reload
 sudo systemctl restart updaterd
 ```
 
-A token on a *developer's* board is fine. A token on a customer robot is not, and is why
-artifact hosting is still an open question — see `docs/design/updater-design.md` §6.1.
+A token on a *developer's* board is fine. A token on a customer robot is not — a fleet-wide
+credential in an image cannot be rotated without reflashing — which is why the answer is a
+public repository rather than a shipped token (`docs/design/updater-design.md` §6.1). A board
+with no token can still install from a local directory or a dev push.
 
 ## Installing without a network
 

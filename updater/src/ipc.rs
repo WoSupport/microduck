@@ -512,23 +512,48 @@ impl Server {
                 .with_engine(id.clone(), |engine| engine.log(params.limit))
                 .await
                 .map_or_else(|e| e, |v| Response::ok(Some(id), &v)),
+            Call::Show(params) => self
+                .with_engine(id.clone(), |engine| engine.show(params.run))
+                .await
+                .map_or_else(|e| e, |v| Response::ok(Some(id), &v)),
             Call::ListInstalled(params) => self
                 .with_engine(id.clone(), |engine| {
                     engine.list_installed(params.component.as_str())
                 })
                 .await
                 .map_or_else(|e| e, |v| Response::ok(Some(id), &v)),
-            Call::Check(params) => {
-                let engine = self.engine.lock().await;
-                match engine.check(params.component.as_str()).await {
+            // `try_lock`, like every other read here, and for a reason the header states:
+            // a request that blocks on the engine mutex is answered whenever the update
+            // finishes, which is minutes for a daemon release. A client asking "is there an
+            // update?" during one has an immediate answer — there is one running — and getting
+            // `BUSY` back at once is what lets it say so. Blocking instead produced a spinner
+            // indistinguishable from a robot that had stopped answering.
+            Call::Check(params) => match self.engine.try_lock() {
+                Ok(engine) => match engine.check(params.component.as_str()).await {
                     Ok(result) => Response::ok(Some(id), &result),
                     Err(e) => Response::err(Some(id), e.to_rpc_error()),
-                }
-            }
+                },
+                Err(_) => Response::err(
+                    Some(id),
+                    proto::Error::new(proto::code::BUSY, "an update is in progress; retry shortly"),
+                ),
+            },
 
             // ── mutating ─────────────────────────────────────────────────────
             Call::Apply(params) => {
                 let component = params.component.0.clone();
+                // The same three numbers `authorise` has already logged, kept for the transcript.
+                // A month later "who ran this?" has no other answer: the journal line that carried
+                // them may be gone, and the transcript that outlived it is where the question gets
+                // asked.
+                let requested_by = peer.map(|p| {
+                    format!(
+                        "uid={} gid={} pid={}",
+                        p.uid(),
+                        p.gid(),
+                        p.pid().map(|pid| pid.to_string()).unwrap_or_else(|| "?".into())
+                    )
+                });
                 self.run_mutating(id, out, move |engine, tx| {
                     Box::pin(async move {
                         engine
@@ -539,6 +564,7 @@ impl Server {
                                     dry_run: params.options.dry_run,
                                     interrupt_sessions: params.options.interrupt_sessions,
                                     from_dir: params.options.from_dir.map(std::path::PathBuf::from),
+                                    requested_by,
                                 },
                                 tx,
                             )
@@ -569,13 +595,19 @@ impl Server {
                 })
                 .await
             }
-            Call::Pin(params) => {
-                let mut engine = self.engine.lock().await;
-                match engine.pin(params.component.as_str(), params.version).await {
+            // Also `try_lock`, and the same `BUSY` every other mutation answers with. Pinning
+            // during an update is a request about which version may be installed, made while one
+            // is being installed: waiting for the answer to become moot is worse than saying so.
+            Call::Pin(params) => match self.engine.try_lock() {
+                Ok(mut engine) => match engine.pin(params.component.as_str(), params.version).await {
                     Ok(()) => Response::ok(Some(id), &serde_json::json!({})),
                     Err(e) => Response::err(Some(id), e.to_rpc_error()),
-                }
-            }
+                },
+                Err(_) => Response::err(
+                    Some(id),
+                    proto::Error::new(proto::code::BUSY, "another update is already in progress"),
+                ),
+            },
 
             // Owned by `handle_connection`, which hands the whole connection to
             // `stream_progress` instead of answering once.
@@ -604,8 +636,14 @@ impl Server {
             | Call::RobotSound(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
+            | Call::RobotTheremin(_)
+            | Call::RobotChorale(_)
+            | Call::ChoraleSubscribe
+            | Call::ChoraleBeaconSet(_)
+            | Call::ChoraleHeard(_)
             | Call::RobotShutdown
             | Call::RobotMode
+            | Call::RobotSetMode(_)
             | Call::RobotSubscribe(_)
             | Call::RobotMap
             | Call::RobotMapWipe => Response::err(
@@ -905,8 +943,8 @@ impl Server {
 ///
 /// So the pair of versions goes to the journal, where it turns a later shape error from a puzzle into
 /// a diagnosis, and `HelloResult::api_version` hands the client the same fact so it can say so
-/// itself. `duck-btctl` reached this conclusion from the far end of the link first — see
-/// `btd/examples/duck-btctl.rs`.
+/// itself. `duckctl` reached this conclusion from the far end of the link first — see
+/// `duckctl/src/main.rs`.
 fn note_version_skew(client: u32) {
     tracing::warn!(
         client,

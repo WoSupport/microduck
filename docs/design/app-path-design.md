@@ -144,7 +144,7 @@ them. Nothing across it checks the number — `configd` gates no `net.*` or `sys
 version, `updaterd` requires no handshake before `update.status`, and `updaterd`'s `hello` no longer
 refuses on it either. So a client that refuses on skew refuses calls the robot would have answered —
 and it refuses them on the transport that exists for a robot with no network, where `net.connect` is
-the way out of the skew. `duck-btctl` warns and proceeds, and an app should do the same: surface the
+the way out of the skew. `duckctl` warns and proceeds, and an app should do the same: surface the
 mismatch, let the call go, and report the JSON-RPC error if a method whose shape changed is actually
 reached. Those errors name themselves — `METHOD_NOT_FOUND` for a route this release does not have,
 `INVALID_PARAMS` for a parameter it does not know — which is what makes proceeding safe rather than
@@ -169,9 +169,10 @@ The cost of one characteristic is that it reads oddly in nRF Connect, where the 
 
 ### 3.1 The routed subset is the security boundary
 
-BLE exposes a subset (§4.1). One table in `btd/src/route.rs` decides both *whether* a call is
-permitted and *which socket* answers it, because those are the same question: a call is allowed
-exactly when the table names a service for it.
+BLE exposes a subset (§4.1). One table in `btd/src/route.rs` decides *whether* a call is
+permitted, *which socket* answers it and *which connection to that socket* carries it. The first
+two are the same question — a call is allowed exactly when the table names a service for it — and
+the third is in the same table so that a new method cannot be added without answering it (§3.5).
 
 **The match over `Call` is exhaustive on purpose.** Adding a protocol method fails `btd`'s build
 until someone decides about it. A `_ => None` wildcard would be the safe default in the moment and
@@ -183,11 +184,20 @@ Refused, each for a reason:
 
 | refused | why |
 |---|---|
-| `update.select`, `update.pin` | Operator surgery, made with `robotctl` and a record of who did it — not a mistap in a phone UI |
-| `update.rollback` | The engine reverts a bad release itself, so the phone needs no button for the ordinary case. Recovery mode (§8.2) should reopen this deliberately |
+| `update.pin` | A robot pinned by a mistap refuses every later update and reports itself as up to date — the one failure here that looks like correct behaviour. `robotctl`, and a person who meant it |
 | `update.resetToGolden` | Factory reset in all but name. Never over a radio |
 | `robot.safeToRestart`, `robot.modelApi`, `robot.remoteSessionActive` | `updaterd`'s private questions to `robotd`; a phone reading them learns nothing it can act on |
 | `system.pairingPin`, `system.setPairingPin` | **The load-bearing one.** A passkey an unpaired peer could read — or overwrite — would make pairing theatre. `btd` reads it over the unix socket instead |
+
+**`update.rollback` and `update.select` were on that list and are not now.** They were refused on
+the reasoning that the engine reverts a bad release itself, which it does — the one that fails its
+health gate. That is not the case an owner reaches for a phone about, which is a release that
+installs, passes its gate and then behaves *worse*: a policy that walks unsteadily rather than not
+at all, a pad that stops reconnecting. Nothing reverts that but a person, and the person is holding
+a phone and has no ssh. Both move to a release that has already run on this board, download
+nothing, and are gated and auto-reverted like any other transition. `update.apply` was already
+routed and is the more consequential of the three, so this widens what a peer in radio range can do
+by close to nothing. `docs/project/update-over-ble.md` §2.4 is the decision and its trade-offs.
 
 ## 4. Authorisation: two layers, kept apart
 
@@ -266,7 +276,7 @@ is nowhere to send the answer.
 
 ### 3.3 One thing the mobile app will hit: do not scan with a service filter  · **measured**
 
-`duck-btctl` is a test tool and deliberately not much more — the real client is a phone app. But one of its
+`duckctl` is a test tool and deliberately not much more — the real client is a phone app. But one of its
 bugs is a property of CoreBluetooth rather than of the tool, so it is worth writing down before
 someone rediscovers it on iOS.
 
@@ -280,7 +290,7 @@ could only match peripherals the filtered scan had already returned.
 The app should scan unfiltered and discriminate its own candidates, strongest evidence first:
 advertised UUID, then a known name or a stored peripheral identifier, and treat "serves our
 characteristic" as the only authoritative identity test — it is knowable solely after connecting. An
-iOS app has a better third tier than `duck-btctl` does, `retrievePeripherals(withIdentifiers:)`, which
+iOS app has a better third tier than `duckctl` does, `retrievePeripherals(withIdentifiers:)`, which
 `btleplug` does not expose; storing the identifier after a first successful connection is the right
 move there and removes the guesswork entirely.
 
@@ -290,7 +300,7 @@ appears.
 
 ### 3.4 The robot has to advertise often enough to be caught  · **measured**
 
-`duck-btctl` reported `no robot found` on roughly half its runs, and for a while that was read as flakiness
+`duckctl` reported `no robot found` on roughly half its runs, and for a while that was read as flakiness
 in the tool — or as the gamepad, whose LE link shares the radio. It was neither. `btd` registered its
 advertisement without an interval, so BlueZ used the kernel's default of **1.28 s**, and a central
 scanning at a low duty cycle does not catch a 1.28 s advertiser reliably.
@@ -322,7 +332,7 @@ nothing for the first connection, which is the one that matters most.
 carries this, the gamepad's LE link and wifi, and airtime spent shouting comes out of what the robot
 is for.
 
-`btd/examples/advwatch.rs` is the measurement, kept because the claim is only checkable by re-running
+`duckctl/examples/advwatch.rs` is the measurement, kept because the claim is only checkable by re-running
 it: arrivals per device with signal strength, then the robot's silences.
 
 **Confirmed on the board.** With 100-150 ms installed, the same two-minute watch from the same Mac:
@@ -332,9 +342,49 @@ it: arrivals per device with signal strength, then the robot's silences.
 | 1.28 s, the default | 16 | 7.5 s | 30.8 s | 7 |
 | 100-150 ms | 151 | 0.8 s | 3.8 s | **0** |
 
-Nine times as often, and — the part that matters — nothing left within a factor of two of `duck-btctl`'s
+Nine times as often, and — the part that matters — nothing left within a factor of two of `duckctl`'s
 eight-second window, so the failure it was diagnosed from cannot occur. The robot went from 34th of
 106 devices heard to 7th of 74.
+
+### 3.5 One connection per lane, because a daemon serves one request at a time
+
+`btd` opens sockets to `updaterd`, `robotd` and `configd` on demand and keeps them for the session
+(`btd/src/upstream.rs`). It held **one per service**, and both daemons behind it serve a connection
+one request at a time: read a line, await the whole call, then read the next
+(`updater/src/ipc.rs::handle_connection`, `configd/src/main.rs::handle`). So every call on a session
+queued behind the slowest thing on that queue, and the two orderings an app reaches for first were
+broken by it:
+
+| the client does | what happened |
+|---|---|
+| `update.apply`, then `update.status` while it runs | the status line waited in a socket `updaterd` would not read for minutes. The client timed out having heard nothing, while the robot was fine and updating |
+| `update.subscribe`, then `update.apply` | worse. `stream_progress` owns its connection until the peer goes away and never reads another request, so the apply was written into a socket nobody read: it never ran, never replied and never errored |
+
+The second is the one to remember. An owner taps "update", the robot does nothing at all, and there
+is no error anywhere to find — the request is sitting in a socket buffer.
+
+So calls are grouped by **how long they hold a connection**, and each group gets its own connection.
+The lane is decided in `route.rs` next to the permission and the service (§3.1), which is what makes
+the exhaustive match cover it too: a new long-running method cannot be added without someone
+choosing.
+
+| lane | holds its connection for | calls |
+|---|---|---|
+| `Prompt` | as long as a lookup | `hello`, `update.status`, `update.log`, `update.listInstalled`, `robot.health`, `net.status`, `net.forget`, `system.*`, `pad.status`, `pad.forget` |
+| `Slow` | seconds — the network, or a radio sweep | `update.check`, `net.scan` |
+| `Operation` | as long as it takes, and changes the robot | `update.apply`, `update.rollback`, `update.select`, `net.connect`, `pad.pair` |
+| `Stream` | forever, and answers nothing | `update.subscribe` |
+
+Sharing a lane is queueing, and each grouping is one where that is the right answer: `updaterd`
+single-flights mutations behind a file lock and answers `BUSY` for a second one, and two radio
+operations at once on `configd` is not a thing to want. `update.check` is deliberately *not* on the
+`Operation` lane — asked during an update it has an immediate answer, and queueing it would turn
+`BUSY` into a spinner that resolves minutes later.
+
+At most four sockets per service per session, and in practice two. A connection per call would be
+the tidier model and needs `btd` to know when a call ended, which needs it to parse replies — it
+never does (§3), and that property is what keeps the routed subset a transport rather than a second
+implementation of the API.
 
 ## 5. Pairing: just-works, and a PIN the transport checks
 
@@ -520,7 +570,7 @@ rather than 1, a PIN keeping its leading zero, and no passphrase in the log. Plu
 which is a real cross-link check: `btd` is the only binary pulling C beyond `zstd`, because `bluer`
 links libdbus built from vendored source by `zig cc`.
 
-`duck-btctl` (`cargo run -p btd --example duck-btctl`) is the phone's stand-in and the only way to exercise
+`duckctl` (`cargo run -p duckctl`) is the phone's stand-in and the only way to exercise
 the radio. An **example, not a binary**, so `btleplug` never reaches the robot; `btleplug` rather
 than `bluer` because it must run on a developer's Mac. It reuses `btd::framing`, so the chunking is
 genuinely the client half of the robot's own code rather than a reimplementation free to agree with
@@ -638,7 +688,7 @@ of the robot has not.
 
 #### The advertisement carries the robot's IPv4 address
 
-`duck-btctl scan` connects to nothing, which is what makes it the command to reach for when a robot
+`duckctl scan` connects to nothing, which is what makes it the command to reach for when a robot
 is unreachable — and it is why a listing can only report what an advertisement carries. So the
 question a listing is most often read to answer, *where do I ssh?*, had no answer in it: the address
 is in `net.status`, and reading that costs a connection, a bond and the PIN, per robot.
@@ -728,7 +778,7 @@ line (`serving BLE ... address=`):
 - `50:37:CD:16:2B:EC` — two `btd` starts within one boot, 10:04 and 10:05
 - `50:37:CD:16:1B:92` — every boot after, 10:18 onward, fifteen of them
 
-Between them: no reflash. Nothing done to the board but BLE connections through `duck-btctl` and gamepad
+Between them: no reflash. Nothing done to the board but BLE connections through `duckctl` and gamepad
 pairing. The top four bytes held; only the low two moved, which fits a driver that generates an
 address once behind a vendor prefix and caches it rather than reading one out of the module. `configd`
 never power-cycles the adapter — it only powers one on that is off — so pad pairing has no obvious

@@ -129,12 +129,60 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// Gaze as a point instead of joint angles: `robot.head`'s doc always promised both forms,
 /// and this is the second one — the daemon runs the IK and answers with the joints it chose.
 ///
-/// # v13 — `robot.map`
+/// # v14 — `robot.chorale`, `chorale.*`
 ///
-/// The live occupancy map, when `[maploc]` is enabled in robotd.toml. A subscription like
-/// `robot.state`: the answer says whether mapping runs, then `map.frame` notifications
-/// carry the rendered grid and the map-frame pose at a slow cadence.
-pub const API_VERSION: u32 = 14;
+/// Several ducks singing one piece in four parts, synchronised over BLE advertisements with no
+/// shared clock. `robot.chorale` is the switch; the `chorale.*` namespace is how `btd` — which owns
+/// the radio — and `robotd` — which owns the behaviour and the voice — divide the work. Additive:
+/// a client that never asks is unaffected, and `chorale.*` is between daemons rather than for
+/// clients at all.
+///
+/// # v13 — `robot.theremin`
+///
+/// The head ToF becomes an instrument: a hand's distance is the pitch, and the mouth opens
+/// with it. Additive, same rule as every method before it — plus an optional `theremin`
+/// block in `robot.state`, absent while the instrument is down, so a client from v12 sees
+/// exactly the frame it saw before.
+///
+/// # v15 — `robot.setMode`
+///
+/// Walk and roller stop being a startup constant: the mode can be switched while the robot runs,
+/// which is what the gamepad's held D-pad up does. Additive as a method — but `robot.mode`'s
+/// answer, and the policy names in the `robot.subscribe` acknowledgement, can now *change* during
+/// a session. A client that read either once and cached it forever was already making an
+/// assumption this method breaks; nothing about a frame's shape changes.
+///
+/// # v16 — `update.show`
+///
+/// The per-run update transcript: what `updaterd` actually did, phase by phase, with the
+/// manifest it verified, the hook output it collected and the units it restarted. Additive
+/// as a method — a client that never asks is unaffected — and `update.log`'s entries gain a
+/// `run` number pointing at one, which an older client ignores as an unknown member because
+/// results are not `deny_unknown_fields`. An older `updaterd` answers `update.show` with
+/// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
+/// handshake refusal.
+/// # v17 — `robot.map`, `robot.map_wipe`
+///
+/// The live occupancy map, when `[maploc]` is enabled in robotd.toml. `robot.map` is a
+/// subscription like `robot.state`: the answer says whether mapping runs, then `map.frame`
+/// notifications carry the rendered grid and the map-frame pose at a slow cadence.
+/// `robot.map_wipe` resets the mapping session in place and deletes its saved file — the
+/// experiment reset button.
+pub const API_VERSION: u32 = 17;
+
+/// The longest an update may legitimately go quiet, in seconds — the pre-install hook's ceiling.
+///
+/// **Here rather than in `updater`, because it is a contract with every client.** The phase
+/// notification for a hook arrives *before* the hook runs, so a client watching an apply sees
+/// nothing at all while the hook works — and that hook installs what a release needs and the board
+/// may not have: ONNX Runtime, and around 100 MB of apt for `mediad`'s GStreamer stack on a board
+/// that has never had it. A client whose idle budget is shorter than this reports a working update
+/// as a robot that stopped answering, which is exactly what `duckctl` did the first time this
+/// ceiling moved.
+///
+/// `updaterd` enforces it and every client sizes its own budget above it. Both read this constant,
+/// so the two cannot disagree.
+pub const UPDATE_MAX_SILENCE_SECONDS: u64 = 600;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -227,6 +275,7 @@ pub mod method {
     pub const STATUS: &str = "update.status";
     pub const LIST_INSTALLED: &str = "update.listInstalled";
     pub const LOG: &str = "update.log";
+    pub const SHOW: &str = "update.show";
     pub const SUBSCRIBE: &str = "update.subscribe";
 
     /// Server → client notification. Never carries an `id`.
@@ -327,14 +376,48 @@ pub mod method {
     /// is diagnostics, not danger), but "accepted" from a robot that cannot make a sound
     /// would make `robotctl quack` lie about which duck answered.
     pub const ROBOT_SOUND: &str = "robot.sound";
+    /// Pick the ToF theremin up, or put it down: the head's depth sensor becomes an
+    /// instrument, and the distance of a hand in front of the beak is the pitch — and the
+    /// mouth opening, which rises with it, so the note is visible as well as audible.
+    ///
+    /// Discrete; send as a request, and idempotent both ways. The answer says whether the
+    /// robot took the instrument — it has a voice, and depth frames are arriving. From then
+    /// on the nearest return inside the playable band is the hand: an explicit mode with
+    /// nothing clever inside it, because the clever version could not be relied on to mean
+    /// the same thing twice on real frames.
+    ///
+    /// [`ROBOT_STATE`]'s `theremin` block carries the live pitch, the mouth, and a line of
+    /// what the sensor said about the frame — which is the field diagnostic for this whole
+    /// feature.
+    pub const ROBOT_THEREMIN: &str = "robot.theremin";
+    /// Start or stop looking for other ducks to sing with. Discrete; the answer is
+    /// [`super::ChoraleResult`].
+    ///
+    /// What it starts is *listening*, not singing: the robot begins broadcasting a beacon saying
+    /// it is willing, and watching for others. Two willing ducks in radio range then start a piece
+    /// between themselves with nobody in charge — the lower id conducts — and a third joins what it
+    /// finds already under way.
+    ///
+    /// Refused outright by a robot whose config has not opted in (`[chorale] accept`), which is
+    /// false by default: a chorale moves the mouth and the head, and a robot that began animating
+    /// because another robot walked into the room would be doing unrequested motion.
+    pub const ROBOT_CHORALE: &str = "robot.chorale";
     /// Sit down gracefully, then power the machine off. The prototype's Select long-press.
     pub const ROBOT_SHUTDOWN: &str = "robot.shutdown";
-    /// Which drive mode this `robotd` was configured with: `walk` or `roller`.
+    /// Which drive mode this `robotd` is in: `walk` or `roller`.
     ///
-    /// Constant for the life of the process — switching modes is a params edit plus a
-    /// restart. Exists so `padd` can shape its stick mapping to the mode without owning
-    /// config it has no business reading.
+    /// `[policy] mode` is where it starts; [`ROBOT_SET_MODE`] moves it while the robot runs, so
+    /// this is a question with a changing answer rather than a startup constant. Exists so `padd`
+    /// can shape its stick mapping to the mode without owning config it has no business reading.
     pub const ROBOT_MODE: &str = "robot.mode";
+
+    /// Switch drive mode: `walk` or `roller`.
+    ///
+    /// Held on the gamepad's D-pad up, as the prototype held it — putting wheels on a duck is a
+    /// thing you do in the room with it, not from a laptop. The robot returns to its home pose,
+    /// loads the other mode's policies, and drives again; the config is untouched, so a reboot
+    /// comes back in the configured mode.
+    pub const ROBOT_SET_MODE: &str = "robot.setMode";
 
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
@@ -427,6 +510,20 @@ pub mod method {
     /// arrive as [`TOF_FRAME`] notifications until the connection closes.
     pub const TOF_STREAM: &str = "tof.stream";
 
+    /// `btd` → `robotd`: subscribe to what to put on the air. Answered, then `robotd` streams
+    /// [`CHORALE_BEACON`] notifications for as long as the connection lasts.
+    ///
+    /// The radio is `btd`'s and the behaviour is `robotd`'s, so neither can do this alone. This is
+    /// the direction that needs a subscription rather than a call: `robotd` decides *when* the
+    /// beacon changes, and it changes on the beat.
+    pub const CHORALE_SUBSCRIBE: &str = "chorale.subscribe";
+    /// `robotd` → `btd`: advertise this, or stop. A notification on a [`CHORALE_SUBSCRIBE`]
+    /// stream; the params are [`super::ChoraleAdvertise`].
+    pub const CHORALE_BEACON: &str = "chorale.beacon";
+    /// `btd` → `robotd`: another duck's beacon was heard. A notification — the params are
+    /// [`super::ChoraleHeard`].
+    pub const CHORALE_HEARD: &str = "chorale.heard";
+
     /// One 8×8 depth frame, pushed after [`TOF_STREAM`].
     pub const TOF_FRAME: &str = "tof.frame";
 
@@ -517,6 +614,8 @@ pub enum Call {
     Status,
     ListInstalled(ComponentParams),
     Log(LogParams),
+    /// One run's full transcript. `update.log` says which runs exist; this says what one did.
+    Show(ShowParams),
     /// Turns the connection into a stream of [`method::PROGRESS`] notifications.
     Subscribe,
 
@@ -547,10 +646,24 @@ pub enum Call {
     RobotMouth(MouthParams),
     /// Play a voice-bank sound.
     RobotSound(SoundParams),
+    /// Pick the ToF theremin up or put it down. Discrete; the answer is [`ThereminResult`].
+    RobotTheremin(ThereminParams),
+    /// Start or stop looking for other ducks to sing with. Discrete; the answer is
+    /// [`ChoraleResult`].
+    RobotChorale(ChoraleParams),
+    /// `btd` subscribing to what it should advertise. Answered, then a stream of
+    /// [`method::CHORALE_BEACON`] notifications.
+    ChoraleSubscribe,
+    /// `robotd` telling `btd` what to advertise. A notification.
+    ChoraleBeaconSet(ChoraleAdvertise),
+    /// `btd` telling `robotd` what it heard. A notification.
+    ChoraleHeard(ChoraleHeard),
     /// Sit down, then power the machine off.
     RobotShutdown,
     /// Which drive mode this robotd runs: walk or roller.
     RobotMode,
+    /// Switch drive mode; see [`method::ROBOT_SET_MODE`].
+    RobotSetMode(SetModeParams),
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -593,6 +706,55 @@ pub enum Call {
     RobotMapWipe,
 }
 
+/// The service that owns the answer to a call.
+///
+/// One socket per service, connected directly — there is no broker (`architecture.md` §2.2). A
+/// transport adapter holds connections to the services whose calls it carries, and to no others:
+/// `btd` holds three, and `padd` being absent from them is deliberate rather than incidental —
+/// `padd` is the unprivileged client whose whole value is having no special access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Service {
+    /// `updaterd`, at [`DEFAULT_SOCKET`].
+    Updater,
+    /// `robotd` — the control loop.
+    Robot,
+    /// `configd` — wifi, identity, the pairing PIN, gamepad bonding.
+    Config,
+    /// `padd` — the raw gamepad input stream.
+    Pad,
+    /// `tofd` — the depth stream.
+    Tof,
+}
+
+/// How long answering a call holds a connection, and therefore which connection carries it.
+///
+/// **Every service here serves one connection one request at a time.** So a single connection per
+/// service would put every call on one queue behind the slowest thing on it, and two orderings a
+/// client reaches for first are broken by that:
+///
+/// - `update.apply` then `update.status` — the status line waits in a socket `updaterd` will not
+///   read for minutes, so the client times out having heard nothing while the robot is fine.
+/// - `update.subscribe` then `update.apply` — worse. The subscription owns its connection until
+///   the peer goes away and never reads another request, so the apply is written into a socket
+///   nobody reads: it never runs, never replies and never errors. An update the owner asked for
+///   that the robot silently did not perform.
+///
+/// Grouping by *how long a call holds a connection* and giving each group its own is what fixes
+/// both. It is at most four sockets per service per session, which costs nothing and is bounded
+/// without bookkeeping — the alternative, a connection per call, needs the adapter to know when a
+/// call ended, which needs it to parse replies. It deliberately never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Lane {
+    /// Answers as fast as the daemon can look something up.
+    Prompt,
+    /// Seconds: a read that goes to the network or sweeps a radio.
+    Slow,
+    /// As long as it takes, and it changes the robot: an update, joining a network, bonding a pad.
+    Operation,
+    /// Never answers. The service writes notifications until the peer goes away.
+    Stream,
+}
+
 impl Call {
     /// The wire method name.
     pub fn method(&self) -> &'static str {
@@ -607,6 +769,7 @@ impl Call {
             Call::Status => method::STATUS,
             Call::ListInstalled(_) => method::LIST_INSTALLED,
             Call::Log(_) => method::LOG,
+            Call::Show(_) => method::SHOW,
             Call::Subscribe => method::SUBSCRIBE,
             Call::RobotSafeToRestart => method::ROBOT_SAFE_TO_RESTART,
             Call::RobotHealth => method::ROBOT_HEALTH,
@@ -623,8 +786,14 @@ impl Call {
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
             Call::RobotSound(_) => method::ROBOT_SOUND,
+            Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
+            Call::RobotChorale(_) => method::ROBOT_CHORALE,
+            Call::ChoraleSubscribe => method::CHORALE_SUBSCRIBE,
+            Call::ChoraleBeaconSet(_) => method::CHORALE_BEACON,
+            Call::ChoraleHeard(_) => method::CHORALE_HEARD,
             Call::RobotShutdown => method::ROBOT_SHUTDOWN,
             Call::RobotMode => method::ROBOT_MODE,
+            Call::RobotSetMode(_) => method::ROBOT_SET_MODE,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -676,6 +845,122 @@ impl Call {
         )
     }
 
+    /// The service that owns the answer to this call, and how long answering it holds a
+    /// connection. `None` for a call no service answers.
+    ///
+    /// **This is a property of the call, not of a transport.** Who owns `net.connect` does not
+    /// change depending on whether a phone asked over Bluetooth or a browser asked over a
+    /// datachannel, and neither does the fact that `configd` will sit on the connection for the
+    /// better part of a minute while it waits for NetworkManager. Whether a given transport may
+    /// *make* the call is the separate question, and it stays with the transport — see
+    /// `btd::route` for the one that exists, and `docs/design/remote-webrtc.md` §5 for why the two
+    /// were split.
+    ///
+    /// It lives here, beside [`Call::mutates`], because it is the same kind of fact: something
+    /// every adapter needs and none should decide for itself.
+    pub fn destination(&self) -> Option<(Service, Lane)> {
+        use Lane::*;
+        use Service::*;
+        Some(match self {
+            // The version handshake. `updaterd` answers it because it is the service on the
+            // recovery path — the one that must reply when the rest of the robot does not.
+            Call::Hello(_) => (Updater, Prompt),
+
+            // ── updaterd ────────────────────────────────────────────────────
+            //
+            // `Apply`, `Rollback` and `ResetToGolden` all move `current`, and `updaterd`
+            // single-flights mutations behind a file lock and answers `BUSY` for a second one —
+            // so sharing one lane is the behaviour to have rather than a compromise.
+            Call::Apply(_) | Call::Rollback(_) | Call::Select(_) | Call::ResetToGolden(_) => {
+                (Updater, Operation)
+            }
+            // Reaches the network to ask a mirror what exists, so seconds. Deliberately off
+            // `Operation`: "is there an update?" asked during one has an immediate answer
+            // (`BUSY`), and queueing it behind the update would turn that into a spinner that
+            // resolves minutes later.
+            Call::Check(_) => (Updater, Slow),
+            // `update.status` falls back to a cached snapshot rather than waiting for the engine,
+            // so it answers during an apply — which is wasted if the request is queued behind one.
+            Call::Status => (Updater, Prompt),
+            Call::Pin(_) | Call::Log(_) | Call::ListInstalled(_) => (Updater, Prompt),
+            // Reads a file, like `log`. Bounded by the per-run caps `updater::transcript`
+            // enforces at write time, so the answer cannot grow without limit however long
+            // a hook talked for.
+            Call::Show(_) => (Updater, Prompt),
+            // Owns its connection until the peer goes away and never reads another request.
+            Call::Subscribe => (Updater, Stream),
+
+            // ── robotd ──────────────────────────────────────────────────────
+            Call::RobotSafeToRestart
+            | Call::RobotHealth
+            | Call::RobotModelApi
+            | Call::RobotRemoteSessionActive
+            | Call::RobotMode => (Robot, Prompt),
+            // Intents and one-shot skills. All fast: they store a value the control loop reads on
+            // its next tick, and none of them waits for the robot to finish anything.
+            Call::RobotMove(_)
+            | Call::RobotHead(_)
+            | Call::RobotLook(_)
+            | Call::RobotStop
+            | Call::RobotEnable(_)
+            | Call::RobotInit
+            | Call::RobotRelax
+            | Call::RobotDo(_)
+            | Call::RobotPose(_)
+            | Call::RobotMouth(_)
+            | Call::RobotSound(_)
+            | Call::RobotTheremin(_)
+            | Call::RobotChorale(_)
+            | Call::RobotSetMode(_)
+            | Call::RobotShutdown => (Robot, Prompt),
+            Call::RobotSubscribe(_) => (Robot, Stream),
+            // The live map is a subscription like `robot.subscribe`; the wipe stores an
+            // event the mapping worker takes on its next spin, like any intent.
+            Call::RobotMap => (Robot, Stream),
+            Call::RobotMapWipe => (Robot, Prompt),
+            // `btd` asking what to put on the air. The answering connection carries the beacon
+            // stream down and `chorale.heard` notifications up.
+            Call::ChoraleSubscribe => (Robot, Stream),
+
+            // ── configd ─────────────────────────────────────────────────────
+            Call::NetStatus
+            | Call::NetForget(_)
+            | Call::SystemInfo
+            | Call::SystemServices
+            | Call::SystemSetName(_)
+            | Call::SystemReboot
+            | Call::SystemPairingPin
+            | Call::SystemSetPairingPin(_)
+            | Call::PadStatus
+            | Call::PadForget(_) => (Config, Prompt),
+            // Re-sweeps the radio rather than returning the last scan.
+            Call::NetScan => (Config, Slow),
+            // `configd` polls NetworkManager for up to 45 seconds before calling a join failed,
+            // and `pad.pair` waits on a gamepad for its whole timeout. Both hold the connection
+            // for that long, which is what `Operation` is for — and why `net.status` must not be
+            // queued behind them.
+            Call::NetConnect(_) | Call::PadPair(_) => (Config, Operation),
+
+            // ── padd and tofd ───────────────────────────────────────────────
+            //
+            // Both are streams, and both are named here even though the only transport that
+            // exists today reaches neither: what a call *is* does not depend on who may ask it.
+            Call::PadInput => (Pad, Stream),
+            Call::TofStream => (Tof, Stream),
+
+            // ── answered by no service ──────────────────────────────────────
+            //
+            // The PIN check belongs to the transport, which is the whole point of it: BLE cannot
+            // express a fixed passkey printed on a robot, so the check moved up a layer to where
+            // we define the rules (`docs/design/app-path-design.md` §5). A transport that does not
+            // gate anything simply never sees this call.
+            Call::SystemAuthenticate(_) => return None,
+            // These two never dial a service: they travel inside the connection that
+            // `chorale.subscribe` opened — the beacon stream down, what the radio heard up.
+            Call::ChoraleBeaconSet(_) | Call::ChoraleHeard(_) => return None,
+        })
+    }
+
     /// The component this call is about, where it names one.
     pub fn component(&self) -> Option<&ComponentId> {
         match self {
@@ -707,6 +992,7 @@ impl Call {
             Call::Select(p) => encode(p),
             Call::Pin(p) => encode(p),
             Call::Log(p) => encode(p),
+            Call::Show(p) => encode(p),
             Call::RobotMove(p) => encode(p),
             Call::RobotHead(p) => encode(p),
             Call::RobotLook(p) => encode(p),
@@ -714,7 +1000,12 @@ impl Call {
             Call::RobotDo(p) => encode(p),
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
+            Call::RobotSetMode(p) => encode(p),
             Call::RobotSound(p) => encode(p),
+            Call::RobotTheremin(p) => encode(p),
+            Call::RobotChorale(p) => encode(p),
+            Call::ChoraleBeaconSet(p) => encode(p),
+            Call::ChoraleHeard(p) => encode(p),
             Call::RobotSubscribe(p) => encode(p),
             Call::NetConnect(p) => encode(p),
             Call::NetForget(p) => encode(p),
@@ -743,6 +1034,7 @@ impl Call {
             | Call::PadStatus
             | Call::PadInput
             | Call::TofStream
+            | Call::ChoraleSubscribe
             | Call::RobotMap
             | Call::RobotMapWipe => Value::Object(serde_json::Map::new()),
         }
@@ -770,6 +1062,7 @@ impl Call {
             method::STATUS => Call::Status,
             method::LIST_INSTALLED => Call::ListInstalled(decode(params)?),
             method::LOG => Call::Log(decode(params)?),
+            method::SHOW => Call::Show(decode(params)?),
             method::SUBSCRIBE => Call::Subscribe,
             method::ROBOT_SAFE_TO_RESTART => Call::RobotSafeToRestart,
             method::ROBOT_HEALTH => Call::RobotHealth,
@@ -786,8 +1079,14 @@ impl Call {
             method::ROBOT_POSE => Call::RobotPose(decode(params)?),
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
             method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
+            method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
+            method::ROBOT_CHORALE => Call::RobotChorale(decode(params)?),
+            method::CHORALE_SUBSCRIBE => Call::ChoraleSubscribe,
+            method::CHORALE_BEACON => Call::ChoraleBeaconSet(decode(params)?),
+            method::CHORALE_HEARD => Call::ChoraleHeard(decode(params)?),
             method::ROBOT_SHUTDOWN => Call::RobotShutdown,
             method::ROBOT_MODE => Call::RobotMode,
+            method::ROBOT_SET_MODE => Call::RobotSetMode(decode(params)?),
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -822,6 +1121,146 @@ impl Call {
                 ));
             }
         })
+    }
+}
+
+/// Fixtures for tests, in this crate and in its consumers.
+///
+/// Behind a feature so nothing here reaches a robot, and it adds no dependencies — this crate is
+/// on the recovery path and its dependency list is deliberately three crates long.
+///
+/// It exists because two copies of [`every_call`] had already appeared, one here and one in
+/// `btd::route`, and they had already drifted — 115 lines against 82. A third was about to be
+/// written for `mediad`.
+// `any(test, ...)` so this crate's own tests reach it without the feature being enabled, which is
+// the difference between `cargo test -p duck-ipc-proto` working and not.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use super::*;
+
+    /// One of every [`Call`] variant, so a test cannot silently skip one.
+    ///
+    /// The exhaustive matches over [`Call`] — `method`, `destination`, and each transport's
+    /// permission table — are what force this list to stay complete: a new variant breaks those
+    /// builds, and whoever fixes them arrives here next.
+    pub fn every_call() -> Vec<Call> {
+        let component = ComponentId::new("daemon");
+        let version = semver::Version::new(1, 4, 2);
+        vec![
+            Call::Hello(HelloParams {
+                api_version: API_VERSION,
+            }),
+            Call::Check(ComponentParams {
+                component: component.clone(),
+            }),
+            Call::Apply(ApplyParams {
+                component: component.clone(),
+                target: Target::Exact(version.clone()),
+                options: ApplyOptions {
+                    dry_run: true,
+                    interrupt_sessions: false,
+                    from_dir: None,
+                },
+            }),
+            Call::Rollback(ComponentParams {
+                component: component.clone(),
+            }),
+            Call::ResetToGolden(ComponentParams {
+                component: component.clone(),
+            }),
+            Call::Select(SelectParams {
+                component: component.clone(),
+                version: version.clone(),
+            }),
+            Call::Pin(PinParams {
+                component: component.clone(),
+                version: Some(version),
+            }),
+            Call::Status,
+            Call::ListInstalled(ComponentParams { component }),
+            Call::Log(LogParams { limit: 20 }),
+            Call::Show(ShowParams { run: Some(42) }),
+            Call::Subscribe,
+            Call::RobotSafeToRestart,
+            Call::RobotHealth,
+            Call::RobotModelApi,
+            Call::RobotRemoteSessionActive,
+            Call::RobotMove(MoveParams {
+                vx: 0.2,
+                vy: -0.1,
+                vyaw: 0.4,
+            }),
+            Call::RobotHead(HeadParams {
+                neck_pitch: 0.35,
+                head_pitch: -0.1,
+                head_yaw: 0.2,
+                head_roll: 0.0,
+            }),
+            Call::RobotLook(LookParams {
+                x: 1.0,
+                y: 0.25,
+                z: -0.1,
+                neck_pitch: 0.2,
+            }),
+            Call::RobotStop,
+            Call::RobotEnable(EnableParams {
+                on: true,
+                toggle: false,
+            }),
+            Call::RobotInit,
+            Call::RobotRelax,
+            Call::RobotDo(DoParams {
+                skill: Skill::GroundPick,
+            }),
+            Call::RobotPose(PoseParams {
+                z: -0.01,
+                roll: 0.05,
+                pitch: -0.1,
+                active: true,
+            }),
+            Call::RobotMouth(MouthParams { open: 0.5 }),
+            Call::RobotSound(SoundParams {
+                tag: SoundTag::Chirp,
+                hold: None,
+            }),
+            Call::RobotShutdown,
+            Call::RobotMode,
+            Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
+            Call::NetStatus,
+            Call::NetScan,
+            Call::NetConnect(NetConnectParams {
+                ssid: "Pollen Guest".into(),
+                psk: Some("hunter2 with spaces".into()),
+            }),
+            Call::NetForget(NetForgetParams {
+                ssid: "Old Network".into(),
+            }),
+            Call::SystemInfo,
+            Call::SystemServices,
+            Call::SystemSetName(SetNameParams {
+                name: "duck-01".into(),
+            }),
+            Call::SystemReboot,
+            Call::SystemPairingPin,
+            Call::SystemSetPairingPin(SetPairingPinParams {
+                pin: "042042".into(),
+            }),
+            Call::SystemAuthenticate(AuthenticateParams {
+                pin: "000000".into(),
+            }),
+            Call::PadStatus,
+            Call::PadPair(PadPairParams {
+                mac: Some("78:86:2E:BB:13:28".into()),
+                timeout_seconds: Some(20),
+            }),
+            Call::PadForget(PadForgetParams {
+                mac: "78:86:2E:BB:13:28".into(),
+            }),
+            Call::PadInput,
+            Call::TofStream,
+            Call::RobotMap,
+            Call::RobotMapWipe,
+        ]
     }
 }
 
@@ -1211,6 +1650,76 @@ pub struct SoundParams {
     pub hold: Option<bool>,
 }
 
+/// See [`method::ROBOT_THEREMIN`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThereminParams {
+    /// True picks the instrument up, false puts it down. Idempotent both ways: a client
+    /// that cannot remember whether it already asked may simply ask again.
+    pub active: bool,
+}
+
+/// Answer to [`Call::RobotTheremin`].
+///
+/// Refused only for what the robot can know at the door: no voice, no depth frames, the
+/// feature switched off. Once accepted it plays immediately — there is no arming step — and
+/// [`RobotState::theremin`] carries what it is doing, including what the sensor is saying
+/// about each frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThereminResult {
+    pub accepted: bool,
+    /// Why not, when `accepted` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Default for ThereminResult {
+    fn default() -> Self {
+        Self {
+            accepted: true,
+            reason: None,
+        }
+    }
+}
+
+/// What the theremin is doing, in [`RobotState`].
+///
+/// Absent from the frame entirely while the instrument is down, which is the ordinary state
+/// of a duck — so a client that never asks for a theremin never pays for one in its state
+/// stream, and one built before this simply does not see the field.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThereminState {
+    /// Distance to the hand being played, metres. `None` when nothing is in the playable
+    /// band — which is silence, not an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hand_range_m: Option<f64>,
+    /// The note being sounded, hertz. `None` when silent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_hz: Option<f64>,
+    /// How far open the mouth is being driven, 0..1 — the same number the pitch came from.
+    pub mouth: f64,
+    /// How many zones the hand covers. Zero while silent. The number that says whether a
+    /// dropout was the hand leaving or the sensor blinking.
+    pub zones: u32,
+    /// This note is the held memory of a frame just gone, bridging a sensor dropout, rather
+    /// than something measured now. Reported so a readout can show that rather than implying
+    /// it still sees a hand.
+    #[serde(default, skip_serializing_if = "not")]
+    pub held: bool,
+    /// What the sensor said about this frame, as a line: how many zones carry a status the
+    /// robot believes, then the count per status code with a `*` on the believed ones — e.g.
+    /// `12 usable · 255:40 4*:12 5*:8 1:4`.
+    ///
+    /// Diagnostic, and the one worth carrying on the wire: a theremin that stops working past
+    /// 30 cm and a frame where status 4 covers half the grid are the same fact, but only the
+    /// second says what to change. The first version of this feature accepted only ST's two
+    /// "valid" codes and died at exactly that distance, invisibly, for want of this line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensor: Option<String>,
+}
+
 /// The one-shot skills, plus the sit↔stand toggle. See [`method::ROBOT_DO`].
 ///
 /// An enum rather than a free string so a typo is [`code::INVALID_PARAMS`] at the door,
@@ -1272,6 +1781,16 @@ impl Default for PoseParams {
 pub struct MouthParams {
     /// 0 closed, 1 fully open. Clamped by the robot.
     pub open: f64,
+}
+
+/// Which mode to switch to, for [`Call::RobotSetMode`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SetModeParams {
+    /// `"walk"` or `"roller"`. A string for the same reason [`ModeResult`] carries one: a mode
+    /// this build has never heard of should come back as a refusal naming what it does know,
+    /// not as a parse error with no explanation in it.
+    pub mode: String,
 }
 
 /// Answer to [`Call::RobotMode`].
@@ -1453,6 +1972,15 @@ pub struct PinParams {
 #[serde(deny_unknown_fields)]
 pub struct LogParams {
     pub limit: usize,
+}
+
+/// Which run to transcribe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShowParams {
+    /// `None` means the most recent run, which is what someone debugging an update that has
+    /// just happened wants and should not have to look up first.
+    pub run: Option<u64>,
 }
 
 /// Join a wifi network.
@@ -1702,12 +2230,21 @@ pub enum ApplyResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
-    /// Unix seconds.
+    /// Unix seconds. Stamped when the attempt *finished*, not when it started — the entry is
+    /// written on the way out of `apply`. Anyone reading backwards from here for the run's own
+    /// logs has to walk backwards; [`RunTranscript`] carries both ends and spares them that.
     pub at: i64,
     pub component: ComponentId,
     pub from: Option<semver::Version>,
     pub to: Option<semver::Version>,
     pub outcome: Outcome,
+    /// Which transcript holds what this attempt actually did — [`Call::Show`]'s argument.
+    ///
+    /// `None` for entries written before transcripts existed, and for an attempt that failed
+    /// before one could be opened. `default` and `skip_serializing_if`, so an old log file still
+    /// parses and a new one still means something to an older client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1721,6 +2258,123 @@ pub enum Outcome {
     Aborted {
         reason: String,
     },
+}
+
+/// One line of an update's transcript.
+///
+/// **On disk, not only in the journal**, for the reason the update log itself is
+/// (`updater::journal`): the record of what an update did must survive the symlink swap, the
+/// rollback, and the power loss the update may itself have provoked. `/var/log` on this board is
+/// zram, so the journal survives a clean reboot and not a power cut — and a power cut is one of
+/// the likelier endings of exactly the updates someone needs this for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRecord {
+    /// Unix seconds.
+    pub at: i64,
+    /// Flattened, so a line of the file reads as one flat object. This file is meant to be
+    /// `cat`ed and `grep`ed on a board where `robotctl` may itself be the thing that is broken,
+    /// and `{"at":…,"event":{"event":"phase",…}}` is worse to read than `{"at":…,"event":"phase",…}`.
+    #[serde(flatten)]
+    pub event: RunEvent,
+}
+
+/// What happened, at one moment of one update.
+///
+/// Typed rather than a free-text line, because the renderer aligns and colours these and a
+/// machine reading `--json` should not have to parse prose. [`Self::Note`] is the escape hatch
+/// for the genuinely shapeless, and a variant this release does not know decodes as
+/// [`Self::Unrecognised`] rather than failing the whole transcript — a newer `updaterd`'s
+/// record must stay readable by the `robotctl` that is on the board asking about it, which
+/// during a partial update is precisely the pairing that exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum RunEvent {
+    /// The run opened: what was asked for, by whom, and what was live at the time.
+    Began {
+        component: ComponentId,
+        /// The target as the caller named it — `latest`, `0.1.4`, `ref my-branch`, `staging`,
+        /// `dir /home/pi/push`. Rendered, not structured: it exists to be read back to whoever
+        /// is asking "what did I actually run", and `Target` already carries the structure.
+        target: String,
+        /// The release live when the run began.
+        installed: Option<semver::Version>,
+        /// Where the manifest was going to be fetched from.
+        source: String,
+        /// `uid=1000 gid=1000 pid=2317`, from `SO_PEERCRED`. `None` for the unattended path and
+        /// for the sideload CLI, where there is no peer.
+        requested_by: Option<String>,
+    },
+    /// A phase boundary. The backbone of the transcript.
+    Phase {
+        phase: Phase,
+        detail: Option<String>,
+    },
+    /// The manifest that passed its signature check — every fact that decides what follows.
+    Manifest {
+        version: semver::Version,
+        sha256: String,
+        bytes: Option<u64>,
+        url: Option<String>,
+        /// Which trusted key verified it. A set of keys is allowed, so which one matters.
+        signed_by: Option<String>,
+        source_revision: Option<String>,
+    },
+    /// A hook ran, with its output verbatim. The richest thing in the file: this is the ONNX
+    /// Runtime and GStreamer install talking, and its whole report is the answer to "can this
+    /// board encode H.264 at this release".
+    Hook {
+        hook: String,
+        exit_code: Option<i32>,
+        output: String,
+    },
+    /// A unit was restarted, reloaded, or scheduled for restart, and how that went.
+    Unit {
+        unit: String,
+        action: String,
+        detail: Option<String>,
+    },
+    /// The health gate's verdict — the thing that decides commit versus rollback.
+    Health {
+        passed: bool,
+        detail: Option<String>,
+    },
+    /// Worth writing down, with no shape of its own.
+    Note { text: String },
+    /// How the run ended. Absent from a transcript whose run was cut short — by the deferred
+    /// restart of `updaterd` itself, or by the power going away — and that absence is the point:
+    /// a transcript with no `ended` is a run whose verdict is elsewhere.
+    Ended {
+        /// The update log's verdict, where this run produced one. `None` for the two outcomes the
+        /// log deliberately does not keep — a dry run, and an apply that found nothing to do —
+        /// which are still perfectly good runs to have a transcript of.
+        outcome: Option<Outcome>,
+        /// One sentence, always. What `robotctl update show` prints as the last line, and what
+        /// spares a reader from having to interpret the tagged outcome above it.
+        summary: String,
+    },
+    /// The per-run caps stopped the writer, and this many events were dropped after it.
+    ///
+    /// A typed event rather than a flag on the transcript, because it has a *place*: everything
+    /// before it was recorded, everything between it and the end was not. A boolean could say
+    /// that something was missing but not where the hole is.
+    Truncated { dropped: u64 },
+    /// A variant from a later release. Kept as a placeholder so one unknown line does not cost
+    /// the reader the rest of the run.
+    #[serde(other)]
+    Unrecognised,
+}
+
+/// Answer to [`Call::Show`]: one run, in full.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTranscript {
+    pub run: u64,
+    pub component: ComponentId,
+    /// Oldest first. This is a story and it is read forwards.
+    pub events: Vec<RunRecord>,
+    /// Every run still on disk, newest first — so a client that asked for the latest can say
+    /// what else there is without a second call.
+    #[serde(default)]
+    pub available: Vec<u64>,
 }
 
 /// Answer to [`Call::RobotSafeToRestart`].
@@ -1978,6 +2632,36 @@ pub struct RobotState {
     /// that has not moved.
     #[serde(default)]
     pub odom: OdomState,
+    /// What the ToF theremin is doing, when one is being played. Absent while the
+    /// instrument is down — see [`ThereminState`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theremin: Option<ThereminState>,
+    /// What the chorale is doing, when one is running. Absent otherwise, which is the ordinary
+    /// state of a duck — see [`ChoraleState`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chorale: Option<ChoraleState>,
+}
+
+/// What the duck chorale is doing, in [`RobotState`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChoraleState {
+    /// Looking for other ducks — on the air and scanning.
+    pub listening: bool,
+    /// Which part this duck is singing: `bass`, `tenor`, `alto`, `soprano`. `None` while it is
+    /// listening, alone, or waiting to be seated by a conductor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part: Option<String>,
+    /// A conductor has been adopted and the phase lock is still filling — the state between
+    /// "waiting for company" and "singing". Carried because a readout that showed both as
+    /// "listening" hid a locking failure through three debugging sessions.
+    #[serde(default, skip_serializing_if = "not")]
+    pub joining: bool,
+    /// How far into the piece, in beats. `None` when not singing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub beats: Option<f64>,
+    /// How many ducks are singing, this one included.
+    pub voices: u32,
 }
 
 /// The contact-odometry estimate: trunk pose in the world frame the IMU chose
@@ -2728,6 +3412,240 @@ pub mod b64 {
     }
 }
 
+/// See [`method::ROBOT_CHORALE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChoraleParams {
+    /// True starts listening for other ducks, false stops and falls silent. Idempotent both ways.
+    pub active: bool,
+    /// Pin which piece this robot picks when *it* conducts. `None` lets it choose. A follower
+    /// sings what the conductor's beacon names regardless — an ensemble where everyone insists
+    /// on their own song is not one — so to guarantee a piece, set it on every duck.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub piece: Option<u8>,
+}
+
+/// Answer to [`Call::RobotChorale`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChoraleResult {
+    pub accepted: bool,
+    /// Why not — no voice, no radio, or the robot has not opted in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Default for ChoraleResult {
+    fn default() -> Self {
+        Self {
+            accepted: true,
+            reason: None,
+        }
+    }
+}
+
+/// What `robotd` wants on the air — a [`method::CHORALE_BEACON`] notification.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChoraleAdvertise {
+    /// The beacon to broadcast, or `None` to take the advertisement down.
+    ///
+    /// Down matters as much as up: a second advertising instance halves the rate of the first, and
+    /// `btd`'s front-door interval was tuned against measurements — so the beacon exists only while
+    /// a chorale does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub beacon: Option<ChoraleBeacon>,
+    /// Whether to be listening for other ducks' beacons at all. Separate from `beacon` because a
+    /// duck that has been asked to stop should stop scanning too, and a duck that is only listening
+    /// still scans while advertising an idle beacon.
+    pub listening: bool,
+}
+
+/// A beacon `btd` heard — a [`method::CHORALE_HEARD`] notification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChoraleHeard {
+    pub beacon: ChoraleBeacon,
+    /// Which radio it came from, as `btd` renders an address. An identity for de-duplication only.
+    pub from: String,
+    /// How long ago `btd` saw it, in microseconds.
+    ///
+    /// An age rather than a timestamp, and that is the whole reason this is usable for
+    /// synchronisation: the two daemons share a machine but not an epoch, and an age survives the
+    /// trip down a socket in a way a timestamp from another process's clock does not. `robotd`
+    /// subtracts it from its own clock on arrival.
+    pub age_us: u64,
+}
+
+/// The duck chorale's beacon: what one duck puts on the air so others can sing with it.
+///
+/// **A wire contract, and the only one that is not JSON.** Every other message in this crate rides
+/// a socket; this one rides a BLE advertisement, because a chorale has to work between two robots
+/// with no network between them and no clock in common. It lives here for the reason
+/// `btd::adv`'s address layout lives in `btd` — one implementation of the layout, so the half that
+/// broadcasts and the half that scans cannot disagree about it.
+///
+/// ## Why these four bytes and no more
+///
+/// The controller reports a 251-byte advertising budget, so this is small by choice rather than by
+/// necessity: **every field is something several ducks have to agree about**, and the fewer of
+/// those there are the fewer ways they can disagree. Notably absent is any kind of timestamp —
+/// the arrival of a new [`ChoraleBeacon::beat`] *is* the downbeat, which is what lets a chorale
+/// work with no shared clock at all.
+///
+/// Also absent is the robot's voice seed. Casting consumes a duck's pitch centre and nothing else
+/// (`sounds::chorale::cast`), so that is what goes out — quantised to a byte — and the seed, which
+/// is the robot's identity, stays at home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChoraleBeacon {
+    /// Which piece is being sung, so a duck arriving late knows what to join. Zero means "willing,
+    /// but nothing is being sung" — which is what a duck with `accept_chorale` on advertises while
+    /// it waits for company.
+    pub piece: u8,
+    /// The beat the conductor is on, wrapping. A byte is about four minutes at a chorale tempo;
+    /// the follower unwraps it (`sounds::chorale::beat::Follower`).
+    pub beat: u8,
+    /// The advertiser's own register — its pitch centre, quantised. All casting needs.
+    pub register: u8,
+    /// Tie-break and identity, derived from the seed rather than being it. Sixteen bits, and
+    /// that width is load-bearing: this id is also how a duck recognises its *own* beacon
+    /// reflected back, and how every duck merges sightings of the same peer. With one byte, a
+    /// four-duck room collided a pair on the first day — the fourth duck rolled the
+    /// conductor's byte, everyone merged the two into one duck, and it dropped the conductor's
+    /// beacons as its own reflection and could never join.
+    pub id: u16,
+    /// Who is singing, in seating order — `(register, id)` per duck. Empty from a duck that is only
+    /// listening.
+    ///
+    /// **This is what stops two ducks singing each other's part.** Seating depends on join order
+    /// (`sounds::chorale::seat`), so a duck that seats itself from whatever it happened to hear
+    /// disagrees with one that heard a different subset — and both then sing alto. The conductor
+    /// keeps the roster and broadcasts it; everyone else replays `seat_all` over it. One source of
+    /// truth, which is what a conductor is for.
+    ///
+    /// There is room: the controller reports a 251-byte advertising budget and a full quartet's
+    /// roster is eight bytes.
+    pub roster: Vec<(u8, u16)>,
+}
+
+impl ChoraleBeacon {
+    /// Bottom and top of the range [`ChoraleBeacon::register`] covers.
+    ///
+    /// Brackets the whole duck population — `sounds::Personality` clamps a pitch centre to
+    /// 110–620 Hz — with margin at both ends, so neither the lowest nor the highest duck sits on a
+    /// clamp. A byte over that span is ~2 Hz a step, a fortieth of a semitone at the bottom, far
+    /// finer than casting looks at.
+    pub const REGISTER_LOW_HZ: f64 = 100.0;
+    pub const REGISTER_HIGH_HZ: f64 = 625.0;
+
+    /// Hertz per step of [`ChoraleBeacon::register`].
+    pub const REGISTER_STEP_HZ: f64 = (Self::REGISTER_HIGH_HZ - Self::REGISTER_LOW_HZ) / 255.0;
+
+    /// The piece number that means "willing, but not singing".
+    pub const IDLE: u8 = 0;
+
+    /// Marks the payload as a chorale beacon rather than some other four bytes.
+    ///
+    /// The advertisement's service UUID already says "this is a duck", so this only has to separate
+    /// *this* payload from the address field the other advertising instance carries — a scanner
+    /// reading four bytes of IPv4 as a beacon would hear a beat in `192.168.1.42`.
+    pub const TAG: u8 = 0xC0;
+
+    /// Quantise a pitch centre into [`ChoraleBeacon::register`].
+    pub fn quantise_register(pitch_center_hz: f64) -> u8 {
+        ((pitch_center_hz - Self::REGISTER_LOW_HZ) / Self::REGISTER_STEP_HZ)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    }
+
+    /// The pitch centre this register stands for.
+    pub fn pitch_center_hz(&self) -> f64 {
+        Self::REGISTER_LOW_HZ + f64::from(self.register) * Self::REGISTER_STEP_HZ
+    }
+
+    /// Whether this beacon says a piece is under way.
+    pub fn singing(&self) -> bool {
+        self.piece != Self::IDLE
+    }
+
+    /// The most ducks a roster carries, and so the most that can sing together.
+    ///
+    /// Four, because the piece has four parts. A fifth duck in the room keeps listening rather than
+    /// joining: `sounds::chorale::seat` can double a part, but nothing seats a fifth duck over the
+    /// radio, and a beacon is not the place to describe a choir. If doubling is ever wanted on
+    /// hardware, this and the roster guard in `robotd`'s chorale are the two places that cap it.
+    pub const MAX_ROSTER: usize = 4;
+
+    /// The manufacturer-data payload: tag, the fixed fields, then the roster length and its
+    /// entries. Ids are big-endian u16 — see [`ChoraleBeacon::id`] for why they grew.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let roster = &self.roster[..self.roster.len().min(Self::MAX_ROSTER)];
+        let mut bytes = vec![Self::TAG, self.piece, self.beat, self.register];
+        bytes.extend(self.id.to_be_bytes());
+        bytes.push(roster.len() as u8);
+        for (register, id) in roster {
+            bytes.push(*register);
+            bytes.extend(id.to_be_bytes());
+        }
+        bytes
+    }
+
+    /// Read a beacon out of a manufacturer-data payload.
+    ///
+    /// `None` for anything that is not exactly this layout, length included. The company id these
+    /// ride under is `0xFFFF`, the SIG's testing id that anyone may use, so a payload of the wrong
+    /// shape is somebody else's advertisement and not a malformed one of ours — which is also why
+    /// a *longer* payload is rejected rather than read leniently: a future beacon with more in it
+    /// is not this one.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let [
+            Self::TAG,
+            piece,
+            beat,
+            register,
+            id_hi,
+            id_lo,
+            count,
+            rest @ ..,
+        ] = bytes
+        else {
+            return None;
+        };
+        let count = usize::from(*count);
+        if count > Self::MAX_ROSTER || rest.len() != count * 3 {
+            return None;
+        }
+        Some(Self {
+            piece: *piece,
+            beat: *beat,
+            register: *register,
+            id: u16::from_be_bytes([*id_hi, *id_lo]),
+            roster: rest
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|entry| (entry[0], u16::from_be_bytes([entry[1], entry[2]])))
+                .collect(),
+        })
+    }
+
+    /// This duck's index in the roster, if it is in there — which is how it learns its part.
+    pub fn seat_of(&self, register: u8, id: u16) -> Option<usize> {
+        self.roster
+            .iter()
+            .position(|(r, i)| *r == register && *i == id)
+    }
+
+    /// The roster's registers as pitch centres, for `sounds::chorale::seat_all`.
+    pub fn roster_registers(&self) -> Vec<f64> {
+        self.roster
+            .iter()
+            .map(|(register, _)| {
+                Self::REGISTER_LOW_HZ + f64::from(*register) * Self::REGISTER_STEP_HZ
+            })
+            .collect()
+    }
+}
+
 /// `skip_serializing_if` for a `bool` that is false by default.
 fn not(b: &bool) -> bool {
     !*b
@@ -2881,6 +3799,62 @@ pub fn publish_identity(service: &str, build: BuildInfo) -> Result<(), String> {
     std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// What `mediad`'s capture path is doing, published for `robotctl` to read.
+///
+/// A file rather than a query, for the same reason [`Identity`] is one: it needs no socket, no
+/// privilege and no protocol version, and it answers just as well when the daemon has stopped
+/// (systemd removes the runtime directory with the unit, so absence means "not running").
+///
+/// `mediad` is not a request/response service — it routes calls upstream rather than answering
+/// them — so adding a served call for this would mean giving it a socket it otherwise has no use
+/// for. If a WebRTC peer ever needs these numbers, that is the moment to reconsider.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraStats {
+    /// Measured delivery rate at the pad before the tee, frames per second.
+    ///
+    /// Measured *there* on purpose: every other place in that pipeline sits behind something that
+    /// drops — a leaky queue, the encoder's queue, a `videorate drop-only` — and reporting one of
+    /// those as the capture rate is a mistake this project has already made four times.
+    pub fps: f64,
+    /// What was asked for, so a reader can judge `fps` without knowing the configuration.
+    pub target_fps: u32,
+    pub width: u32,
+    pub height: u32,
+    /// GStreamer format name of what the capture path emits, e.g. `UYVY`.
+    pub format: String,
+    /// Frames delivered since start.
+    pub frames: u64,
+    /// Frames the *driver* captured and we never saw, counted from gaps in the sequence number
+    /// `v4l2src` leaves in each buffer's offset. Distinct from frames dropped downstream by our
+    /// own queues, which is a choice rather than a fault.
+    pub dropped: u64,
+    /// WebRTC peers currently being encoded for. Zero is normal — nothing encodes until someone
+    /// connects.
+    pub consumers: u32,
+}
+
+/// Where `mediad` publishes [`CameraStats`].
+fn camera_stats_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/run/mediad/camera.json")
+}
+
+/// Publish [`CameraStats`]. Never fatal: a robot that cannot describe its camera still has one.
+pub fn publish_camera_stats(stats: &CameraStats) -> Result<(), String> {
+    let path = camera_stats_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut json = serde_json::to_vec(stats).map_err(|e| e.to_string())?;
+    json.push(b'\n');
+    std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// What `mediad` published about its camera, or `None` — not running, no camera, or too old.
+pub fn read_camera_stats() -> Option<CameraStats> {
+    serde_json::from_slice(&std::fs::read(camera_stats_path()).ok()?).ok()
+}
+
 /// What one daemon published, or `None` if it published nothing.
 ///
 /// `None` covers both "not running" — systemd removes the directory with the unit — and "too old to
@@ -2928,6 +3902,7 @@ macro_rules! log_startup_identity {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::every_call;
     use super::*;
 
     /// The path a release actually installs to, which is what makes "which version is running"
@@ -3006,135 +3981,84 @@ mod tests {
         unsafe { std::env::remove_var("DUCK_RUNTIME_DIR") };
     }
 
-    /// One of every [`Call`] variant, so the tests below cannot silently skip one.
-    fn every_call() -> Vec<Call> {
-        let component = ComponentId::new("daemon");
-        let version = semver::Version::new(1, 4, 2);
-        vec![
-            Call::Hello(HelloParams {
-                api_version: API_VERSION,
-            }),
-            Call::Check(ComponentParams {
-                component: component.clone(),
-            }),
-            Call::Apply(ApplyParams {
-                component: component.clone(),
-                target: Target::Exact(version.clone()),
-                options: ApplyOptions {
-                    dry_run: true,
-                    interrupt_sessions: false,
-                    from_dir: None,
-                },
-            }),
-            Call::Rollback(ComponentParams {
-                component: component.clone(),
-            }),
-            Call::ResetToGolden(ComponentParams {
-                component: component.clone(),
-            }),
-            Call::Select(SelectParams {
-                component: component.clone(),
-                version: version.clone(),
-            }),
-            Call::Pin(PinParams {
-                component: component.clone(),
-                version: Some(version),
-            }),
-            Call::Status,
-            Call::ListInstalled(ComponentParams { component }),
-            Call::Log(LogParams { limit: 20 }),
-            Call::Subscribe,
-            Call::RobotSafeToRestart,
-            Call::RobotHealth,
-            Call::RobotModelApi,
-            Call::RobotRemoteSessionActive,
-            Call::RobotMove(MoveParams {
-                vx: 0.2,
-                vy: -0.1,
-                vyaw: 0.4,
-            }),
-            Call::RobotHead(HeadParams {
-                neck_pitch: 0.35,
-                head_pitch: -0.1,
-                head_yaw: 0.2,
-                head_roll: 0.0,
-            }),
-            Call::RobotLook(LookParams {
-                x: 1.0,
-                y: 0.25,
-                z: -0.1,
-                neck_pitch: 0.2,
-            }),
-            Call::RobotStop,
-            Call::RobotEnable(EnableParams {
-                on: true,
-                toggle: false,
-            }),
-            Call::RobotInit,
-            Call::RobotRelax,
-            Call::RobotDo(DoParams {
-                skill: Skill::GroundPick,
-            }),
-            Call::RobotPose(PoseParams {
-                z: -0.01,
-                roll: 0.05,
-                pitch: -0.1,
-                active: true,
-            }),
-            Call::RobotMouth(MouthParams { open: 0.5 }),
-            Call::RobotSound(SoundParams {
-                tag: SoundTag::Chirp,
-                hold: None,
-            }),
-            Call::RobotShutdown,
-            Call::RobotMode,
-            Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
-            Call::NetStatus,
-            Call::NetScan,
-            Call::NetConnect(NetConnectParams {
-                ssid: "Pollen Guest".into(),
-                psk: Some("hunter2 with spaces".into()),
-            }),
-            Call::NetForget(NetForgetParams {
-                ssid: "Old Network".into(),
-            }),
-            Call::SystemInfo,
-            Call::SystemServices,
-            Call::SystemSetName(SetNameParams {
-                name: "duck-01".into(),
-            }),
-            Call::SystemReboot,
-            Call::SystemPairingPin,
-            Call::SystemSetPairingPin(SetPairingPinParams {
-                pin: "042042".into(),
-            }),
-            Call::SystemAuthenticate(AuthenticateParams {
-                pin: "000000".into(),
-            }),
-            Call::PadStatus,
-            Call::PadPair(PadPairParams {
-                mac: Some("78:86:2E:BB:13:28".into()),
-                timeout_seconds: Some(20),
-            }),
-            Call::PadForget(PadForgetParams {
-                mac: "78:86:2E:BB:13:28".into(),
-            }),
-            Call::TofStream,
-            Call::RobotMap,
-            Call::RobotMapWipe,
-        ]
-    }
-
     /// `every_call` is a hand-written list, so a new variant is silently untested unless
     /// someone remembers to add it. Pin the count: adding a `Call` without extending the
     /// list fails here, which is the only thing standing between a new method and it never
     /// being round-tripped at all.
+    /// `destination` answers for every call but the one the transport answers itself.
+    ///
+    /// The `None` arm is a single deliberate case — `system.authenticate`, whose check belongs to
+    /// the transport rather than to any service. A second `None` appearing here would mean a call
+    /// no service owns, which is a call nobody can serve.
+    #[test]
+    fn only_authenticate_has_no_service() {
+        for call in every_call() {
+            let has = call.destination().is_some();
+            let expected = !matches!(call, Call::SystemAuthenticate(_));
+            assert_eq!(
+                has,
+                expected,
+                "{} destination() = {:?}",
+                call.method(),
+                call.destination()
+            );
+        }
+    }
+
+    /// A stream holds its connection forever, so it must never share a lane with a call that
+    /// expects an answer.
+    ///
+    /// Pinned because the failure is silent and specific: `update.subscribe` owns its connection
+    /// and never reads another request, so anything queued behind it is written into a socket
+    /// nobody reads — it never runs, never replies and never errors.
+    #[test]
+    fn subscriptions_are_the_only_thing_on_the_stream_lane() {
+        for call in every_call() {
+            if let Some((_, Lane::Stream)) = call.destination() {
+                assert!(
+                    matches!(
+                        call,
+                        Call::Subscribe
+                            | Call::RobotSubscribe(_)
+                            | Call::RobotMap
+                            | Call::PadInput
+                            | Call::TofStream
+                    ),
+                    "{} is on the Stream lane but is not a subscription",
+                    call.method()
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            46,
+            48,
             "a Call variant was added or removed — update every_call() and this count"
+        );
+    }
+
+    /// Every method name in the list is distinct.
+    ///
+    /// Worth stating what the count above can and cannot do, because it gave false comfort once.
+    /// It catches a list edited without the count being bumped — and it cannot catch a variant
+    /// added to [`Call`] and to neither, which is how `pad.input` came to be missing from
+    /// `every_call` while this test passed at 44.
+    ///
+    /// What actually caught that is a property test in a consumer: `mediad`'s route table asserts
+    /// that some permitted call reaches every service, and `pad.input` is the only one that
+    /// reaches `padd`. So the real defence is tests that *use* the list for something, and this
+    /// pair only guards against the cheaper mistake.
+    #[test]
+    fn every_call_has_a_distinct_method() {
+        let calls = every_call();
+        let names: std::collections::BTreeSet<_> = calls.iter().map(|c| c.method()).collect();
+        assert_eq!(
+            names.len(),
+            calls.len(),
+            "every_call lists the same method twice, so a variant is standing in for another"
         );
     }
 
@@ -3540,6 +4464,192 @@ mod tests {
         );
     }
 
+    /// The beacon's round trip, which the broadcasting half and the scanning half both depend on.
+    #[test]
+    fn a_beacon_survives_the_advertisement() {
+        let beacon = ChoraleBeacon {
+            piece: 3,
+            beat: 217,
+            register: 56,
+            id: 0x9F,
+            roster: vec![(56, 0x9F), (140, 0x02), (200, 0x71)],
+        };
+        let bytes = beacon.to_bytes();
+        assert_eq!(ChoraleBeacon::from_bytes(&bytes), Some(beacon.clone()));
+        assert!(beacon.singing());
+        // A trio's beacon is a dozen bytes — nowhere near even a legacy advertisement's budget.
+        assert!(bytes.len() <= 20, "{} bytes: {bytes:?}", bytes.len());
+
+        // Idle: willing, but nothing under way, and nobody seated. What a duck waiting for company
+        // advertises.
+        let idle = ChoraleBeacon {
+            piece: ChoraleBeacon::IDLE,
+            roster: Vec::new(),
+            ..beacon.clone()
+        };
+        assert!(!idle.singing());
+        assert_eq!(
+            ChoraleBeacon::from_bytes(&idle.to_bytes()),
+            Some(idle),
+            "an idle beacon still round-trips"
+        );
+
+        // A duck finds its own seat in the roster, which is how it learns its part.
+        assert_eq!(beacon.seat_of(56, 0x9F), Some(0));
+        assert_eq!(beacon.seat_of(200, 0x71), Some(2));
+        assert_eq!(
+            beacon.seat_of(56, 0x00),
+            None,
+            "same register, different duck"
+        );
+        // And the registers come back as pitch centres for the seating fold.
+        let registers = beacon.roster_registers();
+        assert_eq!(registers.len(), 3);
+        assert!(registers[0] < registers[1] && registers[1] < registers[2]);
+    }
+
+    /// The roster's length is part of the layout, so a truncated or overlong payload is not a
+    /// beacon — a lenient read would seat a quartet from three ducks' worth of bytes.
+    #[test]
+    fn a_roster_of_the_wrong_length_is_not_a_beacon() {
+        let good = ChoraleBeacon {
+            piece: 1,
+            beat: 0,
+            register: 56,
+            id: 1,
+            roster: vec![(56, 1), (140, 2)],
+        };
+        let bytes = good.to_bytes();
+        assert!(ChoraleBeacon::from_bytes(&bytes).is_some());
+        // One byte short, one byte long, and a count that disagrees with what follows.
+        assert_eq!(ChoraleBeacon::from_bytes(&bytes[..bytes.len() - 1]), None);
+        let mut long = bytes.clone();
+        long.push(0);
+        assert_eq!(ChoraleBeacon::from_bytes(&long), None);
+        let mut lying = bytes.clone();
+        // The count byte sits after tag, piece, beat, register and the two id bytes.
+        lying[6] = 4;
+        assert_eq!(ChoraleBeacon::from_bytes(&lying), None);
+        // More ducks than there are parts is not a chorale.
+        let crowd = ChoraleBeacon {
+            roster: vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)],
+            ..good
+        };
+        let bytes = crowd.to_bytes();
+        let back = ChoraleBeacon::from_bytes(&bytes).expect("truncated to four, not refused");
+        assert_eq!(back.roster.len(), ChoraleBeacon::MAX_ROSTER);
+    }
+
+    /// The tag is what stops a scanner reading the *other* advertising instance's IPv4 address as a
+    /// beat. Four bytes of address are a plausible beacon without it.
+    #[test]
+    fn an_address_payload_is_not_mistaken_for_a_beacon() {
+        // 192.168.1.42, as `btd::adv` would broadcast it.
+        assert_eq!(ChoraleBeacon::from_bytes(&[192, 168, 1, 42]), None);
+        // Nor is anything else of the wrong length, or the right length with the wrong tag.
+        for length in [0usize, 1, 4, 6, 16] {
+            assert_eq!(
+                ChoraleBeacon::from_bytes(&vec![ChoraleBeacon::TAG; length]),
+                None,
+                "{length} bytes"
+            );
+        }
+        assert_eq!(ChoraleBeacon::from_bytes(&[0x00, 1, 2, 3, 4, 0]), None);
+    }
+
+    /// The register byte has to be fine enough to cast from and wide enough for every duck, or two
+    /// robots would seat the ensemble differently and sing each other's parts.
+    #[test]
+    fn a_quantised_register_is_good_enough_to_cast_from() {
+        let round_trip = |hz: f64| {
+            ChoraleBeacon {
+                piece: 1,
+                beat: 0,
+                register: ChoraleBeacon::quantise_register(hz),
+                id: 0,
+                roster: Vec::new(),
+            }
+            .pitch_center_hz()
+        };
+        for hz in [110.0, 160.0, 214.4, 389.2, 491.5, 519.0, 620.0] {
+            let back = round_trip(hz);
+            assert!(
+                (back - hz).abs() <= ChoraleBeacon::REGISTER_STEP_HZ / 2.0 + 1e-9,
+                "{hz} Hz came back as {back}"
+            );
+        }
+        // Ordering survives, which is the only property casting actually asks of it.
+        assert!(ChoraleBeacon::quantise_register(214.4) < ChoraleBeacon::quantise_register(389.2));
+        // And the whole population fits without sitting on either clamp — a duck at the floor
+        // would be indistinguishable from every other duck at the floor.
+        assert!(ChoraleBeacon::quantise_register(110.0) > 0);
+        assert!(ChoraleBeacon::quantise_register(620.0) < 255);
+        assert_eq!(
+            ChoraleBeacon::quantise_register(50.0),
+            0,
+            "clamps, not wraps"
+        );
+        assert_eq!(ChoraleBeacon::quantise_register(10_000.0), 255);
+    }
+
+    /// The theremin block is absent while the instrument is down, and named when it is up:
+    /// a v12 client must see byte-for-byte the frame it saw before, and a v13 one must find
+    /// the field where the docs say it is.
+    #[test]
+    fn the_theremin_block_is_absent_until_there_is_a_theremin() {
+        let mut state = RobotState {
+            t: 1.5,
+            movement: MoveState {
+                requested: [0.0; 3],
+                applied: [0.0; 3],
+                limited_by: Vec::new(),
+            },
+            head: [0.0; 4],
+            policy: "stand".into(),
+            safety: SafetyState {
+                fallen: false,
+                limp: false,
+                gravity: [0.0, 0.0, -1.0],
+                gain: Some(200),
+            },
+            control_loop: LoopState {
+                hz: 50.0,
+                missed: 0,
+            },
+            joints: vec![0.0; 15],
+            targets: vec![0.0; 15],
+            odom: OdomState::default(),
+            theremin: None,
+            chorale: None,
+        };
+        let down = serde_json::to_string(&state).unwrap();
+        assert!(!down.contains("theremin"), "{down}");
+
+        state.theremin = Some(ThereminState {
+            hand_range_m: Some(0.31),
+            note_hz: Some(412.0),
+            mouth: 0.64,
+            zones: 9,
+            held: false,
+            sensor: Some("12 usable · 255:40 4*:12 5*:8 1:4".into()),
+        });
+        let up = serde_json::to_string(&state).unwrap();
+        assert!(up.contains(r#""theremin":{"hand_range_m":0.31"#), "{up}");
+        assert!(up.contains(r#""note_hz":412.0"#), "{up}");
+        // A silent theremin omits the note rather than sending a zero, which would read as
+        // "playing 0 Hz".
+        state.theremin = Some(ThereminState::default());
+        let silent = serde_json::to_string(&state).unwrap();
+        assert!(!silent.contains("note_hz"), "{silent}");
+        assert!(!silent.contains("hand_range_m"), "{silent}");
+
+        // And it round-trips: a client reads back what the daemon sent.
+        let back: RobotState = serde_json::from_str(&up).unwrap();
+        assert_eq!(back.theremin.expect("present").note_hz, Some(412.0));
+        let back: RobotState = serde_json::from_str(&down).unwrap();
+        assert_eq!(back.theremin, None);
+    }
+
     /// `move` and `loop` are Rust keywords, so the fields are renamed on the wire. A typo
     /// in either rename is invisible in Rust and breaks every consumer, so pin the JSON.
     #[test]
@@ -3566,6 +4676,8 @@ mod tests {
             joints: vec![0.0; 15],
             targets: vec![0.0; 15],
             odom: OdomState::default(),
+            theremin: None,
+            chorale: None,
         };
 
         let line = serde_json::to_string(&Request::notify_state(&state)).unwrap();
@@ -3833,6 +4945,50 @@ mod tests {
             assert_eq!(line, expected, "{target:?}");
             assert_eq!(serde_json::from_str::<Target>(&line).unwrap(), target);
         }
+    }
+
+    /// A transcript line is one flat object, because it is read with `cat` at least as often
+    /// as with `robotctl`.
+    #[test]
+    fn a_run_record_is_one_flat_line() {
+        let record = RunRecord {
+            at: 1_700_000_000,
+            event: RunEvent::Phase {
+                phase: Phase::Downloading,
+                detail: Some("184.2 MB".into()),
+            },
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        assert_eq!(
+            line,
+            r#"{"at":1700000000,"event":"phase","phase":"downloading","detail":"184.2 MB"}"#
+        );
+        assert_eq!(serde_json::from_str::<RunRecord>(&line).unwrap(), record);
+    }
+
+    /// One line from a later release must not cost the reader the rest of the run.
+    ///
+    /// The pairing is not hypothetical: during a daemon update the `robotctl` on the board and
+    /// the `updaterd` that wrote the file can come from different releases, and that window is
+    /// exactly when someone is reading a transcript.
+    #[test]
+    fn an_unknown_run_event_keeps_the_rest_of_the_transcript() {
+        let from_the_future = r#"{"at":1700000001,"event":"quantum_realignment","spin":7}"#;
+        let record: RunRecord = serde_json::from_str(from_the_future).unwrap();
+        assert_eq!(record.at, 1_700_000_001);
+        assert_eq!(record.event, RunEvent::Unrecognised);
+    }
+
+    /// An `update.log` entry written before transcripts existed still parses, and still means
+    /// what it meant.
+    #[test]
+    fn a_log_entry_without_a_run_still_parses() {
+        let old = r#"{"at":1,"component":"daemon","from":"0.1.3","to":"0.1.4","outcome":{"kind":"success"}}"#;
+        let entry: LogEntry = serde_json::from_str(old).unwrap();
+        assert_eq!(entry.run, None);
+        // And it round-trips back to the same line: an absent run must not become `"run":null`
+        // in a file an older `updaterd` may still read.
+        assert_eq!(serde_json::to_string(&entry).unwrap(), old);
     }
 
     /// A branch name with slashes is a valid git ref and must survive verbatim. `feature/foo`
