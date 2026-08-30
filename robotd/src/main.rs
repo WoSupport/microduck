@@ -217,10 +217,22 @@ struct Args {
     #[arg(long)]
     port: Option<String>,
 
-    /// Run against a robot made of nothing. For laptop development and tests — there is no
-    /// simulator yet, and this is what stands in for one.
+    /// Run against a robot made of nothing. For laptop development and tests, and for the cases
+    /// `--sim` does not cover: no physics, no falling over, positions that echo back perfectly.
     #[arg(long)]
     fake: bool,
+
+    /// Run against a robot in MuJoCo, at `host:port`.
+    ///
+    /// **The same daemon, a simulated body.** Everything above `duck_control::io::RobotIo` — the
+    /// loop, the policy, safety, fall detection, odometry, kinematics, every IPC call — is the code
+    /// that runs on a robot, unchanged and unable to tell. `duck_control::sim` has the protocol and
+    /// the reasons for its shape; `docs/design/simulation.md` has what it is and is not a twin of.
+    ///
+    /// Nothing is connected until the first tick, and a simulator that goes away is retried on
+    /// every tick after — restarting MuJoCo must not mean restarting the duck.
+    #[arg(long, conflicts_with = "fake")]
+    sim: Option<String>,
 
     /// Do not load a policy: run the loop and hold the startup pose.
     ///
@@ -797,6 +809,7 @@ fn spawn_control_thread(
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let period = params.period();
     let fake = args.fake;
+    let sim = args.sim.clone();
     let port = params.bus.port.clone();
     let params = params.clone();
 
@@ -818,6 +831,23 @@ fn spawn_control_thread(
                 tracing::warn!("--fake: no bus, no robot");
                 runtime.block_on(control_loop(
                     FakeIo::at(DEFAULT_POSITION),
+                    state,
+                    intents,
+                    params,
+                    period,
+                    poweroff,
+                ));
+                return;
+            }
+
+            // No `open_bus_waiting` equivalent, deliberately: `RemoteIo` connects lazily and
+            // reconnects on every tick, so a duck started before its simulator simply reports
+            // unhealthy until the simulator answers — which is what a robot with no power on the
+            // bus does too, by a different route.
+            if let Some(addr) = sim {
+                tracing::warn!(%addr, "--sim: the body is in MuJoCo");
+                runtime.block_on(control_loop(
+                    duck_control::sim::RemoteIo::at(addr),
                     state,
                     intents,
                     params,
