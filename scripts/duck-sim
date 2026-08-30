@@ -6,6 +6,17 @@
 #   scripts/duck-sim ctl health   # anything robotctl does
 #   scripts/duck-sim down
 #
+# And the same duck, as a machine you log into:
+#
+#   scripts/duck-sim boot         # the daemons under real systemd, in a container
+#   scripts/duck-sim shell        # you are on the duck
+#   duck-a # robotctl health
+#
+# `boot` needs sudo, because `systemd-nspawn` does. What it buys over the plain form is the part
+# that is not fakeable: the real unit files, with their real User=, groups, RuntimeDirectory= and
+# hardening, under a real init — which is what makes `robotctl update apply` and the health gate
+# behave here the way they behave on a robot.
+#
 # What is running afterwards is `robotd` — the same binary a robot runs, with the same policies, the
 # same 50 Hz loop and the same IPC — with `duck_control::sim::RemoteIo` in place of the servo bus.
 # `docs/design/simulation.md` says what that is and is not a twin of.
@@ -89,22 +100,7 @@ kick_right = "$REPO/policies/ball_kick_right.onnx"
 roulade = "$REPO/policies/roulade.onnx"
 TOML
 
-    # Folded on the floor, which is the boot `robotd` is written for: it recognises a seated duck
-    # and stands it up with the sitstand policy. `STAND` starts upright and topples in about a
-    # second, because a position hold at the real servos' 0.75 N·m cannot balance a biped.
-    say "starting the body — a MuJoCo window should open"
-    # `DUCK_SIM_VIEWER=0` for a window-less run: watching costs frames, and the daemon's loop is
-    # wall-clock, so a simulator that cannot keep up is a robot that cannot balance.
-    [ "${DUCK_SIM_VIEWER:-1}" = 0 ] && HEADLESS=--headless || HEADLESS=
-    # **Backgrounded directly, and in its own session.** `( cd X && nohup cmd & echo $! )` records
-    # the *subshell's* pid, because `A && B & C` parses as `(A && B) & C` — so `down` killed a
-    # wrapper and left MuJoCo running as an orphan. `setsid` puts the simulator in its own process
-    # group, which is what makes stopping it one signal rather than a hunt.
-    setsid nohup "$RL/.venv/bin/python" -m mjlab_microduck.sim.body_server \
-        --port "$PORT" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS \
-        > "$STATE/body.log" 2>&1 &
-    echo $! > "$STATE/body.pid"
-    wait_for_port || die "the simulator did not come up. $STATE/body.log has why."
+    start_body
 
     say "starting robotd"
     DUCK_RUNTIME_DIR="$STATE" ORT_DYLIB_PATH="$ORT" RUST_LOG="${RUST_LOG:-info}" \
@@ -201,6 +197,27 @@ WHY
     return 1
 }
 
+# The body, on the host in both modes: MuJoCo is not going in a container, and the container shares
+# the host's network namespace so localhost is the same localhost either way.
+start_body() {
+    [ -d "$RL" ] || die "no simulator at $RL. It is the microduck_rl repo — set DUCK_SIM_RL."
+    [ -x "$RL/.venv/bin/python" ] || die "$RL has no .venv. Run \`uv sync\` there first."
+    mkdir -p "$STATE"
+    say "starting the body — a MuJoCo window should open"
+    # `DUCK_SIM_VIEWER=0` for a window-less run: watching costs frames, and the daemon's loop is
+    # wall-clock, so a simulator that cannot keep up is a robot that cannot balance.
+    [ "${DUCK_SIM_VIEWER:-1}" = 0 ] && HEADLESS=--headless || HEADLESS=
+    # **Backgrounded directly, and in its own session.** `( cd X && nohup cmd & echo $! )` records
+    # the *subshell's* pid, because `A && B & C` parses as `(A && B) & C` — so `down` killed a
+    # wrapper and left MuJoCo running as an orphan. `setsid` puts the simulator in its own process
+    # group, which is what makes stopping it one signal rather than a hunt.
+    setsid nohup "$RL/.venv/bin/python" -m mjlab_microduck.sim.body_server \
+        --port "$PORT" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS \
+        > "$STATE/body.log" 2>&1 &
+    echo $! > "$STATE/body.pid"
+    wait_for_port || die "the simulator did not come up. $STATE/body.log has why."
+}
+
 wait_for_port() {
     i=0
     while [ $i -lt 100 ]; do
@@ -244,13 +261,134 @@ PY
     say "stopped — the intent expires on its own"
 }
 
+# ── the container ─────────────────────────────────────────────────────────────
+
+ROOTFS="$STATE/rootfs"
+MACHINE="${DUCK_SIM_MACHINE:-duck-a}"
+
+# Debian 13 Trixie, the board's own userland, built unprivileged. Two things an Ubuntu host needs
+# and does not have: Debian's archive keyring, and apt not dropping to a `_apt` uid that the user
+# namespace cannot map — which leaves files nobody can delete.
+rootfs() {
+    if [ -d "$ROOTFS" ]; then
+        say "rootfs already at $ROOTFS (delete it to rebuild)"
+        return 0
+    fi
+    command -v mmdebstrap >/dev/null || die "mmdebstrap is missing: sudo apt install mmdebstrap"
+    mkdir -p "$STATE/keyring"
+    if [ ! -f "$STATE/keyring/usr/share/keyrings/debian-archive-keyring.gpg" ]; then
+        say "fetching Debian's archive keyring (this host is not Debian)"
+        deb="$(curl -s http://deb.debian.org/debian/pool/main/d/debian-archive-keyring/ \
+            | grep -o 'debian-archive-keyring_[0-9.]*_all\.deb' | sort -u | tail -1)"
+        [ -n "$deb" ] || die "could not find the keyring package on deb.debian.org"
+        curl -sSL -o "$STATE/keyring.deb" "http://deb.debian.org/debian/pool/main/d/debian-archive-keyring/$deb"
+        dpkg-deb -x "$STATE/keyring.deb" "$STATE/keyring"
+    fi
+    # The keyring has to be readable by the uid apt drops to *inside* the user namespace, and a
+    # keyring under a 0700 `~/.cache` is not — apt then reports the repository as unsigned, which
+    # reads like a mirror problem and is a permissions one. So it is staged somewhere traversable
+    # for the length of the build.
+    KEYDIR="$(mktemp -d)"
+    chmod 755 "$KEYDIR"
+    cp "$STATE"/keyring/usr/share/keyrings/*.gpg "$KEYDIR/"
+    chmod 644 "$KEYDIR"/*.gpg
+    trap 'rm -rf "$KEYDIR"' EXIT
+
+    say "building a Debian 13 rootfs — about three minutes, once"
+    # **A tarball, then unpack it as root.** Building the tree directly needs every parent directory
+    # traversable by the subuids mmdebstrap maps into, and `~/.cache` is 0700 — which is the user's
+    # business, not this script's. A tar is one file in a directory we own, and unpacking it with
+    # the sudo `boot` already needs is what gets the ownership right.
+    mmdebstrap --variant=important \
+        --keyring="$KEYDIR" \
+        --aptopt='APT::Sandbox::User "root"' \
+        --include=systemd-sysv,dbus,libssl3,ca-certificates \
+        --format=tar \
+        trixie "$STATE/rootfs.tar" http://deb.debian.org/debian
+    say "unpacking it (sudo, for the ownership)"
+    sudo mkdir -p "$ROOTFS"
+    sudo tar -xpf "$STATE/rootfs.tar" -C "$ROOTFS"
+    rm -f "$STATE/rootfs.tar"
+    say "rootfs ready ($(sudo du -sh "$ROOTFS" | cut -f1))"
+}
+
+# Everything a release puts on a board, put here by hand — this is not `robotctl update apply`, it
+# is what a board looks like *after* one, so that the units and the daemons are the real thing.
+stage() {
+    ORT="$(ls "$RL"/.venv/lib/python*/site-packages/onnxruntime/capi/libonnxruntime.so.* 2>/dev/null | head -1)"
+    [ -n "$ORT" ] || die "no onnxruntime in $RL/.venv"
+    say "installing the release into the container"
+    sudo sh -eu -c '
+        ROOTFS="$1"; REPO="$2"; ORT="$3"; PORT="$4"
+        REL="$ROOTFS/opt/robot/daemon/releases/sim"
+        mkdir -p "$REL/bin" "$REL/policies" "$ROOTFS/etc/systemd/system/robotd.service.d"
+        install -m755 "$REPO/target/debug/robotd" "$REPO/target/debug/robotctl" "$REL/bin/"
+        cp "$REPO"/policies/*.onnx "$REL/policies/"
+        ln -sfn /opt/robot/daemon/releases/sim "$ROOTFS/opt/robot/daemon/current"
+        cp "$ORT" "$ROOTFS/usr/lib/"
+        ln -sfn "/usr/lib/$(basename "$ORT")" "$ROOTFS/usr/lib/libonnxruntime.so"
+        cp "$REPO"/robotd/systemd/robotd.service "$ROOTFS/etc/systemd/system/"
+        mkdir -p "$ROOTFS/usr/lib/sysusers.d"
+        cp "$REPO"/updater/systemd/sysusers.d/robot.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
+        # The body is on the host, and this container shares the host network namespace, so
+        # localhost is the same localhost.
+        cat > "$ROOTFS/etc/systemd/system/robotd.service.d/sim.conf" <<CONF
+[Service]
+ExecStart=
+ExecStart=/opt/robot/daemon/current/bin/robotd --sim 127.0.0.1:$PORT
+CONF
+        mkdir -p "$ROOTFS/etc/robot"
+        sed "s|$REPO/policies|/opt/robot/daemon/current/policies|g" > "$ROOTFS/etc/robot/robotd.toml" <<TOML
+[policy]
+enabled = true
+TOML
+        printf "root:x:0:\n" >/dev/null
+        chroot "$ROOTFS" /usr/bin/passwd -d root >/dev/null 2>&1 || true
+        chroot "$ROOTFS" /usr/bin/systemctl enable robotd.service >/dev/null 2>&1 || true
+    ' _ "$ROOTFS" "$REPO" "$ORT" "$PORT"
+}
+
+boot() {
+    [ -d "$ROOTFS" ] || rootfs
+    [ -x "$REPO/target/debug/robotd" ] || (cd "$REPO" && cargo build --quiet -p robotd -p robotctl)
+    stage
+    start_body
+    say "booting $MACHINE"
+    sudo systemd-run --collect --unit="$MACHINE" --quiet \
+        systemd-nspawn -D "$ROOTFS" --machine="$MACHINE" --boot \
+        --resolv-conf=copy-host
+    i=0
+    while [ $i -lt 60 ]; do
+        sudo machinectl show "$MACHINE" >/dev/null 2>&1 && break
+        i=$((i + 1)); sleep 0.5
+    done
+    sleep 4
+    say "$MACHINE is up"
+    cat <<NEXT
+
+  scripts/duck-sim shell        you are on the duck
+  duck-a # robotctl health
+  duck-a # systemctl status robotd
+
+  scripts/duck-sim down
+
+NEXT
+}
+
+shell() {
+    sudo machinectl shell "$MACHINE"
+}
+
 case "${1:-up}" in
     up|"")   up ;;
-    down)    down ;;
+    rootfs)  rootfs ;;
+    boot)    boot ;;
+    shell)   shell ;;
+    down)    sudo systemctl stop "$MACHINE" 2>/dev/null || true; down ;;
     drive)   shift; drive "$@" ;;
     ctl)     shift; ctl "$@" ;;
     stand)   stand && sleep 6 && upright ;;
     status)  ctl health | head -4; upright ;;
     log)     tail -f "$STATE/robotd.log" ;;
-    *)       die "unknown command '$1'. Try: up, down, stand, drive, ctl, log, status" ;;
+    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, ctl, log, status" ;;
 esac
