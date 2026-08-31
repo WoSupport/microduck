@@ -159,6 +159,10 @@ accept = true
 
 [audio]
 bank = "$STATE/sounds/DUCK"
+# `plughw:aic3104` is the board's codec, and `robotd` passes it to `aplay` as `-D` — so on anything
+# that is not a robot every sound fails before ALSA's default is ever consulted. That failure is
+# logged and skipped by design, which is why a silent duck looks like a sound bug.
+device = "default"
 
 # Its own depth sensor. On a board this is /run/tofd/tof.sock and needs no saying; here every duck
 # has one and they must not share.
@@ -649,7 +653,8 @@ CONF
         # Singing is opt-in. Only this key: everything else resolves from the release, which is
         # the reason to boot a container in the first place.
         sudo mkdir -p "$upper/merged/etc/robot"
-        printf '[chorale]\naccept = true\n' | sudo tee "$upper/merged/etc/robot/robotd.toml" >/dev/null
+        printf '[chorale]\naccept = true\n\n[audio]\ndevice = "default"\n' \
+            | sudo tee "$upper/merged/etc/robot/robotd.toml" >/dev/null
         # A voice of its own — the chorale id comes from the bank seed, so ducks sharing a bank
         # share an id and drop each other as their own reflection.
         if [ ! -d "$upper/merged/var/lib/robot/sounds" ]; then
