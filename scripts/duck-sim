@@ -85,6 +85,7 @@ down() {
     i=0
     while [ "$i" -lt 16 ]; do
         stop_one "$(duck_name "$i")" robotd
+        stop_one "$(duck_name "$i")-tof" tofd
         i=$((i + 1))
     done
     # The container-mode radio is a unit, not a pidfile — see `boot`.
@@ -136,6 +137,11 @@ accept = true
 
 [audio]
 bank = "$STATE/sounds/DUCK"
+
+# Its own depth sensor. On a board this is /run/tofd/tof.sock and needs no saying; here every duck
+# has one and they must not share.
+[theremin]
+socket = "$STATE/DUCK-tof.sock"
 TOML
 
     # **A voice each, and it is not decoration.** `robotctl chorale` refuses without one — but more
@@ -147,7 +153,8 @@ TOML
     i=0
     while [ "$i" -lt "$DUCKS" ]; do
         name="$(duck_name "$i")"
-        sed "s|/sounds/DUCK|/sounds/$name|" "$STATE/robotd.toml" > "$STATE/robotd-$name.toml"
+        sed -e "s|/sounds/DUCK|/sounds/$name|" -e "s|/DUCK-tof.sock|/$name-tof.sock|" \
+            "$STATE/robotd.toml" > "$STATE/robotd-$name.toml"
         if [ ! -d "$STATE/sounds/$name" ]; then
             say "rendering $name a voice"
             DUCK_IDENTITY="$name" "$REPO/target/debug/sounds" ensure-bank \
@@ -157,6 +164,21 @@ TOML
     done
 
     start_body
+
+    # Depth, before the daemon that reads it. `tofd --sim` asks the simulator for an 8x8 frame at
+    # the sensor's own 15 Hz — the same rays a real VL53L5CX would cast, from the model's `tof` site,
+    # so a head that turns takes the sensor with it.
+    say "starting tofd"
+    [ -x "$REPO/target/debug/tofd" ] || (cd "$REPO" && cargo build --quiet -p tof)
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        DUCK_RUNTIME_DIR="$STATE" setsid nohup "$REPO/target/debug/tofd" \
+            --sim "127.0.0.1:$(duck_port "$i")" --socket "$STATE/$name-tof.sock" \
+            > "$STATE/$name-tof.log" 2>&1 &
+        echo $! > "$STATE/$name-tof.pid"
+        i=$((i + 1))
+    done
 
     say "starting robotd"
     i=0
@@ -481,6 +503,8 @@ stage() {
         cp "$ORT" "$ROOTFS/usr/lib/"
         ln -sfn "/usr/lib/$(basename "$ORT")" "$ROOTFS/usr/lib/libonnxruntime.so"
         cp "$REPO"/robotd/systemd/robotd.service "$ROOTFS/etc/systemd/system/"
+        cp "$REPO"/tof/systemd/tofd.service "$ROOTFS/etc/systemd/system/" 2>/dev/null || true
+        install -m755 "$REPO/target/debug/tofd" "$REL/bin/" 2>/dev/null || true
         mkdir -p "$ROOTFS/usr/lib/sysusers.d"
         cp "$REPO"/updater/systemd/sysusers.d/robot.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
         # The body is on the host, and this container shares the host network namespace, so
@@ -491,7 +515,7 @@ stage() {
         rm -f "$ROOTFS/etc/robot/robotd.toml"
         printf "root:x:0:\n" >/dev/null
         chroot "$ROOTFS" /usr/bin/passwd -d root >/dev/null 2>&1 || true
-        chroot "$ROOTFS" /usr/bin/systemctl enable robotd.service >/dev/null 2>&1 || true
+        chroot "$ROOTFS" /usr/bin/systemctl enable robotd.service tofd.service >/dev/null 2>&1 || true
     ' _ "$ROOTFS" "$REPO" "$ORT" "$PORT"
 }
 
@@ -528,6 +552,12 @@ boot() {
 ExecStart=
 ExecStart=/opt/robot/daemon/current/bin/robotd --sim 127.0.0.1:$(duck_port "$i") --socket /run/duck/robotd.sock
 ExecStartPost=/bin/ln -sf /run/duck/robotd.sock /run/robotd.sock
+CONF
+        sudo mkdir -p "$upper/merged/etc/systemd/system/tofd.service.d"
+        sudo tee "$upper/merged/etc/systemd/system/tofd.service.d/sim.conf" >/dev/null <<CONF
+[Service]
+ExecStart=
+ExecStart=/opt/robot/daemon/current/bin/tofd --sim 127.0.0.1:$(duck_port "$i")
 CONF
         # Singing is opt-in. Only this key: everything else resolves from the release, which is
         # the reason to boot a container in the first place.

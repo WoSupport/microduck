@@ -115,6 +115,18 @@ struct Args {
     /// been drawn.
     #[arg(long)]
     fake: bool,
+
+    /// Read frames from a simulated body at `host:port` instead of a sensor.
+    ///
+    /// **The fake at the loop level, with a simulator behind it** — which is where a fake belongs
+    /// here: `sensor.rs` says in as many words that the off-board `Sensor` "is not a fake sensor and
+    /// must never become one", because the thing it stands for is a vendor C library talking to a
+    /// bus. A frame arriving from somewhere else is a different question from a sensor that lies.
+    ///
+    /// The simulator answers `{"op":"tof"}` with the same 8x8 of distances and per-zone statuses
+    /// this daemon publishes, so nothing downstream — `robotd`, `maploc`, the viewer — can tell.
+    #[arg(long, conflicts_with = "fake")]
+    sim: Option<String>,
 }
 
 fn parse_address(s: &str) -> Result<u8, String> {
@@ -159,10 +171,13 @@ async fn main() -> std::process::ExitCode {
         let address = args.address;
         let hz = args.hz;
         let fake = args.fake;
+        let sim = args.sim.clone();
         std::thread::Builder::new()
             .name("tof-sensor".to_owned())
             .spawn(move || {
-                if fake {
+                if let Some(addr) = sim {
+                    sim_loop(&addr, hz, &status, &frames, &shutdown);
+                } else if fake {
                     fake_loop(hz, &status, &frames, &shutdown);
                 } else {
                     sensor_loop(bus.as_deref(), address, hz, &status, &frames, &shutdown);
@@ -310,6 +325,112 @@ fn fake_loop(
         });
         sleep_unless_shutdown(period, shutdown);
     }
+}
+
+/// Frames from a simulated body, at the sensor's own rate.
+///
+/// Newline-delimited JSON over TCP, the same link `duck_control::sim` uses for the servo bus — one
+/// handshake, then a request per frame. A simulator that goes away is one missed frame and a
+/// reconnect, not a dead daemon: MuJoCo is restarted whenever the number of ducks changes, and a
+/// duck is expected to live through that.
+fn sim_loop(
+    addr: &str,
+    hz: u8,
+    status: &Arc<Status>,
+    frames: &tokio::sync::broadcast::Sender<proto::TofFrame>,
+    shutdown: &Arc<AtomicBool>,
+) {
+    use std::io::{BufRead, Write};
+
+    let started = Instant::now();
+    let period = Duration::from_secs_f64(1.0 / f64::from(hz.max(1)));
+    let mut seq = 0u64;
+    let mut link: Option<SimLink> = None;
+    let mut complained = false;
+
+    while !shutdown.load(Ordering::Acquire) {
+        if link.is_none() {
+            match connect_sim(addr) {
+                Ok(fresh) => {
+                    tracing::info!(%addr, "simulated depth");
+                    status.up("sim");
+                    complained = false;
+                    link = Some(fresh);
+                }
+                Err(e) => {
+                    if !complained {
+                        complained = true;
+                        tracing::warn!(%addr, error = %e, "no simulated body; retrying");
+                        status.down(&format!("no simulated body at {addr}"));
+                    }
+                    sleep_unless_shutdown(period, shutdown);
+                    continue;
+                }
+            }
+        }
+
+        let (write, read) = link.as_mut().expect("just connected");
+        let frame = write.write_all(b"{\"op\":\"tof\"}\n").and_then(|()| {
+            let mut line = String::new();
+            read.read_line(&mut line)?;
+            if line.is_empty() {
+                return Err(std::io::Error::other("the simulator closed the connection"));
+            }
+            serde_json::from_str::<SimDepth>(&line).map_err(std::io::Error::other)
+        });
+
+        match frame {
+            Ok(depth) => {
+                seq += 1;
+                let _ = frames.send(proto::TofFrame {
+                    seq,
+                    at_us: started.elapsed().as_micros() as u64,
+                    rows: depth.rows,
+                    cols: depth.cols,
+                    distance_mm: depth.distance_mm,
+                    status: depth.status,
+                });
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "lost the simulated body");
+                link = None;
+                continue;
+            }
+        }
+        sleep_unless_shutdown(period, shutdown);
+    }
+}
+
+type SimLink = (std::net::TcpStream, std::io::BufReader<std::net::TcpStream>);
+
+/// One connection to a simulated body, handshake included.
+fn connect_sim(addr: &str) -> std::io::Result<SimLink> {
+    use std::io::{BufRead, Write};
+
+    let stream = std::net::TcpStream::connect(addr)?;
+    // Nagle would add tens of milliseconds to a 15 Hz request/response, which is most of a frame.
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut write = stream.try_clone()?;
+    let mut read = std::io::BufReader::new(stream);
+    write.write_all(b"{\"op\":\"hello\",\"protocol\":1,\"joints\":15}\n")?;
+    let mut line = String::new();
+    read.read_line(&mut line)?;
+    if line.is_empty() {
+        return Err(std::io::Error::other(
+            "the simulator hung up during the handshake",
+        ));
+    }
+    Ok((write, read))
+}
+
+/// What the simulator answers `{"op":"tof"}` with.
+#[derive(serde::Deserialize)]
+struct SimDepth {
+    rows: u8,
+    cols: u8,
+    distance_mm: Vec<i16>,
+    status: Vec<u8>,
 }
 
 /// Try the named bus and address, or every candidate, and return the first
