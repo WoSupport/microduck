@@ -33,6 +33,15 @@ STATE="${DUCK_SIM_STATE:-$HOME/.cache/duck-sim}"
 RL="${DUCK_SIM_RL:-$HOME/Pollen/microduck_rl}"
 PORT="${DUCK_SIM_PORT:-7801}"
 DUCKS="${DUCK_SIM_DUCKS:-1}"
+
+# Which world. A bare name is one of the simulator's own scenes; anything with a slash is a path.
+#
+#   DUCK_SIM_SCENE=apartment scripts/duck-sim boot 2
+#
+# `apartment` is six rooms in 7x6 m with 50 cm walls and doorways deliberately off centre — that
+# asymmetry is what lets a pose be disambiguated from a 45-degree forward field of view, which is
+# exactly what the duck has. The default is a bare floor, where there is nothing to see.
+SCENE="${DUCK_SIM_SCENE:-}"
 SOCK="$STATE/duck.sock"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -343,8 +352,14 @@ start_body() {
     # the *subshell's* pid, because `A && B & C` parses as `(A && B) & C` — so `down` killed a
     # wrapper and left MuJoCo running as an orphan. `setsid` puts the simulator in its own process
     # group, which is what makes stopping it one signal rather than a hunt.
+    case "$SCENE" in
+        "")   scene_arg="" ;;
+        */*)  scene_arg="--scene $SCENE" ;;
+        *)    scene_arg="--scene $RL/src/mjlab_microduck/robot/microduck/scene_$SCENE.xml" ;;
+    esac
+    # shellcheck disable=SC2086
     setsid nohup "$RL/.venv/bin/python" -m mjlab_microduck.sim.body_server \
-        --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS \
+        --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS $scene_arg \
         > "$STATE/body.log" 2>&1 &
     echo $! > "$STATE/body.pid"
     wait_for_port || die "the simulator did not come up. $STATE/body.log has why."
