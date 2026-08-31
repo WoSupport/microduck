@@ -39,7 +39,20 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 say()  { printf '\033[36m==\033[0m %s\n' "$*"; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-ctl() { "$REPO/target/debug/robotctl" --robot-socket "$SOCK" "$@"; }
+# Which duck `ctl` talks to. `DUCK_SIM_DUCK=duck-b scripts/duck-sim ctl monitor` for another.
+WHO="${DUCK_SIM_DUCK:-}"
+
+# **Every socket, not just robotd's.** `monitor` draws the depth frame from `tofd` and the sticks
+# from `padd`, and it looks for them under /run — which on a board is where they are and here is
+# not. A monitor with no ToF points looked like a sensor that was not wired, and was a client
+# pointed at the wrong path.
+ctl() {
+    name="${WHO:-$(duck_name 0)}"
+    "$REPO/target/debug/robotctl" \
+        --robot-socket "$STATE/$name.sock" \
+        --tof-socket "$STATE/$name-tof.sock" \
+        "$@"
+}
 
 # ── stopping ──────────────────────────────────────────────────────────────────
 # By pidfile, never by name. `pkill -f robotd` also matches the shell that is about to start one,
@@ -659,8 +672,9 @@ case "${1:-up}" in
     ctl)     shift; ctl "$@" ;;
     stand)   stand && sleep 6 && upright ;;
     status)  ctl health | head -4; upright ;;
+    monitor) shift; ctl monitor "$@" ;;
     log)     tail -f "$STATE/robotd.log" ;;
     simlog)  tail -f "$STATE/body.log" ;;
     realtime) realtime ;;
-    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, ctl, log, status" ;;
+    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, monitor, ctl, log, simlog, status, realtime" ;;
 esac
