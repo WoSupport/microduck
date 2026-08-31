@@ -587,7 +587,10 @@ stage() {
 }
 
 boot() {
-    [ -d "$ROOTFS" ] || rootfs
+    # Always, not only when the directory is missing: deciding whether the rootfs is still the right
+    # one is `rootfs`'s job, and guarding the call on the directory existing is what stopped a
+    # changed package list from ever being noticed. It returns in a moment when nothing has changed.
+    rootfs
     [ -x "$REPO/target/debug/robotd" ] || (cd "$REPO" && cargo build --quiet -p robotd -p robotctl)
     stage
     start_body
