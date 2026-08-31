@@ -44,31 +44,51 @@ ctl() { "$REPO/target/debug/robotctl" --robot-socket "$SOCK" "$@"; }
 # ── stopping ──────────────────────────────────────────────────────────────────
 # By pidfile, never by name. `pkill -f robotd` also matches the shell that is about to start one,
 # which is a good way to kill your own terminal — three times in one afternoon, in this case.
+# Stop one thing this script started, identified by name and by what it must still be running.
+#
+# **A pid is not an identity.** This function used to kill the process *group* named by a pidfile,
+# with a `sudo` fallback — and pidfiles go stale, pids are recycled, and a `boot` leaves behind the
+# pidfiles an `up` wrote. The result was `kill -TERM -<recycled pid>` as root, which took out an
+# unrelated process group: it killed a login session, and the machine had to be rebooted to get it
+# back. Nothing here may act on a pid without first confirming, through /proc, that the process is
+# still the one it was written for.
+#
+# No group kill at all any more. Every process this starts is a single process that exits on TERM,
+# and the group form bought nothing but the reach to do damage.
 stop_one() {
-    [ -f "$STATE/$1.pid" ] || return 0
-    pid="$(cat "$STATE/$1.pid")"
-    # The group, not the process: each half is started with `setsid`, so this reaches a viewer
-    # thread or a child that outlived its parent. The bare pid is the fallback for a pidfile
-    # written before that was true.
-    # `sudo -n` first: the ether runs as root in container mode, and a stop that cannot reach it
-    # leaves a radio talking to containers that are gone.
-    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null \
-        || sudo -n kill -TERM "-$pid" 2>/dev/null || true
+    file="$STATE/$1.pid"
+    expect="$2"
+    [ -f "$file" ] || return 0
+    pid="$(tr -dc '0-9' < "$file")"
+    # Removed before anything is signalled, so a stale file cannot be acted on twice.
+    rm -f "$file"
+
+    [ -n "$pid" ] || return 0
+    [ "$pid" -gt 1 ] 2>/dev/null || return 0
+    [ -r "/proc/$pid/cmdline" ] || return 0
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q -- "$expect" || {
+        say "not stopping pid $pid: it is no longer $1"
+        return 0
+    }
+
+    kill -TERM "$pid" 2>/dev/null || sudo -n kill -TERM "$pid" 2>/dev/null || true
     i=0
-    while [ $i -lt 25 ] && kill -0 "$pid" 2>/dev/null; do i=$((i + 1)); sleep 0.2; done
-    kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-    rm -f "$STATE/$1.pid"
+    while [ $i -lt 25 ] && [ -d "/proc/$pid" ]; do i=$((i + 1)); sleep 0.2; done
+    [ -d "/proc/$pid" ] || return 0
+    kill -KILL "$pid" 2>/dev/null || sudo -n kill -KILL "$pid" 2>/dev/null || true
 }
 
 down() {
-    stop_one robotd
-    stop_one ether
-    stop_one body
+    stop_one robotd robotd
+    stop_one ether duck-ether
+    stop_one body body_server
     i=0
     while [ "$i" -lt 16 ]; do
-        stop_one "$(duck_name "$i")"
+        stop_one "$(duck_name "$i")" robotd
         i=$((i + 1))
     done
+    # The container-mode radio is a unit, not a pidfile — see `boot`.
+    sudo -n systemctl stop duck-ether 2>/dev/null || true
     rm -f "$SOCK"
     # Verified, not assumed: `down` reporting success while a MuJoCo window is still open is worse
     # than saying nothing, and is exactly what the subshell bug above produced.
@@ -572,12 +592,13 @@ CONF
             args="$args --duck $name=$STATE/ducks/$name/run/robotd.sock@$(duck_port "$i")"
             i=$((i + 1))
         done
-        # Under sudo, because robotd creates its socket 0660 root:robot and the person running
-        # this script is not in that group — nor would being in the *host* group help, since the
-        # container has its own. The radio is the one part of this that must reach every duck.
+        # A unit, not a background process with a pidfile. It has to run as root — robotd creates
+        # its socket 0660 root:robot, and the host group would not help since the container has its
+        # own — and a root process stopped by pid is exactly the shape that killed a login session.
+        # `systemctl stop duck-ether` needs no pid and cannot be wrong about which process it is.
         # shellcheck disable=SC2086
-        sudo setsid nohup "$REPO/target/debug/duck-ether" $args > "$STATE/ether.log" 2>&1 &
-        echo $! > "$STATE/ether.pid"
+        sudo systemd-run --collect --unit=duck-ether --quiet \
+            "$REPO/target/debug/duck-ether" $args
         say "the ether is open — $DUCKS ducks can hear each other"
     fi
 
