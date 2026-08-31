@@ -459,10 +459,22 @@ duck_port() { echo $((PORT + $1)); }
 # Debian 13 Trixie, the board's own userland, built unprivileged. Two things an Ubuntu host needs
 # and does not have: Debian's archive keyring, and apt not dropping to a `_apt` uid that the user
 # namespace cannot map — which leaves files nobody can delete.
+# What the container needs beyond a minimal Debian. `alsa-utils` is `aplay`, which `robotd` forks to
+# make a sound — without it the ducks sing silently, and by design that failure is logged and skipped.
+# `libasound2-plugins` is the ALSA-to-PulseAudio bridge, which is what lets several ducks be audible
+# at once rather than the first one holding the device.
+PACKAGES=systemd-sysv,dbus,libssl3,ca-certificates,alsa-utils,libasound2-plugins
+
 rootfs() {
-    if [ -d "$ROOTFS" ]; then
+    # The list is recorded, so changing it rebuilds rather than silently not taking effect — which is
+    # otherwise a round trip spent wondering why a pull changed nothing.
+    if [ -d "$ROOTFS" ] && [ "$(cat "$STATE/rootfs.packages" 2>/dev/null)" = "$PACKAGES" ]; then
         say "rootfs already at $ROOTFS (delete it to rebuild)"
         return 0
+    fi
+    if [ -d "$ROOTFS" ]; then
+        say "the package list changed — rebuilding the rootfs"
+        sudo rm -rf "$ROOTFS"
     fi
     command -v mmdebstrap >/dev/null || die "mmdebstrap is missing: sudo apt install mmdebstrap"
     mkdir -p "$STATE/keyring"
@@ -492,13 +504,14 @@ rootfs() {
     mmdebstrap --variant=important \
         --keyring="$KEYDIR" \
         --aptopt='APT::Sandbox::User "root"' \
-        --include=systemd-sysv,dbus,libssl3,ca-certificates \
+        --include="$PACKAGES" \
         --format=tar \
         trixie "$STATE/rootfs.tar" http://deb.debian.org/debian
     say "unpacking it (sudo, for the ownership)"
     sudo mkdir -p "$ROOTFS"
     sudo tar -xpf "$STATE/rootfs.tar" -C "$ROOTFS"
     rm -f "$STATE/rootfs.tar"
+    printf '%s' "$PACKAGES" > "$STATE/rootfs.packages"
     say "rootfs ready ($(sudo du -sh "$ROOTFS" | cut -f1))"
 }
 
@@ -546,6 +559,10 @@ stage() {
         cp "$REPO"/tof/systemd/sysusers.d/tofd.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
         cp "$REPO"/updater/systemd/sysusers.d/robot.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
         printf "g i2c -\n" > "$ROOTFS/usr/lib/sysusers.d/duck-sim-groups.conf"
+        # ALSA pointed at the host, so `aplay` reaches the machine speakers rather than a sound card
+        # the container does not have. Through the host audio server rather than /dev/snd, because
+        # that is what lets four ducks be audible at once.
+        printf "pcm.!default { type pulse }\nctl.!default { type pulse }\n" > "$ROOTFS/etc/asound.conf"
         # **Run now, not left to the container.** `systemd-sysusers.service` carries
         # `ConditionNeedsUpdate=/etc`, and staging writes /etc after /usr — so /etc looks newer, the
         # condition is not met, and the unit is skipped. The users then do not exist, `tofd.service`
@@ -575,6 +592,15 @@ boot() {
     stage
     start_body
 
+    # The host's audio server, if there is one. A duck with no speaker is not an error — on a board
+    # `robotd` logs a failed `aplay` and carries on — so this is offered rather than required.
+    AUDIO_BIND=""
+    if [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pulse/native" ]; then
+        AUDIO_BIND="--bind=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pulse/native:/run/pulse-host"
+    else
+        say "no host audio server — the ducks will sing silently"
+    fi
+
     # **One rootfs, one overlay per duck.** The base is read-only and each duck gets its own upper,
     # so duck four costs megabytes rather than 213 of them — and `robotctl configure` on one duck
     # does not edit another's config.
@@ -602,6 +628,7 @@ boot() {
 ExecStart=
 ExecStart=/opt/robot/daemon/current/bin/robotd --sim 127.0.0.1:$(duck_port "$i") --socket /run/duck/robotd.sock
 ExecStartPost=/bin/ln -sf /run/duck/robotd.sock /run/robotd.sock
+Environment=PULSE_SERVER=unix:/run/pulse-host
 CONF
         sudo mkdir -p "$upper/merged/etc/systemd/system/tofd.service.d"
         # `RestrictAddressFamilies=AF_UNIX` in the unit, because on a robot `tofd` talks to a bus
@@ -631,7 +658,7 @@ CONF
         sudo systemd-run --collect --unit="$name" --quiet \
             systemd-nspawn -D "$upper/merged" --machine="$name" --boot \
             --hostname="$name" --resolv-conf=copy-host \
-            --bind="$upper/run:/run/duck"
+            --bind="$upper/run:/run/duck" $AUDIO_BIND
         i=$((i + 1))
     done
 
