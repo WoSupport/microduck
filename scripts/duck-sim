@@ -493,6 +493,12 @@ stage() {
     ORT="$(ls "$RL"/.venv/lib/python*/site-packages/onnxruntime/capi/libonnxruntime.so.* 2>/dev/null | head -1)"
     [ -n "$ORT" ] || die "no onnxruntime in $RL/.venv"
     say "installing the release into the container"
+    # **Every daemon's users, not just robotd's.** A unit whose `User=` does not exist fails with
+    # 217/USER and says nothing about a missing user — which is how `tofd` looked like a sensor that
+    # was never wired when it was only unable to start. The release's own postinstall installs every
+    # sysusers file it ships, so this does too, plus the `i2c` group `tofd.service` asks for and that
+    # a board gets from provisioning rather than from a release. mediad, btd and padd would each
+    # have arrived at the same wall in turn.
     # **No apostrophes below this line.** The whole block is one single-quoted argument, so an
     # apostrophe in a comment ends it — the rest becomes unquoted shell, and it swallowed the brace
     # that closes this function along with the next one. `sh -n` sees nothing wrong, because the
@@ -519,7 +525,12 @@ stage() {
         cp "$REPO"/tof/systemd/tofd.service "$ROOTFS/etc/systemd/system/" 2>/dev/null || true
         install -m755 "$REPO/target/debug/tofd" "$REL/bin/" 2>/dev/null || true
         mkdir -p "$ROOTFS/usr/lib/sysusers.d"
+        cp "$REPO"/btd/systemd/sysusers.d/btd.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
+        cp "$REPO"/mediad/systemd/sysusers.d/mediad.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
+        cp "$REPO"/padd/systemd/sysusers.d/padd.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
+        cp "$REPO"/tof/systemd/sysusers.d/tofd.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
         cp "$REPO"/updater/systemd/sysusers.d/robot.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
+        printf "g i2c -\n" > "$ROOTFS/usr/lib/sysusers.d/duck-sim-groups.conf"
         # The body is on the host, and this container shares the host network namespace, so
         # localhost is the same localhost.
         rm -f "$ROOTFS/etc/systemd/system/robotd.service.d/sim.conf"
