@@ -531,6 +531,17 @@ stage() {
         cp "$REPO"/tof/systemd/sysusers.d/tofd.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
         cp "$REPO"/updater/systemd/sysusers.d/robot.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
         printf "g i2c -\n" > "$ROOTFS/usr/lib/sysusers.d/duck-sim-groups.conf"
+        # **Run now, not left to the container.** `systemd-sysusers.service` carries
+        # `ConditionNeedsUpdate=/etc`, and staging writes /etc after /usr — so /etc looks newer, the
+        # condition is not met, and the unit is skipped. The users then do not exist, `tofd.service`
+        # dies with 217/USER, and from the monitor that looks like a sensor nobody wired. The
+        # release postinstall runs this directly for the same reason.
+        chroot "$ROOTFS" /usr/bin/systemd-sysusers >/dev/null 2>&1 || true
+        # Verified here rather than discovered three layers down.
+        for who in tofd robot mediad btd padd; do
+            grep -q "^$who:" "$ROOTFS/etc/passwd" "$ROOTFS/etc/group" 2>/dev/null \
+                || echo "  WARNING: no $who user or group — the unit that needs it will not start"
+        done
         # The body is on the host, and this container shares the host network namespace, so
         # localhost is the same localhost.
         rm -f "$ROOTFS/etc/systemd/system/robotd.service.d/sim.conf"
