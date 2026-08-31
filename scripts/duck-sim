@@ -589,10 +589,17 @@ ExecStart=/opt/robot/daemon/current/bin/robotd --sim 127.0.0.1:$(duck_port "$i")
 ExecStartPost=/bin/ln -sf /run/duck/robotd.sock /run/robotd.sock
 CONF
         sudo mkdir -p "$upper/merged/etc/systemd/system/tofd.service.d"
+        # `RestrictAddressFamilies=AF_UNIX` in the unit, because on a robot `tofd` talks to a bus
+        # and a socket and has no business with TCP. Here its sensor is across a TCP connection, and
+        # the sandbox refuses it with EAFNOSUPPORT — "Address family not supported by protocol",
+        # which reads like a broken network rather than a policy. Reset and re-stated rather than
+        # appended: these merge as a union, and being explicit is what makes the drop-in readable.
         sudo tee "$upper/merged/etc/systemd/system/tofd.service.d/sim.conf" >/dev/null <<CONF
 [Service]
 ExecStart=
 ExecStart=/opt/robot/daemon/current/bin/tofd --sim 127.0.0.1:$(duck_port "$i")
+RestrictAddressFamilies=
+RestrictAddressFamilies=AF_UNIX AF_INET
 CONF
         # Singing is opt-in. Only this key: everything else resolves from the release, which is
         # the reason to boot a container in the first place.
